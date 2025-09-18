@@ -30,7 +30,7 @@ cp miner/.env.example miner/.env
 
 ```bash
 # Register on subnet
-btcli subnet register --netuid 1 --wallet.name default --wallet.hotkey miner
+btcli subnet register --netuid 5 --wallet.name default --wallet.hotkey miner
 
 # Set IP on chain
 pip install substrate-interface netaddr
@@ -58,7 +58,7 @@ source miner/.env && python -m miner.main
 
 ```bash
 # Register
-btcli subnet register --netuid 1 --wallet.name default --wallet.hotkey validator
+btcli subnet register --netuid 5 --wallet.name default --wallet.hotkey validator
 
 # Stake (optional but recommended)
 btcli stake add --wallet.name default --wallet.hotkey validator --amount 100
@@ -81,7 +81,7 @@ make down
 
 **validator/.env.example**
 ```env
-NETUID=1
+NETUID=5
 CHAIN_ENDPOINT=wss://entrypoint-finney.opentensor.ai:443
 WALLET_NAME=default
 WALLET_HOTKEY=validator
