@@ -35,6 +35,11 @@ async def run_weights_cycle(validator, state):
         state['last_weights_block'] = current_block
 
 async def run_continuous(validator, stop_event: asyncio.Event = None):
+    
+    asyncio.create_task(
+        validator.run_synthetics_job()
+    )
+
     while True:
         if stop_event and stop_event.is_set():
             logger.info("Cycle runner stopping...")

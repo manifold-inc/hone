@@ -6,6 +6,18 @@ from common import ChainInterface
 from validator.config import ValidatorConfig
 from validator.db import Database
 from validator import discovery, query, scoring, cycle
+from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator
+import random
+
+
+def sample_difficulty(mu=0.0, sigma=0.8, lo=-0.6, hi=0.6):
+    z = random.gauss(mu, sigma)
+    if z < lo:
+        return "easy"
+    elif z > hi:
+        return "hard"
+    else:
+        return "medium"
 
 class Validator:
     def __init__(self, config: ValidatorConfig):
@@ -29,6 +41,29 @@ class Validator:
             'last_query_block': None,
             'last_weights_block': None
         }
+
+        self.synthetic_generator = ARC2Generator(max_chain_length=4)
+        self.max_synthetics_per_batch = 1000
+
+    async def run_synthetics_job(self):
+        logger.info(f"Running synthetics job")
+        while True:
+            data = []
+            while len(data) < self.max_synthetics_per_batch:
+                try:
+                    problem = self.synthetic_generator.generate_problem(difficulty=sample_difficulty(), return_metadata=True)
+                    logger.info(f'ARC2 | task={problem["metadata"]["base_task"]} | diff={problem["metadata"]["difficulty"]} | steps={len(problem["metadata"].get("transformation_chain", []))}')
+                    data.append(problem)
+                except Exception as e:
+                    logger.error(e)
+
+                await asyncio.sleep(0.5)
+            await self.push_to_s3(data)
+    
+    async def push_to_s3(self, data: list):
+        # does nothing for now
+        logger.info(f"pushing to s3")
+        return
 
     async def start(self):
         await self.db.connect()
