@@ -4,7 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib import colors
 import numpy as np
 
-import arc_agi2_utils as utils
+import validator.synthetics.arcgen.arc_agi2_utils as utils
+from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator  # type: ignore
 
 
 # ARC palette (0..9)
@@ -251,7 +252,6 @@ def _demo() -> None:
     applies the SAME chain (with params if present) to produce train/test examples.
     """
     try:
-        from arc_agi2_generator import ARC2Generator  # type: ignore
 
         gen = ARC2Generator()
         problem = gen.generate_problem(difficulty="medium", return_metadata=True)

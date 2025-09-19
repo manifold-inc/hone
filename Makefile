@@ -7,3 +7,6 @@ val:
 
 down:
 	cd validator && docker-compose down -v
+
+viz:
+	python -m validator.synthetics.arcgen.viz
