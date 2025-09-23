@@ -1,0 +1,34 @@
+version: "3.9"
+
+
+services:
+  orchestrator:
+  build: ./orchestrator
+  image: arcagi2/orchestrator:latest
+  restart: unless-stopped
+  environment:
+    - ORCH_MAX_CONCURRENCY=4
+    - ORCH_CHILD_TIMEOUT_MIN=30
+    - ORCH_CHILD_MEMORY=8g
+    - ORCH_CHILD_CPUS=2.0
+    - ORCH_CHILD_PIDS=512
+    - ORCH_PULL_ALWAYS=false
+    - ORCH_SECURE_MODE=true
+    - ORCH_DATA_ROOT=/orchestrator/data
+    - ORCH_OUT_ROOT=/orchestrator/out
+    - ORCH_TMP_ROOT=/orchestrator/tmp
+    - AWS_REGION=eu-central-1
+    - AWS_ACCESS_KEY_ID
+    - AWS_SECRET_ACCESS_KEY
+    - AWS_SESSION_TOKEN
+    - ORCH_S3_METRICS_BUCKET
+    - ORCH_LOG_LEVEL=INFO
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock:ro # DooD
+    - orchestrator-data:/orchestrator
+  ports:
+    - "8080:8080"
+
+
+volumes:
+  orchestrator-data:

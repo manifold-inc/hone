@@ -1,0 +1,8 @@
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+boto3==1.35.21
+botocore==1.35.21
+docker==7.1.0
+orjson==3.10.7
+python-json-logger==2.0.7
