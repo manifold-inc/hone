@@ -1,0 +1,147 @@
+# validator/docker-compose.test.yml
+version: "3.9"
+
+services:
+  # PostgreSQL Database
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hone_test
+    ports:
+      - "5433:5432"  # Different port to avoid conflicts
+    volumes:
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hone_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      - hone-test
+
+  # Adminer for DB inspection
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "8081:8080"  # Different port to avoid conflicts
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - hone-test
+
+  # Mock Validator
+  validator:
+    build:
+      context: ..
+      dockerfile: validator/Dockerfile
+    restart: unless-stopped
+    environment:
+      # Mock chain mode
+      USE_MOCK_CHAIN: "true"
+      SKIP_EPISTULA_VERIFY: "true"  # Skip signature verification in test mode
+      
+      # Network config
+      NETUID: 5
+      CHAIN_ENDPOINT: "mock://localhost"
+      
+      # Database
+      DB_URL: postgresql://postgres:postgres@db:5432/hone_test
+      
+      # Fast cycles for testing (in blocks)
+      CYCLE_DURATION: 5  # Query every 5 blocks (~10 seconds)
+      
+      # Mock wallet (not used but keeps config happy)
+      WALLET_NAME: validator
+      WALLET_HOTKEY: validator
+      
+      # Logging
+      LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "validator.main"]
+    ports:
+      - "8092:8092"
+    networks:
+      - hone-test
+
+  # Mock Miner 1
+  miner1:
+    build:
+      context: ..
+      dockerfile: miner/Dockerfile
+    restart: unless-stopped
+    environment:
+      SKIP_EPISTULA_VERIFY: "true"
+      WALLET_NAME: miner1
+      WALLET_HOTKEY: miner1
+      MINER_PORT: 8091
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+    ports:
+      - "8091:8091"
+    networks:
+      - hone-test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Mock Miner 2
+  miner2:
+    build:
+      context: ..
+      dockerfile: miner/Dockerfile
+    restart: unless-stopped
+    environment:
+      SKIP_EPISTULA_VERIFY: "true"
+      WALLET_NAME: miner2
+      WALLET_HOTKEY: miner2
+      MINER_PORT: 8092
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+    ports:
+      - "8093:8092"  # Map to 8093 on host to avoid conflict with validator
+    networks:
+      - hone-test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8092/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  # Mock Miner 3
+  miner3:
+    build:
+      context: ..
+      dockerfile: miner/Dockerfile
+    restart: unless-stopped
+    environment:
+      SKIP_EPISTULA_VERIFY: "true"
+      WALLET_NAME: miner3
+      WALLET_HOTKEY: miner3
+      MINER_PORT: 8093
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+    ports:
+      - "8094:8093"  # Map to 8094 on host
+    networks:
+      - hone-test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8093/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  hone-test:
+    driver: bridge
+
+volumes:
+  test_db_data:

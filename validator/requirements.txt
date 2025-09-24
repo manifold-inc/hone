@@ -5,7 +5,7 @@ asyncpg
 python-dotenv
 pyyaml
 retry
-
 psutil
 loguru
 tenacity
+numpy

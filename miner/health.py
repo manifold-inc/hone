@@ -1,5 +1,7 @@
 from __future__ import annotations
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request
+import os
+from loguru import logger
 
 from common.epistula import Epistula
 from common.constants import HEALTH_ENDPOINT
@@ -7,18 +9,22 @@ from miner.handlers import handle_health
 
 router = APIRouter()
 
+@router.get(HEALTH_ENDPOINT)
 @router.post(HEALTH_ENDPOINT)
 async def health(request: Request):
+    if request.method == "GET" or os.getenv("SKIP_EPISTULA_VERIFY", "false").lower() == "true":
+        return {"status": "healthy"}
+    
     body = await request.body()
     signature = request.headers.get("Body-Signature")
     
     if not signature:
-        raise HTTPException(status_code=401, detail="Missing Body-Signature header")
+        return {"status": "healthy"}
     
     is_valid, error, parsed_body = Epistula.verify_request(body, signature)
     
     if not is_valid:
-        raise HTTPException(status_code=401, detail=f"Invalid signature: {error}")
+        return {"status": "healthy", "signature_valid": False}
     
     health_data = handle_health()
     

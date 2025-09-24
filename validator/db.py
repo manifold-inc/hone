@@ -4,6 +4,8 @@ import asyncpg
 from typing import Dict, List, Optional
 from datetime import datetime
 from loguru import logger
+import json
+
 
 class Database:
     def __init__(self, dsn: Optional[str] = None, schema: str = "hone"):
@@ -56,14 +58,39 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM miners ORDER BY uid ASC")
 
-    async def record_query_result(self, block: int, uid: int, success: bool, response: Optional[dict], error: Optional[str], response_time: Optional[float], ts: datetime):
+    async def record_query_result(
+        self, 
+        block: int, 
+        uid: int, 
+        success: bool, 
+        response: Optional[dict], 
+        error: Optional[str], 
+        response_time: Optional[float], 
+        ts: datetime,
+        # New metrics
+        exact_match: bool = False,
+        partial_correctness: float = 0.0,
+        grid_similarity: float = 0.0,
+        efficiency_score: float = 0.0,
+        problem_difficulty: Optional[str] = None,
+        problem_id: Optional[str] = None
+    ):
         async with self.pool.acquire() as conn:
+            # Convert dict to JSON string if needed
+            response_json = json.dumps(response) if response else None
+            
             await conn.execute(
                 """
-                INSERT INTO query_results (block, uid, success, response, error, response_time, timestamp)
-                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7)
+                INSERT INTO query_results (
+                    block, uid, success, response, error, response_time, timestamp,
+                    exact_match, partial_correctness, grid_similarity, efficiency_score,
+                    problem_difficulty, problem_id
+                )
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13)
                 """,
-                block, uid, success, response, error, response_time, ts
+                block, uid, success, response_json, error, response_time, ts,
+                exact_match, partial_correctness, grid_similarity, efficiency_score,
+                problem_difficulty, problem_id
             )
 
     async def get_recent_results(self, window_blocks: int, current_block: int) -> List[asyncpg.Record]:
@@ -73,17 +100,34 @@ class Database:
                 """
                 SELECT * FROM query_results
                 WHERE block >= $1
+                ORDER BY timestamp DESC
                 """,
                 min_block
             )
 
-    async def save_scores(self, scores: Dict[int, float]):
+    async def save_scores(self, scores: Dict[int, Dict[str, float]]):
+        """
+        Save scores with detailed metrics.
+        scores format: {uid: {"score": float, "exact_match_rate": float, ...}}
+        """
         ts = datetime.utcnow()
         async with self.pool.acquire() as conn:
-            await conn.executemany(
-                "INSERT INTO scores (uid, score, timestamp) VALUES ($1, $2, $3)",
-                [(uid, float(score), ts) for uid, score in scores.items()]
-            )
+            for uid, metrics in scores.items():
+                await conn.execute(
+                    """
+                    INSERT INTO scores (
+                        uid, score, exact_match_rate, partial_correctness_avg, 
+                        efficiency_avg, timestamp
+                    ) 
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    """,
+                    uid, 
+                    float(metrics.get("score", 0.0)),
+                    float(metrics.get("exact_match_rate", 0.0)),
+                    float(metrics.get("partial_correctness_avg", 0.0)),
+                    float(metrics.get("efficiency_avg", 0.0)),
+                    ts
+                )
 
     async def get_scores_last_hours(self, hours: int = 24) -> List[asyncpg.Record]:
         async with self.pool.acquire() as conn:
@@ -92,3 +136,23 @@ class Database:
                 str(hours)
             )
             return rows
+
+    async def get_miner_performance_stats(self, uid: int, window_blocks: int, current_block: int) -> Dict:
+        """Get detailed performance statistics for a specific miner"""
+        min_block = max(0, current_block - window_blocks)
+        async with self.pool.acquire() as conn:
+            stats = await conn.fetchrow(
+                """
+                SELECT 
+                    COUNT(*) as total_queries,
+                    SUM(CASE WHEN exact_match THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0) as exact_match_rate,
+                    AVG(partial_correctness) as avg_partial_correctness,
+                    AVG(grid_similarity) as avg_grid_similarity,
+                    AVG(efficiency_score) as avg_efficiency,
+                    AVG(response_time) as avg_response_time
+                FROM query_results
+                WHERE uid = $1 AND block >= $2
+                """,
+                uid, min_block
+            )
+            return dict(stats) if stats else {}

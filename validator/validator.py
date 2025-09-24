@@ -2,22 +2,12 @@ import asyncio
 from loguru import logger
 import signal
 
-from common import ChainInterface
+from common.chain import ChainInterface
 from validator.config import ValidatorConfig
 from validator.db import Database
-from validator import discovery, query, scoring, cycle
+from validator import cycle
 from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator
 import random
-
-
-def sample_difficulty(mu=0.0, sigma=0.8, lo=-0.6, hi=0.6):
-    z = random.gauss(mu, sigma)
-    if z < lo:
-        return "easy"
-    elif z > hi:
-        return "hard"
-    else:
-        return "medium"
 
 class Validator:
     def __init__(self, config: ValidatorConfig):
@@ -25,13 +15,23 @@ class Validator:
         self.should_stop = False
         self._stop_event = asyncio.Event()
 
-        self.chain = ChainInterface(
-            endpoint=config.chain_endpoint, 
-            netuid=config.netuid,
-            wallet_name=config.wallet_name,
-            wallet_hotkey=config.wallet_hotkey,
-            wallet_path=config.wallet_path
-        )
+        if config.use_mock_chain:
+            from common.mock_chain import MockChainInterface
+            self.chain = MockChainInterface(
+                endpoint="mock://localhost",
+                netuid=config.netuid,
+                wallet_name="validator",
+                num_mock_miners=3
+            )
+            logger.info("Using MockChainInterface for testing")
+        else:
+            self.chain = ChainInterface(
+                endpoint=config.chain_endpoint, 
+                netuid=config.netuid,
+                wallet_name=config.wallet_name,
+                wallet_hotkey=config.wallet_hotkey,
+                wallet_path=config.wallet_path
+            )
 
         self.db = Database(dsn=config.db_url)
         self.config.current_block_provider = self.get_current_block
@@ -43,28 +43,7 @@ class Validator:
         }
 
         self.synthetic_generator = ARC2Generator(max_chain_length=4)
-        self.max_synthetics_per_batch = 1000
-
-    async def run_synthetics_job(self):
-        logger.info(f"Running synthetics job")
-        while True:
-            data = []
-            while len(data) < self.max_synthetics_per_batch:
-                try:
-                    problem = self.synthetic_generator.generate_problem(difficulty=sample_difficulty(), return_metadata=True)
-                    logger.info(f'ARC2 | task={problem["metadata"]["base_task"]} | diff={problem["metadata"]["difficulty"]} | steps={len(problem["metadata"].get("transformation_chain", []))}')
-                    data.append(problem)
-                except Exception as e:
-                    logger.error(e)
-
-                await asyncio.sleep(0.5)
-            await self.push_to_s3(data)
     
-    async def push_to_s3(self, data: list):
-        # does nothing for now
-        logger.info(f"pushing to s3")
-        return
-
     async def start(self):
         await self.db.connect()
         loop = asyncio.get_event_loop()
@@ -108,3 +87,12 @@ class Validator:
         finally:
             await self.db.close()
             self.chain.substrate.close() if self.chain.substrate else None
+
+    def sample_difficulty(self, mu=0.0, sigma=0.8, lo=-0.6, hi=0.6):
+        z = random.gauss(mu, sigma)
+        if z < lo:
+            return "easy"
+        elif z > hi:
+            return "hard"
+        else:
+            return "medium"
