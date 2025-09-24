@@ -5,8 +5,9 @@ from loguru import logger
 
 from miner.config import MinerConfig
 from miner.keypair import load_keypair
-from miner.health import router as health_router
-from miner.query import router as query_router
+from miner.endpoints.health import router as health_router
+from miner.endpoints.query import router as query_router
+from miner.endpoints.check_task import router as check_task_router
 
 def create_app(cfg: MinerConfig) -> FastAPI:
     app = FastAPI(title="Hone Miner", version="0.1.0")
@@ -21,6 +22,7 @@ def create_app(cfg: MinerConfig) -> FastAPI:
     
     app.include_router(health_router)
     app.include_router(query_router)
+    app.include_router(check_task_router)
     
     logger.info(f"Miner initialized with hotkey: {cfg.hotkey}")
     return app

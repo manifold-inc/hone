@@ -1,12 +1,13 @@
 import asyncio
 import aiohttp
-from typing import Dict, List
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from loguru import logger
 import json
 
 from common.epistula import Epistula
-from common.constants import QUERY_ENDPOINT, DEFAULT_TIMEOUT
+from common.constants import QUERY_ENDPOINT, CHECK_TASK_ENDPOINT
+
 
 def calculate_grid_similarity(grid1: List[List[int]], grid2: List[List[int]]) -> float:
     """Calculate pixel-wise similarity between two grids"""
@@ -71,15 +72,15 @@ def calculate_efficiency_score(response_time: float, max_time: float = 30.0) -> 
         return 0.0
     return 1.0 - (response_time / max_time)
 
-async def _query_one_with_problem(
+async def _submit_task_to_miner(
     session: aiohttp.ClientSession,
     chain,
     config,
     uid: int,
     miner: Dict,
     problem_data: Dict
-) -> Dict:
-    """Query a single miner with an ARC problem"""
+) -> Optional[str]:
+    """Submit a task to a miner and get back a task ID"""
     ip = miner.get("ip")
     port = miner.get("port") or config.default_miner_port
     url = f"http://{ip}:{port}{QUERY_ENDPOINT}"
@@ -91,7 +92,7 @@ async def _query_one_with_problem(
         "difficulty": problem_data['difficulty']
     }
     
-    logger.info(f"Querying UID {uid} with problem {problem_data['id']} (difficulty: {problem_data['difficulty']})")
+    logger.info(f"Submitting task to UID {uid} with problem {problem_data['id']} (difficulty: {problem_data['difficulty']})")
     
     body, headers = Epistula.create_request(
         keypair=chain.keypair,
@@ -99,92 +100,189 @@ async def _query_one_with_problem(
         data=query_data,
         version=1
     )
-
-    t0 = datetime.now(timezone.utc)
+    
     try:
-        async with session.post(url, json=body, headers=headers, timeout=DEFAULT_TIMEOUT) as resp:
-            response_text = await resp.text()
-            dt = (datetime.now(timezone.utc) - t0).total_seconds()
-            
+        async with session.post(url, json=body, headers=headers, timeout=5) as resp:
             if resp.status != 200:
-                logger.error(f"Failed for UID {uid}: HTTP {resp.status}")
-                return {
-                    "uid": uid,
-                    "problem_id": problem_data['id'],
-                    "success": False,
-                    "response": None,
-                    "error": f"HTTP {resp.status}",
-                    "rt": dt,
-                    "metrics": {
-                        "exact_match": False,
-                        "partial_correctness": 0.0,
-                        "grid_similarity": 0.0,
-                        "efficiency_score": 0.0
-                    }
-                }
+                logger.error(f"Failed to submit task to UID {uid}: HTTP {resp.status}")
+                return None
             
-            # Parse and validate response
-            try:
+            response_text = await resp.text()
+            response_json = json.loads(response_text)
+            task_id = response_json.get('data', {}).get('task_id')
+            
+            if not task_id:
+                logger.error(f"No task_id in response from UID {uid}")
+                return None
+            
+            logger.debug(f"UID {uid} accepted task with ID: {task_id}")
+            return task_id
+            
+    except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError) as e:
+        logger.error(f"Failed to submit task to UID {uid}: {e}")
+        return None
+
+async def _poll_task_result(
+    session: aiohttp.ClientSession,
+    chain,
+    config,
+    uid: int,
+    miner: Dict,
+    task_id: str,
+    problem_data: Dict,
+    max_attempts: int = 20,
+    poll_interval: float = 5
+) -> Dict:
+    """Poll for task result from miner"""
+    ip = miner.get("ip")
+    port = miner.get("port") or config.default_miner_port
+    url = f"http://{ip}:{port}{CHECK_TASK_ENDPOINT}/{task_id}"
+    
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+    
+    for attempt in range(max_attempts):
+        try:
+            # Create authenticated request for checking task
+            check_data = {"task_id": task_id}
+            body, headers = Epistula.create_request(
+                keypair=chain.keypair,
+                receiver_hotkey=miner.get("hotkey"),
+                data=check_data,
+                version=1
+            )
+            
+            async with session.get(url, headers=headers, timeout=5) as resp:
+                if resp.status != 200:
+                    logger.error(f"Failed to check task {task_id} for UID {uid}: HTTP {resp.status}")
+                    await asyncio.sleep(poll_interval)
+                    continue
+                
+                response_text = await resp.text()
                 response_json = json.loads(response_text)
-                payload = response_json.get('data', {})
-                predicted_output = payload.get('output')
+                task_data = response_json.get('data', {})
                 
-                if not predicted_output or not isinstance(predicted_output, list):
-                    raise ValueError("Invalid output format")
+                status = task_data.get('status')
                 
-                # Calculate metrics
-                expected_output = problem_data['problem']['output']
-                exact_match = predicted_output == expected_output
-                partial_correctness = calculate_partial_correctness(predicted_output, expected_output)
-                grid_similarity = calculate_grid_similarity(predicted_output, expected_output)
-                efficiency_score = calculate_efficiency_score(dt)
-                
-                logger.info(f"UID {uid} | Problem {problem_data['id']} | "
-                          f"Exact: {exact_match} | Partial: {partial_correctness:.2f} | "
-                          f"Similarity: {grid_similarity:.2f} | Time: {dt:.2f}s")
-                
-                return {
-                    "uid": uid,
-                    "problem_id": problem_data['id'],
-                    "success": True,
-                    "response": payload,
-                    "error": None,
-                    "rt": dt,
-                    "metrics": {
-                        "exact_match": exact_match,
-                        "partial_correctness": partial_correctness,
-                        "grid_similarity": grid_similarity,
-                        "efficiency_score": efficiency_score
+                if status == 'completed':
+                    dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
+                    predicted_output = task_data.get('result', {}).get('output')
+                    
+                    if not predicted_output or not isinstance(predicted_output, list):
+                        logger.error(f"Invalid output format from UID {uid}")
+                        return {
+                            "uid": uid,
+                            "problem_id": problem_data['id'],
+                            "success": False,
+                            "response": None,
+                            "error": "Invalid output format",
+                            "rt": dt,
+                            "metrics": {
+                                "exact_match": False,
+                                "partial_correctness": 0.0,
+                                "grid_similarity": 0.0,
+                                "efficiency_score": 0.0
+                            }
+                        }
+                    
+                    # Calculate metrics
+                    expected_output = problem_data['problem']['output']
+                    exact_match = predicted_output == expected_output
+                    partial_correctness = calculate_partial_correctness(predicted_output, expected_output)
+                    grid_similarity = calculate_grid_similarity(predicted_output, expected_output)
+                    efficiency_score = calculate_efficiency_score(dt)
+                    
+                    logger.info(f"UID {uid} | Problem {problem_data['id']} | Task {task_id} | "
+                              f"Exact: {exact_match} | Partial: {partial_correctness:.2f} | "
+                              f"Similarity: {grid_similarity:.2f} | Time: {dt:.2f}s")
+                    
+                    return {
+                        "uid": uid,
+                        "problem_id": problem_data['id'],
+                        "success": True,
+                        "response": task_data.get('result', {}),
+                        "error": None,
+                        "rt": dt,
+                        "metrics": {
+                            "exact_match": exact_match,
+                            "partial_correctness": partial_correctness,
+                            "grid_similarity": grid_similarity,
+                            "efficiency_score": efficiency_score
+                        }
                     }
-                }
                 
-            except (json.JSONDecodeError, KeyError, ValueError) as e:
-                logger.error(f"Invalid response from UID {uid}: {e}")
-                return {
-                    "uid": uid,
-                    "problem_id": problem_data['id'],
-                    "success": False,
-                    "response": None,
-                    "error": str(e),
-                    "rt": dt,
-                    "metrics": {
-                        "exact_match": False,
-                        "partial_correctness": 0.0,
-                        "grid_similarity": 0.0,
-                        "efficiency_score": 0.0
+                elif status == 'failed':
+                    dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
+                    error_msg = task_data.get('error', 'Unknown error')
+                    logger.error(f"Task {task_id} failed for UID {uid}: {error_msg}")
+                    return {
+                        "uid": uid,
+                        "problem_id": problem_data['id'],
+                        "success": False,
+                        "response": None,
+                        "error": error_msg,
+                        "rt": dt,
+                        "metrics": {
+                            "exact_match": False,
+                            "partial_correctness": 0.0,
+                            "grid_similarity": 0.0,
+                            "efficiency_score": 0.0
+                        }
                     }
-                }
-            
-    except asyncio.TimeoutError:
-        dt = (datetime.now(timezone.utc) - t0).total_seconds()
-        logger.error(f"Timeout for UID {uid}")
+                
+                elif status in ['pending', 'processing']:
+                    logger.debug(f"Task {task_id} for UID {uid} is {status} (attempt {attempt + 1}/{max_attempts})")
+                    await asyncio.sleep(poll_interval)
+                    continue
+                
+                else:
+                    logger.warning(f"Unknown status '{status}' for task {task_id} from UID {uid}")
+                    await asyncio.sleep(poll_interval)
+                    continue
+                    
+        except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError) as e:
+            logger.error(f"Error checking task {task_id} for UID {uid}: {e}")
+            await asyncio.sleep(poll_interval)
+            continue
+    
+    # Timeout after max attempts
+    dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
+    logger.error(f"Timeout waiting for task {task_id} from UID {uid} after {max_attempts} attempts")
+    return {
+        "uid": uid,
+        "problem_id": problem_data['id'],
+        "success": False,
+        "response": None,
+        "error": "Timeout waiting for result",
+        "rt": dt,
+        "metrics": {
+            "exact_match": False,
+            "partial_correctness": 0.0,
+            "grid_similarity": 0.0,
+            "efficiency_score": 0.0
+        }
+    }
+
+async def _query_one_with_problem(
+    session: aiohttp.ClientSession,
+    chain,
+    config,
+    uid: int,
+    miner: Dict,
+    problem_data: Dict
+) -> Dict:
+    """Query a single miner with an ARC problem using task-based approach"""
+    
+    # Step 1: Submit task and get task ID
+    task_id = await _submit_task_to_miner(session, chain, config, uid, miner, problem_data)
+    
+    if not task_id:
         return {
             "uid": uid,
             "problem_id": problem_data['id'],
             "success": False,
             "response": None,
-            "error": "Timeout",
-            "rt": dt,
+            "error": "Failed to submit task",
+            "rt": 0.0,
             "metrics": {
                 "exact_match": False,
                 "partial_correctness": 0.0,
@@ -192,23 +290,15 @@ async def _query_one_with_problem(
                 "efficiency_score": 0.0
             }
         }
-    except Exception as e:
-        dt = (datetime.now(timezone.utc) - t0).total_seconds()
-        logger.error(f"Failed for UID {uid}: {e}")
-        return {
-            "uid": uid,
-            "problem_id": problem_data['id'],
-            "success": False,
-            "response": None,
-            "error": str(e),
-            "rt": dt,
-            "metrics": {
-                "exact_match": False,
-                "partial_correctness": 0.0,
-                "grid_similarity": 0.0,
-                "efficiency_score": 0.0
-            }
-        }
+    
+    # Step 2: Poll for result
+    result = await _poll_task_result(
+        session, chain, config, uid, miner, task_id, problem_data,
+        max_attempts=20,
+        poll_interval=5
+    )
+    
+    return result
 
 async def query_miners_with_problems(
     chain,
@@ -218,9 +308,9 @@ async def query_miners_with_problems(
     problems_batch: List[Dict],
     current_block: int
 ) -> Dict[int, List[Dict]]:
-    """Query all miners with multiple problems"""
+    """Query all miners with multiple problems using task-based approach"""
     results: Dict[int, List[Dict]] = {uid: [] for uid in miners.keys()}
-    timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+    timeout = aiohttp.ClientTimeout(total=60)  # Increase total timeout for polling
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         # Create all query tasks
@@ -245,12 +335,12 @@ async def query_miners_with_problems(
                 response=res["response"],
                 error=res["error"],
                 response_time=res["rt"],
-                ts=datetime.utcnow(),
+                ts=datetime.now(timezone.utc).replace(tzinfo=None),
                 exact_match=res["metrics"]["exact_match"],
                 partial_correctness=res["metrics"]["partial_correctness"],
                 grid_similarity=res["metrics"]["grid_similarity"],
                 efficiency_score=res["metrics"]["efficiency_score"],
-                problem_difficulty=problem_data['difficulty'],
+                problem_difficulty=next((p['difficulty'] for p in problems_batch if p['id'] == res['problem_id']), None),
                 problem_id=res["problem_id"]
             )
     

@@ -2,7 +2,7 @@ import os
 import asyncio
 import asyncpg
 from typing import Dict, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 from loguru import logger
 import json
 
@@ -110,7 +110,7 @@ class Database:
         Save scores with detailed metrics.
         scores format: {uid: {"score": float, "exact_match_rate": float, ...}}
         """
-        ts = datetime.utcnow()
+        ts = datetime.now(timezone.utc).replace(tzinfo=None)
         async with self.pool.acquire() as conn:
             for uid, metrics in scores.items():
                 await conn.execute(

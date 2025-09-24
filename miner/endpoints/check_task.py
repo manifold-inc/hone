@@ -1,56 +1,56 @@
 from __future__ import annotations
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, Path
 from fastapi.responses import JSONResponse
-from typing import Any, Dict
 import json
 import os
 from loguru import logger
 
 from common.epistula import Epistula
-from common.constants import QUERY_ENDPOINT
-from miner.handlers import handle_query
+from common.constants import CHECK_TASK_ENDPOINT
+from miner.handlers import handle_check_task
 
 router = APIRouter()
 
-@router.post(QUERY_ENDPOINT)
-async def query(request: Request, body: Dict[str, Any]) -> JSONResponse:
-    signature = request.headers.get("Body-Signature")
+@router.get(f"{CHECK_TASK_ENDPOINT}/{{task_id}}")
+async def check_task(request: Request, task_id: str = Path(..., description="Task ID to check")) -> JSONResponse:
+    """Check the status of a submitted task"""
     
     if os.getenv("SKIP_EPISTULA_VERIFY", "false").lower() == "true":
         logger.warning("⚠️ EPISTULA VERIFICATION SKIPPED (TEST MODE)")
-        parsed_body = body.copy()
-        if 'data' in body:
-            query_data = body['data']
-        else:
-            query_data = body
         
-        # test mode
-        response_data = handle_query(request.app.state, query_data)
+        task_status = handle_check_task(task_id)
+        
+        if not task_status:
+            raise HTTPException(status_code=404, detail="Task not found")
         
         return JSONResponse(
-            content={"data": response_data},
+            content={"data": task_status},
             headers={"Content-Type": "application/json"}
         )
+    
     else:
+        signature = request.headers.get("Body-Signature")
+        
         if not signature:
             raise HTTPException(status_code=401, detail="Missing Body-Signature header")
         
-        body_bytes = json.dumps(body, sort_keys=True).encode('utf-8')
+        body_data = {"task_id": task_id}
+        body_bytes = json.dumps(body_data, sort_keys=True).encode('utf-8')
+        
         is_valid, error, parsed_body = Epistula.verify_request(body_bytes, signature)
         
         if not is_valid:
             raise HTTPException(status_code=401, detail=f"Invalid signature: {error}")
         
-        if parsed_body['signed_for'] != request.app.state.cfg.hotkey:
-            raise HTTPException(status_code=403, detail="Request not intended for this miner")
+        task_status = handle_check_task(task_id)
         
-        query_data = Epistula.extract_data(parsed_body)
-        response_data = handle_query(request.app.state, query_data)
+        if not task_status:
+            raise HTTPException(status_code=404, detail="Task not found")
         
         response_body, response_headers = Epistula.create_request(
             keypair=request.app.state.keypair,
             receiver_hotkey=parsed_body['signed_by'],
-            data=response_data,
+            data=task_status,
             version=1
         )
         
