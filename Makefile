@@ -8,5 +8,8 @@ val:
 down:
 	cd validator && docker-compose down -v
 
+all:
+	./test_local.sh
+
 viz:
 	python -m validator.synthetics.arcgen.viz
