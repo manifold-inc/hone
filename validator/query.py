@@ -130,8 +130,8 @@ async def _poll_task_result(
     miner: Dict,
     task_id: str,
     problem_data: Dict,
-    max_attempts: int = 20,
-    poll_interval: float = 5
+    max_attempts: int = 50,
+    poll_interval: float = 10
 ) -> Dict:
     """Poll for task result from miner"""
     ip = miner.get("ip")
@@ -294,8 +294,8 @@ async def _query_one_with_problem(
     # Step 2: Poll for result
     result = await _poll_task_result(
         session, chain, config, uid, miner, task_id, problem_data,
-        max_attempts=20,
-        poll_interval=5
+        max_attempts=50,
+        poll_interval=10
     )
     
     return result
@@ -310,7 +310,7 @@ async def query_miners_with_problems(
 ) -> Dict[int, List[Dict]]:
     """Query all miners with multiple problems using task-based approach"""
     results: Dict[int, List[Dict]] = {uid: [] for uid in miners.keys()}
-    timeout = aiohttp.ClientTimeout(total=60)  # Increase total timeout for polling
+    timeout = aiohttp.ClientTimeout(total=60)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         # Create all query tasks

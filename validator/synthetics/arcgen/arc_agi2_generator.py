@@ -162,9 +162,7 @@ class ARC2Generator:
         """
         if chain_length is None:
             chain_length = (
-                self.rng.randint(1, 2) if difficulty == "easy" else
-                self.rng.randint(2, 3) if difficulty == "medium" else
-                self.rng.randint(3, self.max_chain_length)
+                self.rng.randint(0, self.max_chain_length)
             )
 
         if difficulty == "easy":

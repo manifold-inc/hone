@@ -1,5 +1,5 @@
 from typing import List
-
+from random import shuffle
 
 # Basic ARC solver - Replace with your custom solution
 class ARCSolver:
@@ -21,15 +21,11 @@ class ARCSolver:
         Attempt to solve the ARC problem.
         This is a placeholder - implement your actual solving logic here
         """
-        if difficulty == "easy":
-            return self._apply_strategy(input_grid, [self._identity_transform, self._color_swap])
-        elif difficulty == "hard":
-            return self._apply_strategy(input_grid, self.strategies)
-        else:
-            return self._apply_strategy(input_grid, self.strategies[:3])
+        return self._apply_strategy(input_grid, self.strategies)
     
     def _apply_strategy(self, grid: List[List[int]], strategies: List) -> List[List[int]]:
         """Try different strategies and return the most promising result"""
+        shuffle(strategies)
         for strategy in strategies:
             try:
                 result = strategy(grid)

@@ -37,6 +37,7 @@ def _solve_task_worker():
                 
             except Exception as e:
                 logger.error(f"Error solving task {task.task_id}: {e}")
+                logger.exception(e)
                 _task_queue.update_task_status(
                     task.task_id,
                     TaskStatus.FAILED,
@@ -72,6 +73,8 @@ def handle_query(state: Any, query_data: Dict[str, Any]) -> Dict[str, Any]:
     problem_id = query_data.get("problem_id", "unknown")
     input_grid = query_data.get("input", [])
     difficulty = query_data.get("difficulty", "medium")
+    logger.info(f"query_data : {query_data}")
+    logger.info(f"input_grid : {input_grid}")
     
     if not input_grid or not isinstance(input_grid, list):
         logger.error(f"Invalid input grid for problem {problem_id}")

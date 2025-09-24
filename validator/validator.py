@@ -42,7 +42,7 @@ class Validator:
             'last_weights_block': None
         }
 
-        self.synthetic_generator = ARC2Generator(max_chain_length=4)
+        self.synthetic_generator = ARC2Generator(max_chain_length=2)
     
     async def start(self):
         await self.db.connect()
@@ -88,11 +88,9 @@ class Validator:
             await self.db.close()
             self.chain.substrate.close() if self.chain.substrate else None
 
-    def sample_difficulty(self, mu=0.0, sigma=0.8, lo=-0.6, hi=0.6):
-        z = random.gauss(mu, sigma)
-        if z < lo:
-            return "easy"
-        elif z > hi:
-            return "hard"
-        else:
-            return "medium"
+    def sample_difficulty(self, weights={"easy": 0.8, "medium": 0.15, "hard": 0.05}):
+        return random.choices(
+            population=["easy", "medium", "hard"],
+            weights=list(weights.values()),
+            k=1
+        )[0]
