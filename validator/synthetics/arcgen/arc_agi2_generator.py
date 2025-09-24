@@ -66,10 +66,10 @@ class ARC2Generator:
         task_num: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Pull one base ARC-1 style instance from your task_list.
-        Assumes task_list maps idx -> [task_id_str, generate, validate].
+        Pull one base ARC-1 style instance from task_list
+        Assumes task_list maps idx -> [task_id_str, generate, validate]
         Expects generate() to yield an (input_grid, output_grid) pair or a dict
-        with "input"/"output" keys. Adjust if your task API differs.
+        with "input"/"output" keys
         """
         tmap = task_list.task_list()
         if task_num is None:
