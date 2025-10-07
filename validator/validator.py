@@ -87,10 +87,3 @@ class Validator:
         finally:
             await self.db.close()
             self.chain.substrate.close() if self.chain.substrate else None
-
-    def sample_difficulty(self, weights={"easy": 0.8, "medium": 0.15, "hard": 0.05}):
-        return random.choices(
-            population=["easy", "medium", "hard"],
-            weights=list(weights.values()),
-            k=1
-        )[0]

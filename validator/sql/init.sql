@@ -21,7 +21,6 @@ CREATE TABLE IF NOT EXISTS query_results (
     partial_correctness REAL DEFAULT 0.0,  -- 0-1 score
     grid_similarity REAL DEFAULT 0.0,      -- 0-1 score  
     efficiency_score REAL DEFAULT 0.0,     -- 0-1 score based on response time
-    problem_difficulty VARCHAR(20),        -- easy/medium/hard
     problem_id VARCHAR(255),               -- unique identifier for the problem
     
     response JSONB,

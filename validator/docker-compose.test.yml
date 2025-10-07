@@ -72,6 +72,7 @@ services:
       MINER_PORT: 8091
       HOST: 0.0.0.0
       LOG_LEVEL: INFO
+      OPENAI_MODEL: "gpt-5"
     ports:
       - "8091:8091"
     networks:
@@ -94,6 +95,7 @@ services:
       MINER_PORT: 8092
       HOST: 0.0.0.0
       LOG_LEVEL: INFO
+      OPENAI_MODEL: "o3"
     ports:
       - "8093:8092"
     networks:
@@ -116,6 +118,7 @@ services:
       MINER_PORT: 8093
       HOST: 0.0.0.0
       LOG_LEVEL: INFO
+      OPENAI_MODEL: "o3-mini"
     ports:
       - "8094:8093" 
     networks:
@@ -132,3 +135,6 @@ networks:
 
 volumes:
   test_db_data:
+
+environment:
+  - OPENAI_API_KEY=${OPENAI_API_KEY:-your-key-here}

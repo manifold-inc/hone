@@ -67,16 +67,13 @@ class Database:
         error: Optional[str], 
         response_time: Optional[float], 
         ts: datetime,
-        # New metrics
         exact_match: bool = False,
         partial_correctness: float = 0.0,
         grid_similarity: float = 0.0,
         efficiency_score: float = 0.0,
-        problem_difficulty: Optional[str] = None,
         problem_id: Optional[str] = None
     ):
         async with self.pool.acquire() as conn:
-            # Convert dict to JSON string if needed
             response_json = json.dumps(response) if response else None
             
             await conn.execute(
@@ -84,13 +81,13 @@ class Database:
                 INSERT INTO query_results (
                     block, uid, success, response, error, response_time, timestamp,
                     exact_match, partial_correctness, grid_similarity, efficiency_score,
-                    problem_difficulty, problem_id
+                    problem_id
                 )
-                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12)
                 """,
                 block, uid, success, response_json, error, response_time, ts,
                 exact_match, partial_correctness, grid_similarity, efficiency_score,
-                problem_difficulty, problem_id
+                problem_id
             )
 
     async def get_recent_results(self, window_blocks: int, current_block: int) -> List[asyncpg.Record]:

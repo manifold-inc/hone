@@ -13,16 +13,15 @@ def _count_non_black(grid: List[List[int]]) -> int:
 
 class ARC2Generator:
     """
-    Generate problems of the form:
-      - Start from a base ARC-1-like task (input -> output).
-      - Apply a parameterized chain of post-transforms to the *output*.
-      - The same chain (incl. parameters) is reused for all examples.
-
-    Key improvements:
-      - Every transform has frozen parameters recorded in metadata.
-      - Optional `preserves_size_only` filter if you need equal HxW across examples.
-      - Light degeneracy checks to avoid all-black or trivial outputs.
-      - Dedicated RNG to avoid global random state surprises.
+    Generate ARC-AGI-2 style problems by applying transformation chains to ARC-1 base tasks.
+    
+    Key approach:
+      - Start from a base ARC-1 task (input -> output)
+      - Apply a parameterized chain of transforms to the *output*
+      - The same chain (with frozen parameters) is reused for all examples
+    
+    This creates problems requiring compositional reasoning while remaining
+    solvable by humans who can infer the transformation pattern.
     """
 
     def __init__(
@@ -35,83 +34,63 @@ class ARC2Generator:
         self.max_grid_size = max_grid_size
         self.rng = random.Random(seed)
 
-        self.easy_transforms = [
-            "flip_horizontal", "flip_vertical",
-            "rotate_90", "rotate_180", "rotate_270",
-        ]
-        self.medium_transforms = [
-            "transpose", "shift", "gravity_down", "gravity_left", "gravity_right",
-            "swap_colors", "add_frame", "crop", "recenter", "highlight_color",
-        ]
-        self.hard_transforms = [
-            "zoom_2x", "invert_colors", "remove_color",
-            "downsample_2x", "add_noise"
-        ]
-
-        # safety net to keep outputs meaningful
+        # Quality thresholds to keep outputs meaningful
         self.min_distinct_colors = 2
         self.min_non_black_cells = 6
         self.max_resample_attempts = 4
 
+        # Cache which transforms preserve grid dimensions
         self._preserves_size = {
             name: meta.get("preserves_size", False)
             for name, (_, meta) in utils.TRANSFORMATIONS.items()
         }
 
-    # --------------------
-    # Base ARC-1 problem
-    # --------------------
     def generate_initial_problem(
         self,
         task_num: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
-        Pull one base ARC-1 style instance from task_list
-        Assumes task_list maps idx -> [task_id_str, generate, validate]
-        Expects generate() to yield an (input_grid, output_grid) pair or a dict
-        with "input"/"output" keys
+        Generate a base ARC-1 style problem from task_list.
+        
+        Returns:
+            Dict with "input", "output", and "task_num" keys
         """
         tmap = task_list.task_list()
         if task_num is None:
             task_num = self.rng.choice(list(tmap.keys()))
 
         _, gen_fn, _ = tmap[task_num]
-
         pair = gen_fn()
+        
         if isinstance(pair, dict):
             inp = pair["input"]
             out = pair["output"]
         else:
             inp, out = pair
 
-        # basic validation
         if not utils.is_valid_grid(inp) or not utils.is_valid_grid(out):
-            raise ValueError("Base task produced invalid grid(s).")
+            raise ValueError(f"Base task produced invalid grid(s) - task_num: {task_num}")
 
-        # keep sizes within bounds
         h, w = utils.get_grid_size(out)
         if h > self.max_grid_size or w > self.max_grid_size:
-            raise ValueError(f"Base output too large: {h}x{w} > {self.max_grid_size}")
+            raise ValueError(f"Base output too large: {h}x{w} > {self.max_grid_size} - task_num: {task_num}")
 
         return {"input": inp, "output": out, "task_num": task_num}
 
-    # --------------------------------
-    # Parameter sampling per transform
-    # --------------------------------
     def _sample_params(self, name: str, grid: List[List[int]]) -> Optional[Dict[str, Any]]:
         """
-        Sample deterministic parameters for a transform, based on current grid content.
-        If a transform is deterministic or content-based by default, return None.
+        Sample parameters for a transformation based on current grid state.
+        Returns None if the transform doesn't need parameters or can't be applied.
         """
         colors_present = list(utils.get_colors_in_grid(grid) - {0})
-        palette = list(range(10))
+        palette = list(range(1, 10))  # Colors 1-9
 
         if name == "swap_colors":
             if len(colors_present) >= 2:
                 c1, c2 = self.rng.sample(colors_present, 2)
             elif len(colors_present) == 1:
                 c1 = colors_present[0]
-                c2 = next(c for c in palette if c != c1)
+                c2 = self.rng.choice([c for c in palette if c != c1])
             else:
                 c1, c2 = 1, 2
             return {"color1": c1, "color2": c2}
@@ -119,13 +98,7 @@ class ARC2Generator:
         if name == "remove_color":
             if len(colors_present) <= 1:
                 return None
-            c = self.rng.choice(colors_present)
-            return {"color": c}
-
-        if name in ("add_frame", "add_border"):
-            c = self.rng.choice(colors_present) if colors_present else self.rng.choice(palette)
-            thickness = 1
-            return {"color": c, "thickness": thickness}
+            return {"color": self.rng.choice(colors_present)}
 
         if name == "highlight_color":
             if not colors_present:
@@ -140,40 +113,24 @@ class ARC2Generator:
             amt = self.rng.randint(1, min(3, max_amt))
             return {"direction": direction, "amount": amt, "wrap": False}
 
-        if name == "add_noise":
-            return {"prob": 0.05, "seed": self.rng.randint(0, 10**9)}
-
         return None
 
-    # ----------------------------
-    # Chain selection + execution
-    # ----------------------------
     def select_transformation_chain(
         self,
         grid: List[List[int]],
         chain_length: Optional[int] = None,
-        difficulty: str = "medium",
         preserves_size_only: bool = False,
     ) -> List[Dict[str, Any]]:
         """
-        Build a *parameterized* chain over the given grid.
-        Applies each chosen step to the *current* grid to ensure compatibility,
-        freezing sampled parameters along the way.
+        Build a parameterized transformation chain.
+        
+        Each transform is applied to the current grid state to ensure compatibility,
+        and parameters are frozen for reuse across examples.
         """
         if chain_length is None:
-            chain_length = (
-                self.rng.randint(0, self.max_chain_length)
-            )
+            chain_length = self.max_chain_length
 
-        if difficulty == "easy":
-            pool = list(self.easy_transforms)
-        elif difficulty == "medium":
-            pool = list(set(self.easy_transforms + self.medium_transforms))
-        elif difficulty == "hard":
-            pool = list(set(self.medium_transforms + self.hard_transforms))
-        else:
-            pool = list(utils.TRANSFORMATIONS.keys())
-
+        pool = list(utils.TRANSFORMATIONS.keys())
         result_chain: List[Dict[str, Any]] = []
         cur = utils.deep_copy_grid(grid)
 
@@ -187,7 +144,7 @@ class ARC2Generator:
             if not available:
                 break
 
-            # avoid immediate reversals where possible
+            # Avoid immediate reversals for better chain quality
             if result_chain and len(available) > 1:
                 last = result_chain[-1]["name"]
                 avoid = {
@@ -207,7 +164,8 @@ class ARC2Generator:
 
             name = self.rng.choice(available)
             params = self._sample_params(name, cur)
-            # if params are invalid (example: would degenerate), try picking another transform
+            
+            # Skip if params are invalid
             if name in ("remove_color", "highlight_color") and params is None:
                 continue
 
@@ -225,6 +183,7 @@ class ARC2Generator:
         grid: List[List[int]],
         chain: List[Dict[str, Any]],
     ) -> List[List[int]]:
+        """Apply a frozen transformation chain to a grid."""
         out = utils.deep_copy_grid(grid)
         for step in chain:
             name = step["name"]
@@ -234,10 +193,8 @@ class ARC2Generator:
                 raise ValueError(f"Invalid grid after transform: {name}")
         return out
 
-    # ----------------------------
-    # Problem generation
-    # ----------------------------
     def _non_degenerate(self, grid: List[List[int]]) -> bool:
+        """Check if grid has sufficient complexity."""
         distinct_colors = utils.get_colors_in_grid(grid) - {0}
         if len(distinct_colors) < self.min_distinct_colors:
             return False
@@ -249,23 +206,21 @@ class ARC2Generator:
         self,
         task_num: Optional[int] = None,
         chain_length: Optional[int] = None,
-        difficulty: str = "medium",
         return_metadata: bool = True,
         preserves_size_only: bool = False,
     ) -> Dict[str, Any]:
         """
-        Generate a single ARC-2 style problem with frozen chain parameters.
+        Generate a single ARC-AGI-2 style problem.
 
-        Returns dict:
+        Returns:
             {
               "input": <grid>,
-              "output": <grid>,             # output after applying chain to base output
+              "output": <grid after applying chain>,
               "metadata": {
                   "base_task": <int>,
-                  "transformation_chain": [ { "name": str, "params": dict|None }, ... ],
-                  "difficulty": str,
+                  "transformation_chain": [{"name": str, "params": dict|None}, ...],
                   "chain_length": int,
-                  "initial_output": <grid>   # base ARC-1 output (before chain)
+                  "initial_output": <grid>  # before chain
               }
             }
         """
@@ -276,7 +231,6 @@ class ARC2Generator:
             chain = self.select_transformation_chain(
                 base["output"],
                 chain_length=chain_length,
-                difficulty=difficulty,
                 preserves_size_only=preserves_size_only,
             )
             transformed = self.apply_transformation_chain(base["output"], chain)
@@ -292,12 +246,94 @@ class ARC2Generator:
             "input": base["input"],
             "output": transformed,
         }
+        
         if return_metadata:
             result["metadata"] = {
                 "base_task": base["task_num"],
                 "transformation_chain": chain,
-                "difficulty": difficulty,
                 "chain_length": len(chain),
                 "initial_output": base["output"],
             }
+        
         return result
+
+    def generate_problem_set(
+        self,
+        num_train: int = 3,
+        num_test: int = 1,
+        task_num: Optional[int] = None,
+        chain_length: Optional[int] = None,
+        preserves_size_only: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Generate train/test examples with the same transformation chain.
+        
+        This mirrors the ARC-AGI format where the same underlying rule
+        applies across all examples.
+        
+        Returns:
+            {
+              "train_examples": [{"input": <grid>, "output": <grid>}, ...],
+              "test_input": <grid>,
+              "test_output": <grid>,  # For validation
+              "metadata": {
+                  "base_task": <int>,
+                  "transformation_chain": [...],
+                  "chain_length": int
+              }
+            }
+        """
+        # Generate initial task to get base task number
+        base_initial = self.generate_initial_problem(task_num)
+        task_num = base_initial["task_num"]
+        
+        # Generate transformation chain (empty if chain_length is 0)
+        if chain_length == 0:
+            chain = []
+        else:
+            chain = self.select_transformation_chain(
+                base_initial["output"],
+                chain_length=chain_length,
+                preserves_size_only=preserves_size_only,
+            )
+        
+        # Generate training examples
+        train_examples = []
+        attempts = 0
+        max_attempts = num_train * 5
+        
+        while len(train_examples) < num_train and attempts < max_attempts:
+            attempts += 1
+            try:
+                base = self.generate_initial_problem(task_num=task_num)
+                
+                if chain:
+                    output = self.apply_transformation_chain(base["output"], chain)
+                else:
+                    output = base["output"]
+                
+                if self._non_degenerate(output):
+                    train_examples.append({
+                        "input": base["input"],
+                        "output": output
+                    })
+            except:
+                continue
+        
+        # Generate test example
+        test_base = self.generate_initial_problem(task_num=task_num)
+        if chain:
+            test_output = self.apply_transformation_chain(test_base["output"], chain)
+        else:
+            test_output = test_base["output"]
+        
+        return {
+            "train_examples": train_examples,
+            "test_input": test_base["input"],
+            "test_output": test_output,
+            "metadata": {
+                "base_task": task_num,
+                "transformation_chain": chain,
+                "chain_length": len(chain)
+            }
+        }

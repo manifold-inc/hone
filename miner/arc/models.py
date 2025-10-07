@@ -13,9 +13,10 @@ class TaskStatus(Enum):
 class ARCTask:
     task_id: str
     problem_id: str
-    input_grid: List[List[int]]
-    difficulty: str
+    train_examples: List[Dict[str, List[List[int]]]]  # List of {"input": grid, "output": grid}
+    test_input: List[List[int]]
     timestamp: float
+    num_train: int = 3
     status: TaskStatus = TaskStatus.PENDING
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None

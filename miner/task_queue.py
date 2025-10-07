@@ -54,7 +54,6 @@ class ARCTaskQueue:
                 "status": task.status.value,
                 "created_at": task.timestamp,
                 "problem_id": task.problem_id,
-                "difficulty": task.difficulty
             }
             
             if task.completed_at:

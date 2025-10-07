@@ -17,7 +17,7 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
 
     rows = await db.get_recent_results(window_blocks=window_blocks, current_block=current_block)
     
-    # Aggregate metrics per miner
+    # agg metrics per miner
     miner_stats: Dict[int, Dict] = {}
     
     for r in rows:
@@ -42,7 +42,7 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
             stats['similarity_sum'] += float(r.get('grid_similarity', 0.0))
             stats['efficiency_sum'] += float(r.get('efficiency_score', 0.0))
     
-    # Calculate weighted scores
+    # weighted scores
     scores: Dict[int, Dict[str, float]] = {}
     weights = {
         'exact_match': 0.4,
@@ -65,13 +65,11 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
             }
             continue
         
-        # Calculate rates
         exact_rate = stats['exact_matches'] / stats['count']
         partial_avg = stats['partial_sum'] / stats['successful_responses']
         similarity_avg = stats['similarity_sum'] / stats['successful_responses']
         efficiency_avg = stats['efficiency_sum'] / stats['successful_responses']
         
-        # Weighted final score
         final_score = (
             weights['exact_match'] * exact_rate +
             weights['partial'] * partial_avg +
@@ -90,10 +88,8 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
                    f"Exact: {exact_rate:.2f} | Partial: {partial_avg:.2f} | "
                    f"Efficiency: {efficiency_avg:.2f}")
     
-    # Save detailed scores to database
     await db.save_scores(scores)
     
-    # Return simplified scores for weight setting
     return {uid: metrics["score"] for uid, metrics in scores.items()}
 
 def _normalize_scores(scores: Dict[int, float], weight_max: int = 65535) -> Dict[int, float]:

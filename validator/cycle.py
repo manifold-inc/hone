@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 from loguru import logger
 from validator import discovery, query, scoring
+import random
 
 async def run_query_cycle(validator, state):
     """Run continuous queries for CYCLE_DURATION blocks"""
@@ -39,23 +40,41 @@ async def run_query_cycle(validator, state):
         num_problems = min(5, len(miners)) or 1
         
         for i in range(num_problems):
-            try:
-                difficulty = validator.sample_difficulty()
-                problem = validator.synthetic_generator.generate_problem(
-                    difficulty=difficulty,
-                    return_metadata=True
+            try:                
+                num_train = random.randint(
+                    validator.config.min_train_examples, 
+                    validator.config.max_train_examples
                 )
                 
-                problem_str = str(problem['input']) + str(problem['metadata']['transformation_chain'])
+                chain_length = random.randint(3, 5)
+                
+                problem_set = validator.synthetic_generator.generate_problem_set(
+                    num_train=num_train,
+                    num_test=1,
+                    chain_length=chain_length,
+                )
+                
+                actual_train_count = len(problem_set.get('train_examples', []))
+                if actual_train_count == 0:
+                    logger.warning(f"Generated problem set has no training examples (requested {num_train}), skipping")
+                    continue
+                
+                if not problem_set.get('test_input') or not problem_set.get('test_output'):
+                    logger.warning(f"Generated problem set missing test input/output, skipping")
+                    continue
+                
+                problem_str = str(problem_set['test_input']) + str(problem_set['metadata']['transformation_chain'])
                 problem_id = hashlib.sha256(problem_str.encode()).hexdigest()[:16]
                 
                 problems_batch.append({
                     'id': problem_id,
-                    'problem': problem,
-                    'difficulty': difficulty
+                    'problem_set': problem_set,
+                    'num_train': actual_train_count
                 })
                 
-                logger.info(f'Generated problem {problem_id} | difficulty={difficulty} | steps={len(problem["metadata"]["transformation_chain"])}')
+                chain_length_actual = len(problem_set['metadata']['transformation_chain'])
+                logger.info(f'Generated problem {problem_id} '
+                           f'train_examples={actual_train_count} | chain_length={chain_length_actual}')
             except Exception as e:
                 logger.error(f"Failed to generate problem: {e}")
         
@@ -69,6 +88,8 @@ async def run_query_cycle(validator, state):
                 current_block
             )
             queries_in_cycle += 1
+        else:
+            logger.warning("No valid problems generated in this round, will retry")
         
         await asyncio.sleep(15)
     

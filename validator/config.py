@@ -1,4 +1,3 @@
-# validator/config.py
 import os
 from dataclasses import dataclass, field
 from typing import Callable, Optional
@@ -23,13 +22,14 @@ class ValidatorConfig:
 
     db_url: str = os.getenv("DB_URL")
     
-    # Add the mock chain flag
     use_mock_chain: bool = os.getenv("USE_MOCK_CHAIN", "false").lower() == "true"
 
-    # Use private field for cycle_duration to avoid property/field conflict
     _cycle_duration: int = field(default_factory=lambda: int(os.getenv("CYCLE_DURATION", "30")))
     
     current_block_provider: Callable[[], int] = field(default=lambda: 0)
+
+    min_train_examples: int = int(os.getenv("MIN_TRAIN_EXAMPLES", "3"))
+    max_train_examples: int = int(os.getenv("MAX_TRAIN_EXAMPLES", "4"))
     
     @property
     def cycle_duration(self) -> int:

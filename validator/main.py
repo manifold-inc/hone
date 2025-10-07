@@ -1,5 +1,4 @@
 import asyncio
-import signal
 from loguru import logger
 
 from validator.config import ValidatorConfig

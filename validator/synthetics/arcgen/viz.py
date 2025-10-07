@@ -120,7 +120,6 @@ class Visualizer:
         figsize: Optional[Tuple[float, float]] = None,
     ) -> plt.Figure:
         meta = (problem or {}).get("metadata", {}) or {}
-        difficulty = meta.get("difficulty", "unknown")
         chain: List[Union[str, Dict[str, Any]]] = meta.get("transformation_chain", []) or []
 
         base_task = meta.get("base_task")
@@ -145,7 +144,7 @@ class Visualizer:
         gs_top = fig.add_gridspec(n_rows, total_cols, wspace=0.28, hspace=0.34)
 
         fig.suptitle(
-            f"ARC-AGI-2 | Base Task: {base_task if base_task is not None else 'None'} | Difficulty: {difficulty}",
+            f"ARC-AGI-2 | Base Task: {base_task if base_task is not None else 'None'}",
             fontsize=14,
         )
 
@@ -179,7 +178,7 @@ class Visualizer:
             prev_ax = ax
             col += 1
 
-        # Chain text (show names only to match old viz)
+        # Chain text
         if chain:
             chain_names = [(_step_name_and_params(s)[0] or "?") for s in chain]
             fig.text(
@@ -191,7 +190,7 @@ class Visualizer:
                 style="italic",
             )
 
-        # ---- EXAMPLES ROW: proper Input→Output PAIRS ----
+        # ---- EXAMPLES ROW: Input→Output PAIRS ----
         if n_rows == 2:
             trains = (train_examples or [])[:3]
             tests = (test_examples or [])[:1]
@@ -254,7 +253,7 @@ def _demo() -> None:
     try:
 
         gen = ARC2Generator()
-        problem = gen.generate_problem(difficulty="medium", return_metadata=True)
+        problem = gen.generate_problem(return_metadata=True)
 
         meta = problem.get("metadata", {}) or {}
         base_task = meta.get("base_task")

@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Any
 from datetime import datetime, timezone
 from loguru import logger
 import json
@@ -14,7 +14,7 @@ def calculate_grid_similarity(grid1: List[List[int]], grid2: List[List[int]]) ->
     if not grid1 or not grid2:
         return 0.0
     
-    # Handle size mismatch
+    # size mismatch
     if len(grid1) != len(grid2) or (grid1 and len(grid1[0]) != len(grid2[0])):
         return 0.0
     
@@ -43,16 +43,16 @@ def calculate_partial_correctness(predicted: List[List[int]], expected: List[Lis
     score = 0.0
     weights = {'shape': 0.3, 'grid': 0.5, 'colors': 0.2}
     
-    # Shape score
+    # shape score
     shape_match = (len(predicted) == len(expected) and 
                    len(predicted[0]) == len(expected[0]) if predicted else False)
     score += weights['shape'] if shape_match else 0
     
-    # Grid similarity
+    # grid similarity
     if shape_match:
         score += weights['grid'] * calculate_grid_similarity(predicted, expected)
     
-    # Color distribution similarity
+    # color distribution similarity
     pred_colors = set()
     exp_colors = set()
     for row in predicted:
@@ -72,6 +72,25 @@ def calculate_efficiency_score(response_time: float, max_time: float = 30.0) -> 
         return 0.0
     return 1.0 - (response_time / max_time)
 
+def _deep_validate_data(data: Any, path: str = "root") -> Tuple[bool, str]:
+    """Deep validation of data structure for serialization"""
+    try:
+        serialized = json.dumps(data)
+        deserialized = json.loads(serialized)        
+        if isinstance(data, dict) and 'train_examples' in data:
+            original_len = len(data['train_examples'])
+            deserialized_len = len(deserialized['train_examples'])
+            if original_len != deserialized_len:
+                return False, f"train_examples length mismatch: {original_len} -> {deserialized_len}"
+            
+            for i, (orig_ex, deser_ex) in enumerate(zip(data['train_examples'], deserialized['train_examples'])):
+                if 'input' not in deser_ex or 'output' not in deser_ex:
+                    return False, f"Example {i} missing input/output after serialization"
+        
+        return True, "OK"
+    except Exception as e:
+        return False, f"Serialization error: {e}"
+
 async def _submit_task_to_miner(
     session: aiohttp.ClientSession,
     chain,
@@ -85,14 +104,31 @@ async def _submit_task_to_miner(
     port = miner.get("port") or config.default_miner_port
     url = f"http://{ip}:{port}{QUERY_ENDPOINT}"
     
-    # Prepare the query with just input (miner should predict output)
     query_data = {
         "problem_id": problem_data['id'],
-        "input": problem_data['problem']['input'],
-        "difficulty": problem_data['difficulty']
+        "train_examples": problem_data['problem_set']['train_examples'],
+        "test_input": problem_data['problem_set']['test_input'],
+        "num_train": problem_data['num_train']
     }
     
-    logger.info(f"Submitting task to UID {uid} with problem {problem_data['id']} (difficulty: {problem_data['difficulty']})")
+    train_ex_count = len(query_data['train_examples'])
+    logger.info(f"Submitting task to UID {uid} with problem {problem_data['id']} "
+               f"(train_examples: {train_ex_count})")
+    
+    if train_ex_count == 0:
+        logger.error(f"⚠️  PROBLEM: query_data has ZERO training examples for problem {problem_data['id']}")
+        logger.error(f"   problem_set keys: {problem_data['problem_set'].keys()}")
+        logger.error(f"   problem_set train_examples length: {len(problem_data['problem_set']['train_examples'])}")
+    else:
+        logger.debug(f"✓ query_data has {train_ex_count} training examples")
+        first_ex = query_data['train_examples'][0]
+        logger.debug(f"  First example keys: {first_ex.keys() if isinstance(first_ex, dict) else type(first_ex)}")
+    
+    is_valid, msg = _deep_validate_data(query_data, "query_data")
+    if not is_valid:
+        logger.error(f"⚠️  Data validation failed for UID {uid}: {msg}")
+        return None
+    logger.debug(f"✓ Data validation passed: {msg}")
     
     body, headers = Epistula.create_request(
         keypair=chain.keypair,
@@ -100,11 +136,13 @@ async def _submit_task_to_miner(
         data=query_data,
         version=1
     )
-    
+        
     try:
         async with session.post(url, json=body, headers=headers, timeout=5) as resp:
             if resp.status != 200:
                 logger.error(f"Failed to submit task to UID {uid}: HTTP {resp.status}")
+                response_text = await resp.text()
+                logger.debug(f"Response: {response_text[:200]}")
                 return None
             
             response_text = await resp.text()
@@ -113,6 +151,7 @@ async def _submit_task_to_miner(
             
             if not task_id:
                 logger.error(f"No task_id in response from UID {uid}")
+                logger.debug(f"Full response: {response_json}")
                 return None
             
             logger.debug(f"UID {uid} accepted task with ID: {task_id}")
@@ -142,7 +181,6 @@ async def _poll_task_result(
     
     for attempt in range(max_attempts):
         try:
-            # Create authenticated request for checking task
             check_data = {"task_id": task_id}
             body, headers = Epistula.create_request(
                 keypair=chain.keypair,
@@ -184,8 +222,7 @@ async def _poll_task_result(
                             }
                         }
                     
-                    # Calculate metrics
-                    expected_output = problem_data['problem']['output']
+                    expected_output = problem_data['problem_set']['test_output']
                     exact_match = predicted_output == expected_output
                     partial_correctness = calculate_partial_correctness(predicted_output, expected_output)
                     grid_similarity = calculate_grid_similarity(predicted_output, expected_output)
@@ -244,7 +281,6 @@ async def _poll_task_result(
             await asyncio.sleep(poll_interval)
             continue
     
-    # Timeout after max attempts
     dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
     logger.error(f"Timeout waiting for task {task_id} from UID {uid} after {max_attempts} attempts")
     return {
@@ -272,7 +308,6 @@ async def _query_one_with_problem(
 ) -> Dict:
     """Query a single miner with an ARC problem using task-based approach"""
     
-    # Step 1: Submit task and get task ID
     task_id = await _submit_task_to_miner(session, chain, config, uid, miner, problem_data)
     
     if not task_id:
@@ -291,7 +326,6 @@ async def _query_one_with_problem(
             }
         }
     
-    # Step 2: Poll for result
     result = await _poll_task_result(
         session, chain, config, uid, miner, task_id, problem_data,
         max_attempts=50,
@@ -313,7 +347,6 @@ async def query_miners_with_problems(
     timeout = aiohttp.ClientTimeout(total=60)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        # Create all query tasks
         tasks = []
         for problem_data in problems_batch:
             for uid, miner in miners.items():
@@ -321,13 +354,11 @@ async def query_miners_with_problems(
                     session, chain, config, uid, miner, problem_data
                 ))
         
-        # Execute and collect results
         for fut in asyncio.as_completed(tasks):
             res = await fut
             uid = res["uid"]
             results[uid].append(res)
             
-            # Store in database with metrics
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
@@ -340,11 +371,9 @@ async def query_miners_with_problems(
                 partial_correctness=res["metrics"]["partial_correctness"],
                 grid_similarity=res["metrics"]["grid_similarity"],
                 efficiency_score=res["metrics"]["efficiency_score"],
-                problem_difficulty=next((p['difficulty'] for p in problems_batch if p['id'] == res['problem_id']), None),
                 problem_id=res["problem_id"]
             )
     
-    # Summary logging
     total_queries = sum(len(r) for r in results.values())
     successful = sum(1 for uid_results in results.values() for r in uid_results if r["success"])
     exact_matches = sum(1 for uid_results in results.values() for r in uid_results if r["metrics"]["exact_match"])
