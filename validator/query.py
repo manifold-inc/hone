@@ -6,7 +6,7 @@ from loguru import logger
 import json
 
 from common.epistula import Epistula
-from common.constants import QUERY_ENDPOINT, CHECK_TASK_ENDPOINT
+from common.constants import QUERY_ENDPOINT, CHECK_TASK_ENDPOINT, MAX_POLL_ATTEMPTS, POLL_INTERVAL 
 
 
 def calculate_grid_similarity(grid1: List[List[int]], grid2: List[List[int]]) -> float:
@@ -169,8 +169,8 @@ async def _poll_task_result(
     miner: Dict,
     task_id: str,
     problem_data: Dict,
-    max_attempts: int = 50,
-    poll_interval: float = 10
+    max_attempts: int = MAX_POLL_ATTEMPTS,
+    poll_interval: float = POLL_INTERVAL
 ) -> Dict:
     """Poll for task result from miner"""
     ip = miner.get("ip")

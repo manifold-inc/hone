@@ -1,4 +1,3 @@
-# miner/arc/solver.py
 import os
 import re
 import json
