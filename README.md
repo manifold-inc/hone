@@ -1,4 +1,4 @@
-# Hone Subnet — ARC‑AGI Problem Solving (Production‑Focused)
+# Hone Subnet — ARC‑AGI Problem Solving
 
 A Bittensor subnet where **validators** continuously generate novel ARC‑AGI‑2 problems and score **miners** based on quality and latency
 ---
