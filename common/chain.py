@@ -281,6 +281,9 @@ def set_node_weights(
     version_key: int = 0,
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = True,
+    wallet_name: Optional[str] = None,
+    wallet_hotkey: Optional[str] = None,
+    wallet_path: Optional[str] = None,
 ) -> bool:
     """Set node weights with all checks"""
     node_ids_formatted, node_weights_formatted = _normalize_and_quantize_weights(node_ids, node_weights)
@@ -304,7 +307,10 @@ def set_node_weights(
     if commit_reveal_enabled:
         substrate.close()
         
-        # Use bittensor library for commit-reveal
+        if not wallet_name or not wallet_hotkey:
+            logger.error("Commit-reveal requires wallet_name and wallet_hotkey")
+            return False
+        
         try:
             config = bt.subtensor.config()
             config.subtensor.chain_endpoint = substrate.url
@@ -312,13 +318,10 @@ def set_node_weights(
             
             subtensor = bt.subtensor(config=config)
             
-            # Convert node_weights back to float for bittensor API
             max_weight = max(node_weights_formatted) if node_weights_formatted else 1
             node_weights_float = [w / max_weight for w in node_weights_formatted]
             
-            # Create wallet from keypair
-            wallet = bt.wallet()
-            wallet._hotkey = keypair
+            wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey, path=wallet_path)
             
             result, msg = subtensor.set_weights(
                 wallet=wallet,
@@ -390,6 +393,9 @@ class ChainInterface:
         self.substrate: Optional[SubstrateInterface] = None
         self.keypair: Optional[Keypair] = None
         self.validator_uid: Optional[int] = None
+        self.wallet_name = wallet_name
+        self.wallet_hotkey = wallet_hotkey
+        self.wallet_path = wallet_path
         
         if wallet_name and wallet_hotkey:
             self.keypair = load_hotkey_keypair(wallet_name, wallet_hotkey, wallet_path)
@@ -467,6 +473,9 @@ class ChainInterface:
             version_key=version,
             wait_for_inclusion=wait_for_inclusion,
             wait_for_finalization=wait_for_finalization,
+            wallet_name=self.wallet_name,
+            wallet_hotkey=self.wallet_hotkey,
+            wallet_path=self.wallet_path,
         )
         
         if success:
