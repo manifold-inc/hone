@@ -2,6 +2,8 @@ from typing import Dict, List
 from loguru import logger
 from substrateinterface.exceptions import SubstrateRequestException
 from common.chain import can_set_weights
+import os
+
 
 async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
     """
@@ -92,6 +94,7 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
     
     return {uid: metrics["score"] for uid, metrics in scores.items()}
 
+
 def _normalize_scores(scores: Dict[int, float], weight_max: int = 65535) -> Dict[int, float]:
     if not scores:
         return {}
@@ -102,6 +105,7 @@ def _normalize_scores(scores: Dict[int, float], weight_max: int = 65535) -> Dict
     
     normalized = {uid: (s / total) * weight_max for uid, s in scores.items()}
     return normalized
+
 
 def _validate_scores(scores: Dict[int, float]) -> bool:
     if not scores:
@@ -118,7 +122,7 @@ def _validate_scores(scores: Dict[int, float]) -> bool:
     
     return True
 
-import os
+
 async def set_weights(chain, config, scores: Dict[int, float], version: int = 0) -> bool:
     
     BURN_UID = int(os.getenv("BURN_UID", "251"))
@@ -136,6 +140,7 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
             weight_values = [65535.0]
             logger.info("No valid scores, setting 100% weight to burn UID")
         else:
+            logger.warning("No valid scores and burn protection disabled - cannot set weights")
             return False
     else:
         if use_burn:
@@ -165,6 +170,7 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
     logger.debug(f"UIDs: {uids[:10]}..." if len(uids) > 10 else f"UIDs: {uids}")
     logger.debug(f"Weights: {weight_values[:10]}..." if len(weight_values) > 10 else f"Weights: {weight_values}")
 
+    # Ensure we have a connection
     if not chain.substrate:
         chain.connect()
 
@@ -191,7 +197,9 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
         logger.error(f"Failed to set weights - Unexpected error: {e}", exc_info=True)
         return False
 
+
 async def check_can_set_weights(chain, config) -> bool:
+    """Check if the validator can set weights based on rate limiting"""
     if not chain.substrate:
         chain.connect()
     

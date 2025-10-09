@@ -140,9 +140,7 @@ async def _submit_task_to_miner(
     try:
         async with session.post(url, json=body, headers=headers, timeout=5) as resp:
             if resp.status != 200:
-                logger.error(f"Failed to submit task to UID {uid}: HTTP {resp.status}")
                 response_text = await resp.text()
-                logger.debug(f"Response: {response_text[:200]}")
                 return None
             
             response_text = await resp.text()
@@ -158,7 +156,6 @@ async def _submit_task_to_miner(
             return task_id
             
     except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError) as e:
-        logger.error(f"Failed to submit task to UID {uid}: {e}")
         return None
 
 async def _poll_task_result(
@@ -188,8 +185,9 @@ async def _poll_task_result(
                 data=check_data,
                 version=1
             )
-            
-            async with session.get(url, headers=headers, timeout=5) as resp:
+            body_json = json.dumps(body, sort_keys=True)
+
+            async with session.get(url, data=body_json, headers=headers, timeout=5) as resp:
                 if resp.status != 200:
                     logger.error(f"Failed to check task {task_id} for UID {uid}: HTTP {resp.status}")
                     await asyncio.sleep(poll_interval)

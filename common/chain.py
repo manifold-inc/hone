@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from loguru import logger
-
+import os
 from async_substrate_interface import SubstrateInterface
 from substrateinterface import Keypair
 from substrateinterface.exceptions import SubstrateRequestException
@@ -210,11 +210,6 @@ def can_set_weights(substrate: SubstrateInterface, netuid: int, validator_node_i
     return can_set_weights
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1.5, min=2, max=5),
-    reraise=True,
-)
 def _send_weights_to_chain(
     substrate: SubstrateInterface,
     keypair: Keypair,
@@ -226,34 +221,52 @@ def _send_weights_to_chain(
     wait_for_finalization: bool = False,
 ) -> tuple[bool, str | None]:
     """Send weights to chain with retries"""
-    with substrate as si:
-        rpc_call = si.compose_call(
-            call_module="SubtensorModule",
-            call_function="set_weights",
-            call_params={
-                "dests": node_ids,
-                "weights": node_weights,
-                "netuid": netuid,
-                "version_key": version_key,
-            },
-        )
-        extrinsic_to_send = si.create_signed_extrinsic(call=rpc_call, keypair=keypair, era={"period": 5})
-        
-        response = si.submit_extrinsic(
-            extrinsic_to_send,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
-        )
-        
-        if not wait_for_finalization and not wait_for_inclusion:
-            return True, "Not waiting for finalization or inclusion."
-        
-        response.process_events()
-        
-        if response.is_success:
-            return True, "Successfully set weights."
-        
-        return False, format_error_message(response.error_message)
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1.5, min=2, max=5),
+        reraise=True,
+    )
+    def _send_weights():
+        try:
+            with substrate as si:
+                rpc_call = si.compose_call(
+                    call_module="SubtensorModule",
+                    call_function="set_weights",
+                    call_params={
+                        "dests": node_ids,
+                        "weights": node_weights,
+                        "netuid": netuid,
+                        "version_key": version_key,
+                    },
+                )
+                extrinsic_to_send = si.create_signed_extrinsic(
+                    call=rpc_call, 
+                    keypair=keypair, 
+                    era={"period": 5}
+                )
+                
+                response = si.submit_extrinsic(
+                    extrinsic_to_send,
+                    wait_for_inclusion=wait_for_inclusion,
+                    wait_for_finalization=wait_for_finalization,
+                )
+                
+                if not wait_for_finalization and not wait_for_inclusion:
+                    return True, "Not waiting for finalization or inclusion."
+                
+                response.process_events()
+                
+                if response.is_success:
+                    return True, "Successfully set weights."
+                
+                return False, format_error_message(response.error_message)
+                
+        except Exception as e:
+            logger.exception(f"Exception in _send_weights: {str(e)}")
+            raise
+    
+    return _send_weights()
 
 
 def set_node_weights(
@@ -270,9 +283,11 @@ def set_node_weights(
     """Set node weights with all checks"""
     node_ids_formatted, node_weights_formatted = _normalize_and_quantize_weights(node_ids, node_weights)
 
+    # Create fresh substrate connection
     substrate = get_substrate(subtensor_address=substrate.url)
 
     if not can_set_weights(substrate, netuid, validator_node_id):
+        substrate.close()
         return False
 
     substrate, commit_reveal_enabled = query_substrate(
@@ -287,19 +302,26 @@ def set_node_weights(
 
     if commit_reveal_enabled is True:
         logger.error("Commit reveal is enabled but not implemented in this version")
+        substrate.close()
         return False
 
     logger.info(f"Setting weights for subnet {netuid} with version key {version_key}...")
-    success, error_message = _send_weights_to_chain(
-        substrate,
-        keypair,
-        node_ids_formatted,
-        node_weights_formatted,
-        netuid,
-        version_key,
-        wait_for_inclusion,
-        wait_for_finalization,
-    )
+    
+    try:
+        success, error_message = _send_weights_to_chain(
+            substrate,
+            keypair,
+            node_ids_formatted,
+            node_weights_formatted,
+            netuid,
+            version_key,
+            wait_for_inclusion,
+            wait_for_finalization,
+        )
+    except Exception as e:
+        logger.error(f"Exception during weight setting: {e}")
+        substrate.close()
+        return False
 
     if success:
         if wait_for_finalization:

@@ -48,7 +48,6 @@ class Epistula:
             "Content-Type": "application/json"
         }
         
-        logger.debug(f"Created Epistula request from {keypair.ss58_address[:8]}... to {receiver_hotkey[:8]}...")
         return body, headers
     
     @staticmethod
