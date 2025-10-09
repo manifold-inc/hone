@@ -110,25 +110,11 @@ async def _submit_task_to_miner(
         "test_input": problem_data['problem_set']['test_input'],
         "num_train": problem_data['num_train']
     }
-    
-    train_ex_count = len(query_data['train_examples'])
-    logger.info(f"Submitting task to UID {uid} with problem {problem_data['id']} "
-               f"(train_examples: {train_ex_count})")
-    
-    if train_ex_count == 0:
-        logger.error(f"⚠️  PROBLEM: query_data has ZERO training examples for problem {problem_data['id']}")
-        logger.error(f"   problem_set keys: {problem_data['problem_set'].keys()}")
-        logger.error(f"   problem_set train_examples length: {len(problem_data['problem_set']['train_examples'])}")
-    else:
-        logger.debug(f"✓ query_data has {train_ex_count} training examples")
-        first_ex = query_data['train_examples'][0]
-        logger.debug(f"  First example keys: {first_ex.keys() if isinstance(first_ex, dict) else type(first_ex)}")
-    
+        
     is_valid, msg = _deep_validate_data(query_data, "query_data")
     if not is_valid:
         logger.error(f"⚠️  Data validation failed for UID {uid}: {msg}")
         return None
-    logger.debug(f"✓ Data validation passed: {msg}")
     
     body, headers = Epistula.create_request(
         keypair=chain.keypair,
