@@ -8,6 +8,7 @@ from substrateinterface import Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 from scalecodec.utils.ss58 import ss58_encode
 from tenacity import retry, stop_after_attempt, wait_exponential
+import bittensor as bt
 
 
 U16_MAX = 65535
@@ -71,6 +72,7 @@ def load_hotkey_keypair(wallet_name: str, hotkey_name: str, wallet_path: Optiona
         return keypair
     except Exception as e:
         raise ValueError(f"Failed to load keypair: {str(e)}")
+
 
 def query_substrate(
     substrate: SubstrateInterface,
@@ -283,7 +285,6 @@ def set_node_weights(
     """Set node weights with all checks"""
     node_ids_formatted, node_weights_formatted = _normalize_and_quantize_weights(node_ids, node_weights)
 
-    # Create fresh substrate connection
     substrate = get_substrate(subtensor_address=substrate.url)
 
     if not can_set_weights(substrate, netuid, validator_node_id):
@@ -298,12 +299,47 @@ def set_node_weights(
         return_value=True,
     )
 
-    logger.info(f"Commit reveal enabled hyperparameter is set to {commit_reveal_enabled}")
+    logger.info(f"Commit reveal enabled: {commit_reveal_enabled}")
 
-    if commit_reveal_enabled is True:
-        logger.error("Commit reveal is enabled but not implemented in this version")
+    if commit_reveal_enabled:
         substrate.close()
-        return False
+        
+        # Use bittensor library for commit-reveal
+        try:
+            config = bt.subtensor.config()
+            config.subtensor.chain_endpoint = substrate.url
+            config.subtensor.network = None
+            
+            subtensor = bt.subtensor(config=config)
+            
+            # Convert node_weights back to float for bittensor API
+            max_weight = max(node_weights_formatted) if node_weights_formatted else 1
+            node_weights_float = [w / max_weight for w in node_weights_formatted]
+            
+            # Create wallet from keypair
+            wallet = bt.wallet()
+            wallet._hotkey = keypair
+            
+            result, msg = subtensor.set_weights(
+                wallet=wallet,
+                netuid=netuid,
+                uids=node_ids_formatted,
+                weights=node_weights_float,
+                version_key=version_key,
+                wait_for_finalization=wait_for_finalization,
+                wait_for_inclusion=wait_for_inclusion,
+            )
+            
+            if result:
+                logger.info("✅ Successfully set weights using commit-reveal")
+                return True
+            else:
+                logger.error(f"❌ Failed to set weights: {msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Exception during commit-reveal weight setting: {e}")
+            return False
 
     logger.info(f"Setting weights for subnet {netuid} with version key {version_key}...")
     
@@ -449,59 +485,5 @@ class ChainInterface:
         assert self.substrate, "Call connect() first"
         params = params or []
         substrate, value = query_substrate(self.substrate, module, method, params, return_value=True, block=block)
-        self.substrate = substrate  # update in case of reconnection
+        self.substrate = substrate
         return value
-
-
-def main():
-    """Test ChainInterface"""
-    import sys
-    from .constants import MAINNET_ENDPOINT, NETUID_MAINNET
-    
-    WALLET_NAME = "default"
-    WALLET_HOTKEY = "default"
-        
-    try:
-        chain = ChainInterface(
-            endpoint=MAINNET_ENDPOINT,
-            netuid=NETUID_MAINNET,
-            wallet_name=WALLET_NAME,
-            wallet_hotkey=WALLET_HOTKEY
-        )
-        
-        chain.connect()
-        logger.info(f"Connected with address: {chain.get_ss58_address()}")
-    
-        current_block = chain.get_current_block()
-        logger.info(f"Current block: {current_block}")
-        
-        logger.info("Fetching nodes...")
-        nodes = chain.get_nodes()
-        logger.info(f"Found {len(nodes)} nodes")
-        validators = [node for node in nodes if node.is_validator]
-        miners = [node for node in nodes if not node.is_validator]
-        logger.info(f"Validators: {len(validators)}, Miners: {len(miners)}")
-
-        
-        if nodes:
-            for i, node in enumerate(nodes[:5]):
-                logger.info(f"Node {i}: UID={node.uid}, Hotkey={node.hotkey[:8]}..., Stake={getattr(node, 'stake', 0):.2f}")
-                
-        tempo = chain.query_substrate("SubtensorModule", "Tempo", [NETUID])
-        logger.info(f"Subnet tempo: {tempo}")
-        
-        if chain.validator_uid is not None:
-            can_set = can_set_weights(chain.substrate, NETUID, chain.validator_uid)
-            logger.info(f"Can set weights: {can_set}")
-        
-    except Exception as e:
-        logger.error(f"Error in test: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    logger.info("✅ All tests completed successfully!")
-
-
-if __name__ == "__main__":
-    main()

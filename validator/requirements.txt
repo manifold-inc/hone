@@ -9,3 +9,4 @@ psutil
 loguru
 tenacity
 numpy
+bittensor
