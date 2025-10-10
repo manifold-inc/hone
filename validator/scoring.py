@@ -2,6 +2,8 @@ from typing import Dict, List
 from loguru import logger
 from substrateinterface.exceptions import SubstrateRequestException
 from common.chain import can_set_weights
+import os
+
 
 async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
     """
@@ -92,6 +94,7 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
     
     return {uid: metrics["score"] for uid, metrics in scores.items()}
 
+
 def _normalize_scores(scores: Dict[int, float], weight_max: int = 65535) -> Dict[int, float]:
     if not scores:
         return {}
@@ -102,6 +105,7 @@ def _normalize_scores(scores: Dict[int, float], weight_max: int = 65535) -> Dict
     
     normalized = {uid: (s / total) * weight_max for uid, s in scores.items()}
     return normalized
+
 
 def _validate_scores(scores: Dict[int, float]) -> bool:
     if not scores:
@@ -118,22 +122,55 @@ def _validate_scores(scores: Dict[int, float]) -> bool:
     
     return True
 
+
 async def set_weights(chain, config, scores: Dict[int, float], version: int = 0) -> bool:
+    
+    BURN_UID = int(os.getenv("BURN_UID", "251"))
+    BURN_WEIGHT_PERCENT = float(os.getenv("BURN_WEIGHT_PERCENT", "0.99"))
+    
+    use_burn = BURN_WEIGHT_PERCENT > 0
+    
+    if use_burn:
+        logger.info(f"🔥 Burn protection enabled: {BURN_WEIGHT_PERCENT*100:.0f}% to UID {BURN_UID}")
+    
     if not _validate_scores(scores):
-        return False
-
-    weights = _normalize_scores(scores)
-    if not weights:
-        logger.warning("No weights to set after normalization")
-        return False
-
-    uids: List[int] = sorted(weights.keys())
-    weight_values: List[float] = [weights[u] for u in uids]
+        if use_burn:
+            weights = {BURN_UID: 65535.0}
+            uids = [BURN_UID]
+            weight_values = [65535.0]
+            logger.info("No valid scores, setting 100% weight to burn UID")
+        else:
+            logger.warning("No valid scores and burn protection disabled - cannot set weights")
+            return False
+    else:
+        if use_burn:
+            remaining_weight = 65535.0 * (1.0 - BURN_WEIGHT_PERCENT)
+            burn_weight = 65535.0 * BURN_WEIGHT_PERCENT
+            
+            normalized_miner_weights = _normalize_scores(scores, weight_max=remaining_weight)
+            
+            weights = {BURN_UID: burn_weight}
+            weights.update(normalized_miner_weights)
+            
+            uids = sorted(weights.keys())
+            weight_values = [weights[u] for u in uids]
+            
+            logger.info(f"Setting weights: {BURN_WEIGHT_PERCENT*100:.0f}% to burn UID {BURN_UID}, "
+                       f"{(1-BURN_WEIGHT_PERCENT)*100:.0f}% split among {len(scores)} miners")
+        else:
+            weights = _normalize_scores(scores)
+            if not weights:
+                logger.warning("No weights to set after normalization")
+                return False
+            
+            uids = sorted(weights.keys())
+            weight_values = [weights[u] for u in uids]
 
     logger.info(f"Setting weights for {len(uids)} UIDs")
     logger.debug(f"UIDs: {uids[:10]}..." if len(uids) > 10 else f"UIDs: {uids}")
-    logger.debug(f"Weights (normalized): {weight_values[:10]}..." if len(weight_values) > 10 else f"Weights: {weight_values}")
+    logger.debug(f"Weights: {weight_values[:10]}..." if len(weight_values) > 10 else f"Weights: {weight_values}")
 
+    # Ensure we have a connection
     if not chain.substrate:
         chain.connect()
 
@@ -160,7 +197,9 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
         logger.error(f"Failed to set weights - Unexpected error: {e}", exc_info=True)
         return False
 
+
 async def check_can_set_weights(chain, config) -> bool:
+    """Check if the validator can set weights based on rate limiting"""
     if not chain.substrate:
         chain.connect()
     

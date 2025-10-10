@@ -2,12 +2,13 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from loguru import logger
-
+import os
 from async_substrate_interface import SubstrateInterface
 from substrateinterface import Keypair
 from substrateinterface.exceptions import SubstrateRequestException
 from scalecodec.utils.ss58 import ss58_encode
 from tenacity import retry, stop_after_attempt, wait_exponential
+import bittensor as bt
 
 
 U16_MAX = 65535
@@ -71,6 +72,7 @@ def load_hotkey_keypair(wallet_name: str, hotkey_name: str, wallet_path: Optiona
         return keypair
     except Exception as e:
         raise ValueError(f"Failed to load keypair: {str(e)}")
+
 
 def query_substrate(
     substrate: SubstrateInterface,
@@ -210,11 +212,6 @@ def can_set_weights(substrate: SubstrateInterface, netuid: int, validator_node_i
     return can_set_weights
 
 
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1.5, min=2, max=5),
-    reraise=True,
-)
 def _send_weights_to_chain(
     substrate: SubstrateInterface,
     keypair: Keypair,
@@ -226,34 +223,52 @@ def _send_weights_to_chain(
     wait_for_finalization: bool = False,
 ) -> tuple[bool, str | None]:
     """Send weights to chain with retries"""
-    with substrate as si:
-        rpc_call = si.compose_call(
-            call_module="SubtensorModule",
-            call_function="set_weights",
-            call_params={
-                "dests": node_ids,
-                "weights": node_weights,
-                "netuid": netuid,
-                "version_key": version_key,
-            },
-        )
-        extrinsic_to_send = si.create_signed_extrinsic(call=rpc_call, keypair=keypair, era={"period": 5})
-        
-        response = si.submit_extrinsic(
-            extrinsic_to_send,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
-        )
-        
-        if not wait_for_finalization and not wait_for_inclusion:
-            return True, "Not waiting for finalization or inclusion."
-        
-        response.process_events()
-        
-        if response.is_success:
-            return True, "Successfully set weights."
-        
-        return False, format_error_message(response.error_message)
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1.5, min=2, max=5),
+        reraise=True,
+    )
+    def _send_weights():
+        try:
+            with substrate as si:
+                rpc_call = si.compose_call(
+                    call_module="SubtensorModule",
+                    call_function="set_weights",
+                    call_params={
+                        "dests": node_ids,
+                        "weights": node_weights,
+                        "netuid": netuid,
+                        "version_key": version_key,
+                    },
+                )
+                extrinsic_to_send = si.create_signed_extrinsic(
+                    call=rpc_call, 
+                    keypair=keypair, 
+                    era={"period": 5}
+                )
+                
+                response = si.submit_extrinsic(
+                    extrinsic_to_send,
+                    wait_for_inclusion=wait_for_inclusion,
+                    wait_for_finalization=wait_for_finalization,
+                )
+                
+                if not wait_for_finalization and not wait_for_inclusion:
+                    return True, "Not waiting for finalization or inclusion."
+                
+                response.process_events()
+                
+                if response.is_success:
+                    return True, "Successfully set weights."
+                
+                return False, format_error_message(response.error_message)
+                
+        except Exception as e:
+            logger.exception(f"Exception in _send_weights: {str(e)}")
+            raise
+    
+    return _send_weights()
 
 
 def set_node_weights(
@@ -266,6 +281,9 @@ def set_node_weights(
     version_key: int = 0,
     wait_for_inclusion: bool = False,
     wait_for_finalization: bool = True,
+    wallet_name: Optional[str] = None,
+    wallet_hotkey: Optional[str] = None,
+    wallet_path: Optional[str] = None,
 ) -> bool:
     """Set node weights with all checks"""
     node_ids_formatted, node_weights_formatted = _normalize_and_quantize_weights(node_ids, node_weights)
@@ -273,6 +291,7 @@ def set_node_weights(
     substrate = get_substrate(subtensor_address=substrate.url)
 
     if not can_set_weights(substrate, netuid, validator_node_id):
+        substrate.close()
         return False
 
     substrate, commit_reveal_enabled = query_substrate(
@@ -283,23 +302,65 @@ def set_node_weights(
         return_value=True,
     )
 
-    logger.info(f"Commit reveal enabled hyperparameter is set to {commit_reveal_enabled}")
+    logger.info(f"Commit reveal enabled: {commit_reveal_enabled}")
 
-    if commit_reveal_enabled is True:
-        logger.error("Commit reveal is enabled but not implemented in this version")
-        return False
+    if commit_reveal_enabled:
+        substrate.close()
+        
+        if not wallet_name or not wallet_hotkey:
+            logger.error("Commit-reveal requires wallet_name and wallet_hotkey")
+            return False
+        
+        try:
+            config = bt.subtensor.config()
+            config.subtensor.chain_endpoint = substrate.url
+            config.subtensor.network = None
+            
+            subtensor = bt.subtensor(config=config)
+            
+            max_weight = max(node_weights_formatted) if node_weights_formatted else 1
+            node_weights_float = [w / max_weight for w in node_weights_formatted]
+            
+            wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey, path=wallet_path)
+            
+            result, msg = subtensor.set_weights(
+                wallet=wallet,
+                netuid=netuid,
+                uids=node_ids_formatted,
+                weights=node_weights_float,
+                version_key=version_key,
+                wait_for_finalization=wait_for_finalization,
+                wait_for_inclusion=wait_for_inclusion,
+            )
+            
+            if result:
+                logger.info("✅ Successfully set weights using commit-reveal")
+                return True
+            else:
+                logger.error(f"❌ Failed to set weights: {msg}")
+                return False
+                
+        except Exception as e:
+            logger.error(f"Exception during commit-reveal weight setting: {e}")
+            return False
 
     logger.info(f"Setting weights for subnet {netuid} with version key {version_key}...")
-    success, error_message = _send_weights_to_chain(
-        substrate,
-        keypair,
-        node_ids_formatted,
-        node_weights_formatted,
-        netuid,
-        version_key,
-        wait_for_inclusion,
-        wait_for_finalization,
-    )
+    
+    try:
+        success, error_message = _send_weights_to_chain(
+            substrate,
+            keypair,
+            node_ids_formatted,
+            node_weights_formatted,
+            netuid,
+            version_key,
+            wait_for_inclusion,
+            wait_for_finalization,
+        )
+    except Exception as e:
+        logger.error(f"Exception during weight setting: {e}")
+        substrate.close()
+        return False
 
     if success:
         if wait_for_finalization:
@@ -332,6 +393,9 @@ class ChainInterface:
         self.substrate: Optional[SubstrateInterface] = None
         self.keypair: Optional[Keypair] = None
         self.validator_uid: Optional[int] = None
+        self.wallet_name = wallet_name
+        self.wallet_hotkey = wallet_hotkey
+        self.wallet_path = wallet_path
         
         if wallet_name and wallet_hotkey:
             self.keypair = load_hotkey_keypair(wallet_name, wallet_hotkey, wallet_path)
@@ -409,6 +473,9 @@ class ChainInterface:
             version_key=version,
             wait_for_inclusion=wait_for_inclusion,
             wait_for_finalization=wait_for_finalization,
+            wallet_name=self.wallet_name,
+            wallet_hotkey=self.wallet_hotkey,
+            wallet_path=self.wallet_path,
         )
         
         if success:
@@ -427,59 +494,5 @@ class ChainInterface:
         assert self.substrate, "Call connect() first"
         params = params or []
         substrate, value = query_substrate(self.substrate, module, method, params, return_value=True, block=block)
-        self.substrate = substrate  # update in case of reconnection
+        self.substrate = substrate
         return value
-
-
-def main():
-    """Test ChainInterface"""
-    import sys
-    from .constants import MAINNET_ENDPOINT, NETUID_MAINNET
-    
-    WALLET_NAME = "default"
-    WALLET_HOTKEY = "default"
-        
-    try:
-        chain = ChainInterface(
-            endpoint=MAINNET_ENDPOINT,
-            netuid=NETUID_MAINNET,
-            wallet_name=WALLET_NAME,
-            wallet_hotkey=WALLET_HOTKEY
-        )
-        
-        chain.connect()
-        logger.info(f"Connected with address: {chain.get_ss58_address()}")
-    
-        current_block = chain.get_current_block()
-        logger.info(f"Current block: {current_block}")
-        
-        logger.info("Fetching nodes...")
-        nodes = chain.get_nodes()
-        logger.info(f"Found {len(nodes)} nodes")
-        validators = [node for node in nodes if node.is_validator]
-        miners = [node for node in nodes if not node.is_validator]
-        logger.info(f"Validators: {len(validators)}, Miners: {len(miners)}")
-
-        
-        if nodes:
-            for i, node in enumerate(nodes[:5]):
-                logger.info(f"Node {i}: UID={node.uid}, Hotkey={node.hotkey[:8]}..., Stake={getattr(node, 'stake', 0):.2f}")
-                
-        tempo = chain.query_substrate("SubtensorModule", "Tempo", [NETUID])
-        logger.info(f"Subnet tempo: {tempo}")
-        
-        if chain.validator_uid is not None:
-            can_set = can_set_weights(chain.substrate, NETUID, chain.validator_uid)
-            logger.info(f"Can set weights: {can_set}")
-        
-    except Exception as e:
-        logger.error(f"Error in test: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
-    
-    logger.info("✅ All tests completed successfully!")
-
-
-if __name__ == "__main__":
-    main()
