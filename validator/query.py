@@ -108,8 +108,9 @@ async def _submit_task_to_miner(
         "problem_id": problem_data['id'],
         "train_examples": problem_data['problem_set']['train_examples'],
         "test_input": problem_data['problem_set']['test_input'],
-        "num_train": problem_data['num_train']
+        "num_train": problem_data['num_train_examples']
     }
+
         
     is_valid, msg = _deep_validate_data(query_data, "query_data")
     if not is_valid:
@@ -203,7 +204,11 @@ async def _poll_task_result(
                                 "partial_correctness": 0.0,
                                 "grid_similarity": 0.0,
                                 "efficiency_score": 0.0
-                            }
+                            },
+                            "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
+                            "chain_length": problem_data.get('metadata', {}).get('chain_length'),
+                            "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
+                            "num_train_examples": problem_data.get('num_train_examples')
                         }
                     
                     expected_output = problem_data['problem_set']['test_output']
@@ -228,7 +233,11 @@ async def _poll_task_result(
                             "partial_correctness": partial_correctness,
                             "grid_similarity": grid_similarity,
                             "efficiency_score": efficiency_score
-                        }
+                        },
+                        "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
+                        "chain_length": problem_data.get('metadata', {}).get('chain_length'),
+                        "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
+                        "num_train_examples": problem_data.get('num_train_examples')
                     }
                 
                 elif status == 'failed':
@@ -247,7 +256,11 @@ async def _poll_task_result(
                             "partial_correctness": 0.0,
                             "grid_similarity": 0.0,
                             "efficiency_score": 0.0
-                        }
+                        },
+                        "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
+                        "chain_length": problem_data.get('metadata', {}).get('chain_length'),
+                        "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
+                        "num_train_examples": problem_data.get('num_train_examples')
                     }
                 
                 elif status in ['pending', 'processing']:
@@ -279,7 +292,11 @@ async def _poll_task_result(
             "partial_correctness": 0.0,
             "grid_similarity": 0.0,
             "efficiency_score": 0.0
-        }
+        },
+        "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
+        "chain_length": problem_data.get('metadata', {}).get('chain_length'),
+        "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
+        "num_train_examples": problem_data.get('num_train_examples')
     }
 
 async def _query_one_with_problem(
@@ -355,7 +372,11 @@ async def query_miners_with_problems(
                 partial_correctness=res["metrics"]["partial_correctness"],
                 grid_similarity=res["metrics"]["grid_similarity"],
                 efficiency_score=res["metrics"]["efficiency_score"],
-                problem_id=res["problem_id"]
+                problem_id=res["problem_id"],
+                base_task_num=res.get("base_task_num"),
+                chain_length=res.get("chain_length"),
+                transformation_chain=res.get("transformation_chain"),
+                num_train_examples=res.get("num_train_examples")
             )
     
     total_queries = sum(len(r) for r in results.values())

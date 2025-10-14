@@ -1,13 +1,13 @@
 import asyncio
 from loguru import logger
 import signal
+import time
 
 from common.chain import ChainInterface
 from validator.config import ValidatorConfig
 from validator.db import Database
 from validator import cycle
 from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator
-import random
 
 class Validator:
     def __init__(self, config: ValidatorConfig):
@@ -43,6 +43,8 @@ class Validator:
         }
 
         self.synthetic_generator = ARC2Generator(max_chain_length=2)
+
+        self.last_cleanup_time = None
     
     async def start(self):
         await self.db.connect()
@@ -78,6 +80,18 @@ class Validator:
         except Exception as e:
             logger.warning(f"Could not read current block from chain ({e}); falling back to 0")
             return 0
+    
+    async def maybe_cleanup_database(self):
+        """Periodically cleanup old database records"""        
+        current_time = time.time()
+        cleanup_interval_seconds = self.config.cleanup_interval_hours * 3600
+        
+        if (self.last_cleanup_time is None or 
+            current_time - self.last_cleanup_time > cleanup_interval_seconds):
+            
+            logger.info(f"Running database cleanup (retention: {self.config.retention_days} days)")
+            await self.db.cleanup_old_data(self.config.retention_days)
+            self.last_cleanup_time = current_time
 
     async def run(self):
         try:

@@ -16,12 +16,18 @@ CREATE TABLE IF NOT EXISTS query_results (
     uid INTEGER NOT NULL,
     success BOOLEAN NOT NULL,
     
-    -- New metrics fields
+    -- Metrics fields
     exact_match BOOLEAN DEFAULT FALSE,
-    partial_correctness REAL DEFAULT 0.0,  -- 0-1 score
-    grid_similarity REAL DEFAULT 0.0,      -- 0-1 score  
-    efficiency_score REAL DEFAULT 0.0,     -- 0-1 score based on response time
-    problem_id VARCHAR(255),               -- unique identifier for the problem
+    partial_correctness REAL DEFAULT 0.0,
+    grid_similarity REAL DEFAULT 0.0,
+    efficiency_score REAL DEFAULT 0.0,
+    
+    -- Task metadata for overfitting analysis
+    problem_id VARCHAR(255),
+    base_task_num INTEGER,                 -- Original ARC-1 task number
+    chain_length INTEGER,                  -- Number of transformations
+    transformation_chain JSONB,            -- Full transformation chain
+    num_train_examples INTEGER,            -- Training examples provided
     
     response JSONB,
     error TEXT,
@@ -30,6 +36,7 @@ CREATE TABLE IF NOT EXISTS query_results (
     
     FOREIGN KEY (uid) REFERENCES miners(uid) ON DELETE CASCADE
 );
+
 
 CREATE TABLE IF NOT EXISTS scores (
     id SERIAL PRIMARY KEY,
@@ -47,5 +54,8 @@ CREATE TABLE IF NOT EXISTS scores (
 CREATE INDEX IF NOT EXISTS idx_query_results_block ON query_results(block);
 CREATE INDEX IF NOT EXISTS idx_query_results_uid ON query_results(uid);
 CREATE INDEX IF NOT EXISTS idx_query_results_timestamp ON query_results(timestamp);
+CREATE INDEX IF NOT EXISTS idx_query_results_base_task ON query_results(base_task_num);
+CREATE INDEX IF NOT EXISTS idx_query_results_chain_length ON query_results(chain_length);
+
 CREATE INDEX IF NOT EXISTS idx_scores_uid ON scores(uid);
 CREATE INDEX IF NOT EXISTS idx_scores_timestamp ON scores(timestamp);

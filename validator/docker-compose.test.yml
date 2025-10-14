@@ -11,6 +11,7 @@ services:
     ports:
       - "5433:5432"
     volumes:
+      - test_db_data:/var/lib/postgresql/data
       - ./sql/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d hone_test"]
@@ -135,6 +136,3 @@ networks:
 
 volumes:
   test_db_data:
-
-environment:
-  - OPENAI_API_KEY=${OPENAI_API_KEY:-your-key-here}

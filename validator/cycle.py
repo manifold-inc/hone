@@ -69,7 +69,12 @@ async def run_query_cycle(validator, state):
                 problems_batch.append({
                     'id': problem_id,
                     'problem_set': problem_set,
-                    'num_train': actual_train_count
+                    'num_train_examples': actual_train_count,
+                    'metadata': {
+                        'base_task_num': problem_set['metadata']['base_task'],
+                        'chain_length': problem_set['metadata']['chain_length'],
+                        'transformation_chain': problem_set['metadata']['transformation_chain']
+                    }
                 })
                 
                 chain_length_actual = len(problem_set['metadata']['transformation_chain'])
@@ -88,6 +93,8 @@ async def run_query_cycle(validator, state):
                 current_block
             )
             queries_in_cycle += 1
+            await validator.maybe_cleanup_database()
+
         else:
             logger.warning("No valid problems generated in this round, will retry")
         
@@ -105,7 +112,7 @@ async def run_weights_cycle(validator, state):
     
     logger.info(f"Starting weights cycle at block {current_block}")
     scores = await scoring.calculate_scores(validator.db, validator.config)
-    
+
     if scores:
         await scoring.set_weights(validator.chain, validator.config, scores)
     else:

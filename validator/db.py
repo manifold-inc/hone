@@ -71,23 +71,28 @@ class Database:
         partial_correctness: float = 0.0,
         grid_similarity: float = 0.0,
         efficiency_score: float = 0.0,
-        problem_id: Optional[str] = None
+        problem_id: Optional[str] = None,
+        base_task_num: Optional[int] = None,
+        chain_length: Optional[int] = None,
+        transformation_chain: Optional[List[Dict]] = None,
+        num_train_examples: Optional[int] = None
     ):
         async with self.pool.acquire() as conn:
             response_json = json.dumps(response) if response else None
+            chain_json = json.dumps(transformation_chain) if transformation_chain else None
             
             await conn.execute(
                 """
                 INSERT INTO query_results (
                     block, uid, success, response, error, response_time, timestamp,
                     exact_match, partial_correctness, grid_similarity, efficiency_score,
-                    problem_id
+                    problem_id, base_task_num, chain_length, transformation_chain, num_train_examples
                 )
-                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12)
+                VALUES ($1, $2, $3, $4::jsonb, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16)
                 """,
                 block, uid, success, response_json, error, response_time, ts,
                 exact_match, partial_correctness, grid_similarity, efficiency_score,
-                problem_id
+                problem_id, base_task_num, chain_length, chain_json, num_train_examples
             )
 
     async def get_recent_results(self, window_blocks: int, current_block: int) -> List[asyncpg.Record]:
@@ -153,3 +158,64 @@ class Database:
                 uid, min_block
             )
             return dict(stats) if stats else {}
+    
+    async def cleanup_old_data(self, retention_days: int):
+        """Delete data older than retention_days to prevent disk overflow"""
+        async with self.pool.acquire() as conn:
+            deleted_queries = await conn.execute(
+                """
+                DELETE FROM query_results
+                WHERE timestamp < NOW() - ($1 || ' days')::interval
+                """,
+                str(retention_days)
+            )
+            
+            deleted_scores = await conn.execute(
+                """
+                DELETE FROM scores
+                WHERE timestamp < NOW() - ($1 || ' days')::interval
+                """,
+                str(retention_days)
+            )
+            
+            logger.info(f"Cleaned up data older than {retention_days} days")
+            return deleted_queries, deleted_scores
+
+    async def get_performance_by_task_type(self, uid: int, window_blocks: int, current_block: int) -> Dict:
+        """Analyze miner performance by task characteristics to detect overfitting"""
+        min_block = max(0, current_block - window_blocks)
+        async with self.pool.acquire() as conn:
+            by_task = await conn.fetch(
+                """
+                SELECT 
+                    base_task_num,
+                    COUNT(*) as attempts,
+                    AVG(CASE WHEN exact_match THEN 1.0 ELSE 0.0 END) as exact_match_rate,
+                    AVG(partial_correctness) as avg_partial
+                FROM query_results
+                WHERE uid = $1 AND block >= $2 AND base_task_num IS NOT NULL
+                GROUP BY base_task_num
+                ORDER BY attempts DESC
+                """,
+                uid, min_block
+            )
+            
+            by_chain = await conn.fetch(
+                """
+                SELECT 
+                    chain_length,
+                    COUNT(*) as attempts,
+                    AVG(CASE WHEN exact_match THEN 1.0 ELSE 0.0 END) as exact_match_rate,
+                    AVG(partial_correctness) as avg_partial
+                FROM query_results
+                WHERE uid = $1 AND block >= $2 AND chain_length IS NOT NULL
+                GROUP BY chain_length
+                ORDER BY chain_length
+                """,
+                uid, min_block
+            )
+            
+            return {
+                'by_base_task': [dict(row) for row in by_task],
+                'by_chain_length': [dict(row) for row in by_chain]
+            }

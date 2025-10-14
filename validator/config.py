@@ -30,6 +30,9 @@ class ValidatorConfig:
 
     min_train_examples: int = int(os.getenv("MIN_TRAIN_EXAMPLES", "3"))
     max_train_examples: int = int(os.getenv("MAX_TRAIN_EXAMPLES", "4"))
+
+    retention_days: int = int(os.getenv("RETENTION_DAYS", "30"))
+    cleanup_interval_hours: int = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
     
     @property
     def cycle_duration(self) -> int:
