@@ -1,0 +1,12 @@
+substrate-interface
+async_substrate_interface
+aiohttp
+asyncpg
+python-dotenv
+pyyaml
+retry
+psutil
+loguru
+tenacity
+numpy
+bittensor

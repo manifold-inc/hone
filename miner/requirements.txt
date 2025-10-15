@@ -1,0 +1,8 @@
+substrate-interface
+fastapi
+uvicorn[standard]
+loguru
+python-dotenv
+numpy
+tenacity
+openai

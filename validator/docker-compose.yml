@@ -1,0 +1,55 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-hone}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hone}"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "${ADMINER_PORT:-8080}:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  validator:
+    build:
+      context: ..
+      dockerfile: validator/Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DB_URL: ${DB_URL:-postgresql://postgres:postgres@db:5432/hone}
+      CHAIN_ENDPOINT: ${CHAIN_ENDPOINT:-wss://test.finney.opentensor.ai:443}
+      NETUID: ${NETUID:-1}
+      WALLET_NAME: ${WALLET_NAME:-}
+      WALLET_HOTKEY: ${WALLET_HOTKEY:-default}
+      WALLET_PATH: ${WALLET_PATH:-}
+      CYCLE_DURATION: ${CYCLE_DURATION:-30}
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "validator.main"]
+    ports:
+      - "${VALIDATOR_PORT:-8092}:8092"
+    volumes:
+      - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
+
+volumes:
+  db_data:

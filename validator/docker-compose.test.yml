@@ -1,0 +1,138 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: hone_test
+    ports:
+      - "5433:5432"
+    volumes:
+      - test_db_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hone_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    networks:
+      - hone-test
+
+  adminer:
+    image: adminer
+    restart: unless-stopped
+    ports:
+      - "8081:8080"  
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - hone-test
+
+  validator:
+    build:
+      context: ..
+      dockerfile: validator/Dockerfile
+    restart: unless-stopped
+    environment:
+      USE_MOCK_CHAIN: "true"
+      SKIP_EPISTULA_VERIFY: "true"
+      
+      NETUID: 5
+      CHAIN_ENDPOINT: "mock://localhost"
+      
+      DB_URL: postgresql://postgres:postgres@db:5432/hone_test
+      
+      CYCLE_DURATION: 5  
+      
+      WALLET_NAME: validator
+      WALLET_HOTKEY: validator
+      
+      LOG_LEVEL: INFO
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "validator.main"]
+    ports:
+      - "8092:8092"
+    networks:
+      - hone-test
+
+  miner1:
+    build:
+      context: ..
+      dockerfile: miner/Dockerfile
+    restart: unless-stopped
+    environment:
+      SKIP_EPISTULA_VERIFY: "true"
+      WALLET_NAME: miner1
+      WALLET_HOTKEY: miner1
+      MINER_PORT: 8091
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+      OPENAI_MODEL: "gpt-5"
+    ports:
+      - "8091:8091"
+    networks:
+      - hone-test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8091/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  miner2:
+    build:
+      context: ..
+      dockerfile: miner/Dockerfile
+    restart: unless-stopped
+    environment:
+      SKIP_EPISTULA_VERIFY: "true"
+      WALLET_NAME: miner2
+      WALLET_HOTKEY: miner2
+      MINER_PORT: 8092
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+      OPENAI_MODEL: "o3"
+    ports:
+      - "8093:8092"
+    networks:
+      - hone-test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8092/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  miner3:
+    build:
+      context: ..
+      dockerfile: miner/Dockerfile
+    restart: unless-stopped
+    environment:
+      SKIP_EPISTULA_VERIFY: "true"
+      WALLET_NAME: miner3
+      WALLET_HOTKEY: miner3
+      MINER_PORT: 8093
+      HOST: 0.0.0.0
+      LOG_LEVEL: INFO
+      OPENAI_MODEL: "o3-mini"
+    ports:
+      - "8094:8093" 
+    networks:
+      - hone-test
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8093/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+networks:
+  hone-test:
+    driver: bridge
+
+volumes:
+  test_db_data:
