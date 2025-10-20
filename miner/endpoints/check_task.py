@@ -34,10 +34,9 @@ async def check_task(request: Request, task_id: str = Path(..., description="Tas
         if not signature:
             raise HTTPException(status_code=401, detail="Missing Body-Signature header")
         
-        body_data = {"task_id": task_id}
-        body_bytes = json.dumps(body_data, sort_keys=True).encode('utf-8')
-        
-        is_valid, error, parsed_body = Epistula.verify_request(body_bytes, signature)
+        body = await request.body()
+
+        is_valid, error, parsed_body = Epistula.verify_request(body, signature)
         
         if not is_valid:
             raise HTTPException(status_code=401, detail=f"Invalid signature: {error}")
