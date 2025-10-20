@@ -5,10 +5,10 @@ A Bittensor subnet where **validators** continuously generate novel ARC‑AGI‑
 
 ## Overview
 
-- **Validators**
+- [**Validators**](#validator-setup)
   - Discover registered miners from chain, generate synthetic ARC‑AGI‑2 tasks, dispatch queries, score responses, and push **on‑chain weights** by performance.
   - Persists results + metrics to Postgres for analytics and stability.
-- **Miners**
+- [**Miners**](#miner-setup)
   - Expose a minimal HTTP API (FastAPI) that receives ARC tasks and returns predicted grids.
   - You can plug your own solver (LLM, search, program synthesis, classical vision, HRMs, etc).
 
@@ -57,16 +57,16 @@ hone/
 
 ---
 
-## Production Deployment (mainnet)
+## Deployment (mainnet)
 
-### 0) Prerequisites
+### Prerequisites
 
 - **Python 3.10+**
 - **Docker & Docker Compose**
 - **Bittensor** installed (`btcli` available)
 - A wallet with some **TAO** (Finney testnet or mainnet)
 
-### 1) Create/Import Wallets
+### Create/Import Wallets
 
 ```bash
 # Coldkey
@@ -77,11 +77,17 @@ btcli wallet new_hotkey --wallet.name default --wallet.hotkey validator
 btcli wallet new_hotkey --wallet.name default --wallet.hotkey miner
 ```
 
-> Store wallets on the host under `~/.bittensor/wallets`. The validator and miner containers **mount** this directory read‑only.
+> [!NOTE] Wallet files location
+> Store wallet files on the host under `~/.bittensor/wallets`.  
+> The validator and miner containers **mount** this directory read‑only.
 
-### 2) Set Environment (Validator)
 
-Create **`validator/.env`** (or use your CI secrets). Defaults shown match `validator/docker-compose.yml`:
+### Validator Setup
+
+#### Setup Environment Variables
+
+Create **`validator/.env`** (or use your CI secrets).   
+Defaults shown match `validator/docker-compose.yml`:
 
 ```ini
 # ---- Chain ----
@@ -103,9 +109,11 @@ CYCLE_DURATION=30                     # blocks (≈ 6 min on Finney)
 LOG_LEVEL=INFO
 ```
 
-> The compose file will also pass `DB_URL` explicitly. If you keep both, `environment` usually wins over `.env`.
+> [!NOTE] 
+> The compose file will also pass `DB_URL` explicitly.   
+> If you keep both, `environment` usually wins over `.env`.
 
-### 3) Register & Stake (Subnet)
+#### Register & Stake
 
 ```bash
 # Register validator
@@ -115,7 +123,7 @@ btcli subnet register --netuid 5 --wallet.name default --wallet.hotkey validator
 btcli stake add --wallet.name default --wallet.hotkey validator --amount 100
 ```
 
-### 4) Start Validator (DB + App)
+#### Start Validator (DB + App)
 
 From `validator/`:
 
@@ -137,9 +145,9 @@ This will:
 - `query_results(...)` with **exact_match**, **partial_correctness**, **grid_similarity**, **efficiency_score**, **response_time**, **problem_id**
 - `scores(...)` with aggregate metrics
 
-### 5) Miner Setup (Production)
+### Miner Setup
 
-#### a) Miner Environment
+#### Set Environment Variables
 
 Create **`miner/.env`**:
 
@@ -159,7 +167,7 @@ SKIP_EPISTULA_VERIFY=false           # true for local dev only
 
 If using LLMs, set your model/provider secrets as needed (`OPENAI_API_KEY` & `OPENAI_MODEL`).
 
-#### b) Register Miner & Set IP on Chain
+#### Register Miner & Set IP on Chain
 
 ```bash
 # Register the miner identity on the subnet
@@ -173,11 +181,12 @@ python tools/post_ip_chain.py \
   --port 8091 # or any other port you're using
 ```
 
+> [!TIP] Ensure ports are open
 > Ensure your firewall allows inbound traffic to the miner port.
 
-#### c) Run Miner (Docker)
+#### Start Miner (Docker)
 
-From repo root (or `miner/`):
+From the repo root (or `miner/`):
 
 ```bash
 docker build -t hone-miner miner/
@@ -190,6 +199,7 @@ docker run -d --name miner \
 docker logs -f miner
 ```
 
+> [!TIP]
 > The miner serves **FastAPI** endpoints and should respond healthily at `/health`.
 
 ---
@@ -210,7 +220,9 @@ docker logs -f miner
    - Aggregate last N cycles into a **score** per miner.
 3. **Weight Setting**: Push updated weights on‑chain (via chain interface).
 
-> Exact weights can be tuned in `scoring.py` and config constants. Responses are polled (for now 50 attempts, 10s intervals between them).
+> [!TIP] 
+> Exact weights and confi constants can be tuned in `scoring.py`.  
+> Responses are polled (for now 50 attempts, 10s intervals between them).
 
 ---
 
@@ -223,11 +235,13 @@ docker logs -f miner
 - The **solver entrypoint** is in `solver.py`. Replace baseline logic with your own approach (LLM, search, programs, HRMs, etc ).
 - Request handlers live in `handlers.py`. Background checks / queueing in `task_queue.py` and helpers in `check_task.py`.
 
-> For secure traffic, validator ↔ miner messages can be signed/verified using **Epistula** (`common/epistula.py`). In production, **do not** set `SKIP_EPISTULA_VERIFY=true`.
+> [!WARNING] 
+> Validator <-> miner messages are signed/verified using **Epistula** (`common/epistula.py`).   
+> In production, ***do not*** set `SKIP_EPISTULA_VERIFY=true`.
 
 ---
 
-## Developer / Local Testing (Mock Chain)
+## Development / Local Testing (Mock Chain)
 
 ### One‑shot Local Test Script
 
@@ -258,6 +272,7 @@ docker logs validator-miner1-1
 docker-compose -f docker-compose.test.yml down -v
 ```
 
+> [!NOTE] 
 > The test compose sets `USE_MOCK_CHAIN=true`, `SKIP_EPISTULA_VERIFY=true`, and points `DB_URL` to the test DB (`hone_test`).
 
 ---
@@ -304,6 +319,7 @@ LOG_LEVEL=INFO
 SKIP_EPISTULA_VERIFY=false
 ```
 
+> [!TIP]
 > If you use LLMs (e.g., OpenAI), include the relevant keys (e.g., `OPENAI_API_KEY`) and model names in your environment. `miner/requirements.txt` includes `openai` for a reference baseline.
 
 ---
