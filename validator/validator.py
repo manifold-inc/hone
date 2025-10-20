@@ -42,7 +42,7 @@ class Validator:
             'last_weights_block': None
         }
 
-        self.synthetic_generator = ARC2Generator(max_chain_length=2)
+        self.synthetic_generator = ARC2Generator(max_chain_length=6)
 
         self.last_cleanup_time = None
     
