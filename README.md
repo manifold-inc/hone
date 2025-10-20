@@ -84,6 +84,12 @@ btcli wallet new_hotkey --wallet.name default --wallet.hotkey miner
 
 ### Validator Setup
 
+#### Requirements
+Minimum: 
+- 4 CPU
+- 4gb RAM
+- 10gb disk
+
 #### Setup Environment Variables
 
 Create **`validator/.env`** (or use your CI secrets).   
