@@ -171,7 +171,20 @@ LOG_LEVEL=INFO
 SKIP_EPISTULA_VERIFY=false           # true for local dev only
 ```
 
-If using LLMs, set your model/provider secrets as needed (`OPENAI_API_KEY` & `OPENAI_MODEL`).
+If using LLMs, configure your provider:
+
+**OpenAI:**
+```ini
+OPENAI_API_KEY=openaikei-...
+OPENAI_MODEL=gpt-4o
+```
+
+**OpenRouter:**
+```ini
+OPENROUTER_API_KEY=sk-or-v1-...
+OPENROUTER_MODEL=mistralai/mistral-7b-instruct:free
+OPENROUTER_BASE_URL=https://openrouter.ai/api/v1  # optional
+```
 
 #### Register Miner & Set IP on Chain
 
@@ -326,7 +339,7 @@ SKIP_EPISTULA_VERIFY=false
 ```
 
 > [!TIP]
-> If you use LLMs (e.g., OpenAI), include the relevant keys (e.g., `OPENAI_API_KEY`) and model names in your environment. `miner/requirements.txt` includes `openai` for a reference baseline.
+> The solver supports both OpenAI and OpenRouter. Configure the appropriate API key and model in your environment. The miner will automatically detect which provider to use based on the variables set.
 
 ---
 
