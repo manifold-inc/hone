@@ -169,8 +169,8 @@ def _normalize_and_quantize_weights(node_ids: list[int], node_weights: list[floa
     if not any(node_weights):
         return [], []
     
-    max_weight = max(node_weights)
-    scaling_factor = U16_MAX / max_weight
+    total_weight = sum(node_weights)
+    scaling_factor = U16_MAX / total_weight
     
     node_weights_formatted = []
     node_ids_formatted = []
@@ -179,6 +179,12 @@ def _normalize_and_quantize_weights(node_ids: list[int], node_weights: list[floa
         node_ids_formatted.append(node_id)
         quantized_weight = round(node_weight * scaling_factor) if node_weight > 0 else 0
         node_weights_formatted.append(quantized_weight)
+    
+    actual_sum = sum(node_weights_formatted)
+    drift = U16_MAX - actual_sum
+    if drift != 0:
+        max_idx = max(range(len(node_weights_formatted)), key=lambda i: node_weights_formatted[i])
+        node_weights_formatted[max_idx] += drift
     
     return node_ids_formatted, node_weights_formatted
 
