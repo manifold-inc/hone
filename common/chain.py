@@ -301,8 +301,8 @@ def set_node_weights(
                 uids=node_ids_formatted,
                 weights=node_weights_float,
                 version_key=803,
-                wait_for_finalization=wait_for_finalization,
-                wait_for_inclusion=wait_for_inclusion,
+                wait_for_finalization=True,
+                wait_for_inclusion=True,
             )
             
             if result:
