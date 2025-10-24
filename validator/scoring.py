@@ -133,11 +133,22 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
     if use_burn:
         logger.info(f"🔥 Burn protection enabled: {BURN_WEIGHT_PERCENT*100:.0f}% to UID {BURN_UID}")
     
+    # Ensure we have a connection
+    if not chain.substrate:
+        chain.connect()
+    
+    # Get ALL nodes to create full weight array
+    nodes = chain.get_nodes()
+    total_uids = len(nodes)
+    logger.info(f"Total UIDs in subnet: {total_uids}")
+    
+    # Initialize weights for ALL UIDs
+    all_uids = list(range(total_uids))
+    all_weights = [0.0] * total_uids
+    
     if not _validate_scores(scores):
         if use_burn:
-            weights = {BURN_UID: 65535.0}
-            uids = [BURN_UID]
-            weight_values = [65535.0]
+            all_weights[BURN_UID] = 65535.0
             logger.info("No valid scores, setting 100% weight to burn UID")
         else:
             logger.warning("No valid scores and burn protection disabled - cannot set weights")
@@ -149,11 +160,12 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
             
             normalized_miner_weights = _normalize_scores(scores, weight_max=remaining_weight)
             
-            weights = {BURN_UID: burn_weight}
-            weights.update(normalized_miner_weights)
+            # Set burn weight
+            all_weights[BURN_UID] = burn_weight
             
-            uids = sorted(weights.keys())
-            weight_values = [weights[u] for u in uids]
+            # Set miner weights
+            for uid, weight in normalized_miner_weights.items():
+                all_weights[uid] = weight
             
             logger.info(f"Setting weights: {BURN_WEIGHT_PERCENT*100:.0f}% to burn UID {BURN_UID}, "
                        f"{(1-BURN_WEIGHT_PERCENT)*100:.0f}% split among {len(scores)} miners")
@@ -163,23 +175,25 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
                 logger.warning("No weights to set after normalization")
                 return False
             
-            uids = sorted(weights.keys())
-            weight_values = [weights[u] for u in uids]
-
-    logger.info(f"Setting weights for {len(uids)} UIDs")
-    logger.debug(f"UIDs: {uids[:10]}..." if len(uids) > 10 else f"UIDs: {uids}")
-    logger.debug(f"Weights: {weight_values[:10]}..." if len(weight_values) > 10 else f"Weights: {weight_values}")
-
-    # Ensure we have a connection
-    if not chain.substrate:
-        chain.connect()
+            # Set miner weights
+            for uid, weight in weights.items():
+                all_weights[uid] = weight
+    
+    # Log non-zero weights
+    logger.info("=" * 60)
+    logger.info("Non-zero weights being set:")
+    for uid, weight in enumerate(all_weights):
+        if weight > 0:
+            percentage = (weight / 65535.0) * 100
+            logger.info(f"  UID {uid:>3} - Weight: {percentage:>6.2f}%")
+    logger.info("=" * 60)
 
     try:
         result = chain.set_weights(
-            uids=uids,
-            weights=weight_values,
+            uids=all_uids,
+            weights=all_weights,
             version=version,
-            wait_for_inclusion=config.__dict__.get('wait_for_inclusion', False),
+            wait_for_inclusion=config.__dict__.get('wait_for_inclusion', True),
             wait_for_finalization=config.__dict__.get('wait_for_finalization', True)
         )
         
