@@ -278,7 +278,7 @@ def set_node_weights(
         try:
             config = bt.subtensor.config()
             config.subtensor.chain_endpoint = substrate.url
-            config.subtensor.network = None
+            config.subtensor.network = 'finney'
             
             subtensor = bt.subtensor(config=config)
             

@@ -148,43 +148,62 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
     
     if not _validate_scores(scores):
         if use_burn:
-            all_weights[BURN_UID] = 65535.0
+            all_weights[BURN_UID] = 1.0  # Set 100% weight as normalized value
             logger.info("No valid scores, setting 100% weight to burn UID")
         else:
             logger.warning("No valid scores and burn protection disabled - cannot set weights")
             return False
     else:
         if use_burn:
-            remaining_weight = 65535.0 * (1.0 - BURN_WEIGHT_PERCENT)
-            burn_weight = 65535.0 * BURN_WEIGHT_PERCENT
+            # Work in percentages (0-1), not ticks
+            remaining_weight_percent = 1.0 - BURN_WEIGHT_PERCENT
+            burn_weight_percent = BURN_WEIGHT_PERCENT
             
-            normalized_miner_weights = _normalize_scores(scores, weight_max=remaining_weight)
-            
-            # Set burn weight
-            all_weights[BURN_UID] = burn_weight
-            
-            # Set miner weights
-            for uid, weight in normalized_miner_weights.items():
-                all_weights[uid] = weight
-            
-            logger.info(f"Setting weights: {BURN_WEIGHT_PERCENT*100:.0f}% to burn UID {BURN_UID}, "
-                       f"{(1-BURN_WEIGHT_PERCENT)*100:.0f}% split among {len(scores)} miners")
+            # Normalize miner scores to percentages
+            total_score = sum(scores.values())
+            if total_score > 0:
+                miner_percentages = {uid: (score / total_score) * remaining_weight_percent 
+                                    for uid, score in scores.items()}
+                
+                # Set burn weight as percentage
+                all_weights[BURN_UID] = burn_weight_percent
+                
+                # Set miner weights as percentages
+                for uid, weight_pct in miner_percentages.items():
+                    all_weights[uid] = weight_pct
+                
+                logger.info(f"Setting weights: {BURN_WEIGHT_PERCENT*100:.0f}% to burn UID {BURN_UID}, "
+                           f"{remaining_weight_percent*100:.0f}% split among {len(scores)} miners")
+            else:
+                logger.warning("Total score is zero, setting 100% to burn UID")
+                all_weights[BURN_UID] = 1.0
         else:
-            weights = _normalize_scores(scores)
-            if not weights:
-                logger.warning("No weights to set after normalization")
+            # Normalize scores to sum to 1.0
+            total_score = sum(scores.values())
+            if total_score > 0:
+                for uid, score in scores.items():
+                    all_weights[uid] = score / total_score
+            else:
+                logger.warning("Total score is zero, cannot set weights")
                 return False
-            
-            # Set miner weights
-            for uid, weight in weights.items():
-                all_weights[uid] = weight
+    
+    # Verify weights sum to 1.0
+    weight_sum = sum(all_weights)
+    logger.info(f"Total weight sum: {weight_sum:.10f}")
+    
+    # Normalize to exactly 1.0 if there's floating point drift
+    if abs(weight_sum - 1.0) > 1e-6:
+        logger.warning(f"Weight sum {weight_sum} != 1.0, normalizing...")
+        all_weights = [w / weight_sum for w in all_weights]
+        weight_sum = sum(all_weights)
+        logger.info(f"Normalized weight sum: {weight_sum:.10f}")
     
     # Log non-zero weights
     logger.info("=" * 60)
     logger.info("Non-zero weights being set:")
     for uid, weight in enumerate(all_weights):
         if weight > 0:
-            percentage = (weight / 65535.0) * 100
+            percentage = weight * 100
             logger.info(f"  UID {uid:>3} - Weight: {percentage:>6.2f}%")
     logger.info("=" * 60)
 
