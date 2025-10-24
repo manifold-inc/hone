@@ -300,7 +300,7 @@ def set_node_weights(
                 netuid=netuid,
                 uids=node_ids_formatted,
                 weights=node_weights_float,
-                version_key=version_key,
+                version_key=803,
                 wait_for_finalization=wait_for_finalization,
                 wait_for_inclusion=wait_for_inclusion,
             )
