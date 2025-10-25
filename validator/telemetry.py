@@ -106,6 +106,7 @@ class TelemetryClient:
                             f"Telemetry exception: {e} "
                             f"(attempt {attempt}/{self.max_retries})"
                         )
+                        logger.exception(e)
                         await asyncio.sleep(0.5)
 
                 if not sent:
