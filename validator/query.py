@@ -176,7 +176,6 @@ async def _poll_task_result(
 
             async with session.get(url, data=body_json, headers=headers, timeout=5) as resp:
                 if resp.status != 200:
-                    logger.error(f"Failed to check task {task_id} for UID {uid}: HTTP {resp.status}")
                     await asyncio.sleep(poll_interval)
                     continue
                 
@@ -264,7 +263,6 @@ async def _poll_task_result(
                     }
                 
                 elif status in ['pending', 'processing']:
-                    logger.debug(f"Task {task_id} for UID {uid} is {status} (attempt {attempt + 1}/{max_attempts})")
                     await asyncio.sleep(poll_interval)
                     continue
                 

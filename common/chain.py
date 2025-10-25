@@ -227,14 +227,10 @@ def can_set_weights(substrate: SubstrateInterface, netuid: int, validator_node_i
 
 def set_node_weights(
     substrate: SubstrateInterface,
-    keypair: Keypair,
     node_ids: list[int],
     node_weights: list[float],
     netuid: int,
     validator_node_id: int,
-    version_key: int = 0,
-    wait_for_inclusion: bool = True, 
-    wait_for_finalization: bool = True,
     wallet_name: Optional[str] = None,
     wallet_hotkey: Optional[str] = None,
     wallet_path: Optional[str] = None,
@@ -390,7 +386,6 @@ class ChainInterface:
         self,
         uids: List[int],
         weights: List[float],
-        version: int = 803, # from subnet hyperparameters
         wait_for_inclusion: bool = True,
         wait_for_finalization: bool = True
     ) -> Optional[str]:
@@ -420,9 +415,6 @@ class ChainInterface:
             node_weights=weights,
             netuid=self.netuid,
             validator_node_id=self.validator_uid,
-            version_key=version,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
             wallet_name=self.wallet_name,
             wallet_hotkey=self.wallet_hotkey,
             wallet_path=self.wallet_path,

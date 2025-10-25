@@ -123,7 +123,7 @@ def _validate_scores(scores: Dict[int, float]) -> bool:
     return True
 
 
-async def set_weights(chain, config, scores: Dict[int, float], version: int = 0) -> bool:
+async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
     
     BURN_UID = int(os.getenv("BURN_UID", "251"))
     BURN_WEIGHT_PERCENT = float(os.getenv("BURN_WEIGHT_PERCENT", "0.99"))
@@ -133,42 +133,35 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
     if use_burn:
         logger.info(f"🔥 Burn protection enabled: {BURN_WEIGHT_PERCENT*100:.0f}% to UID {BURN_UID}")
     
-    # Ensure we have a connection
     if not chain.substrate:
         chain.connect()
     
-    # Get ALL nodes to create full weight array
     nodes = chain.get_nodes()
     total_uids = len(nodes)
     logger.info(f"Total UIDs in subnet: {total_uids}")
     
-    # Initialize weights for ALL UIDs
     all_uids = list(range(total_uids))
     all_weights = [0.0] * total_uids
     
     if not _validate_scores(scores):
         if use_burn:
-            all_weights[BURN_UID] = 1.0  # Set 100% weight as normalized value
+            all_weights[BURN_UID] = 1.0
             logger.info("No valid scores, setting 100% weight to burn UID")
         else:
             logger.warning("No valid scores and burn protection disabled - cannot set weights")
             return False
     else:
         if use_burn:
-            # Work in percentages (0-1), not ticks
             remaining_weight_percent = 1.0 - BURN_WEIGHT_PERCENT
             burn_weight_percent = BURN_WEIGHT_PERCENT
             
-            # Normalize miner scores to percentages
             total_score = sum(scores.values())
             if total_score > 0:
                 miner_percentages = {uid: (score / total_score) * remaining_weight_percent 
                                     for uid, score in scores.items()}
                 
-                # Set burn weight as percentage
                 all_weights[BURN_UID] = burn_weight_percent
                 
-                # Set miner weights as percentages
                 for uid, weight_pct in miner_percentages.items():
                     all_weights[uid] = weight_pct
                 
@@ -178,7 +171,6 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
                 logger.warning("Total score is zero, setting 100% to burn UID")
                 all_weights[BURN_UID] = 1.0
         else:
-            # Normalize scores to sum to 1.0
             total_score = sum(scores.values())
             if total_score > 0:
                 for uid, score in scores.items():
@@ -187,18 +179,15 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
                 logger.warning("Total score is zero, cannot set weights")
                 return False
     
-    # Verify weights sum to 1.0
     weight_sum = sum(all_weights)
     logger.info(f"Total weight sum: {weight_sum:.10f}")
     
-    # Normalize to exactly 1.0 if there's floating point drift
     if abs(weight_sum - 1.0) > 1e-6:
         logger.warning(f"Weight sum {weight_sum} != 1.0, normalizing...")
         all_weights = [w / weight_sum for w in all_weights]
         weight_sum = sum(all_weights)
         logger.info(f"Normalized weight sum: {weight_sum:.10f}")
     
-    # Log non-zero weights
     logger.info("=" * 60)
     logger.info("Non-zero weights being set:")
     for uid, weight in enumerate(all_weights):
@@ -210,10 +199,7 @@ async def set_weights(chain, config, scores: Dict[int, float], version: int = 0)
     try:
         result = chain.set_weights(
             uids=all_uids,
-            weights=all_weights,
-            version=version,
-            wait_for_inclusion=config.__dict__.get('wait_for_inclusion', True),
-            wait_for_finalization=config.__dict__.get('wait_for_finalization', True)
+            weights=all_weights
         )
         
         if result == "success":
