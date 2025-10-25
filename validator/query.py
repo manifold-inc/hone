@@ -378,23 +378,24 @@ async def query_miners_with_problems(
                 num_train_examples=res.get("num_train_examples")
             )
             try:
-                telemetry_client.publish(
-                    "/validator/ingest_miner_metrics",
-                    {
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "block": current_block,
-                        "uid": uid,
-                        "problem_id": res["problem_id"],
-                        "success": res["success"],
-                        "response_time": res["rt"],
-                        "metrics": {
-                            "exact_match": res["metrics"]["exact_match"],
-                            "partial_correctness": res["metrics"]["partial_correctness"],
-                            "grid_similarity": res["metrics"]["grid_similarity"],
-                            "efficiency_score": res["metrics"]["efficiency_score"],
+                if res["success"]:
+                    telemetry_client.publish(
+                        "/validator/ingest_miner_metrics",
+                        {
+                            "ts": datetime.now(timezone.utc).isoformat(),
+                            "block": current_block,
+                            "uid": uid,
+                            "problem_id": res["problem_id"],
+                            "success": res["success"],
+                            "response_time": res["rt"],
+                            "metrics": {
+                                "exact_match": res["metrics"]["exact_match"],
+                                "partial_correctness": res["metrics"]["partial_correctness"],
+                                "grid_similarity": res["metrics"]["grid_similarity"],
+                                "efficiency_score": res["metrics"]["efficiency_score"],
+                            },
                         },
-                    },
-                )
+                    )
             except Exception as e:
                 logger.warning("Couldn't send query data & results to the dashboard API - error : {e}")
 
