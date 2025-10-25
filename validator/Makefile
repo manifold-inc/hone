@@ -8,16 +8,17 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 
 .PHONY: up down logs status check-autoupdate install-autoupdate start-autoupdate restart update logs-update logs-service help
 
+# Simple up target that just calls docker compose directly
 up: check-autoupdate
 	@echo "Starting validator services..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build
 	@echo "✅ Validator started successfully!"
 	@echo "📝 To view logs, run: make logs"
 	@echo "🔄 Auto-updates are enabled - the validator will automatically pull and apply changes"
 
 down:
 	@echo "Stopping validator services..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down
 	@echo "✅ Validator stopped successfully!"
 
 restart: down up
