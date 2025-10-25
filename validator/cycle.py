@@ -126,7 +126,7 @@ async def run_continuous(validator, stop_event: asyncio.Event = None):
     """Main loop that runs cycles continuously"""
 
     try:
-        with open(".version", "r") as f:
+        with open("validator/.version", "r") as f:
             validator_version = f.read().strip()
     except Exception as e:
         logger.warning(f"Could not read .version file: {e}")
