@@ -10,8 +10,6 @@ import streamlit as st
 
 from substrateinterface import SubstrateInterface
 
-
-
 REFERENCE_VALIDATOR = "5GZ2KuT2TtLbYTtsMcgAtazo6KQ4bc57ykZgyQv9oit3y7iq"
 DEFAULT_NETUID = 5
 DEFAULT_ENDPOINT = "wss://entrypoint-finney.opentensor.ai:443"
@@ -59,19 +57,12 @@ def connect_substrate(endpoint: str = DEFAULT_ENDPOINT):
 
 
 def read_weights_by_uid(substrate: SubstrateInterface, netuid: int, uid: int):
-    """
-    Reads SubtensorModule::Weights(netuid, uid) -> Vec<(u16 dest_uid, u16 weight)>
-    """
     q = substrate.query("SubtensorModule", "Weights", [netuid, uid])
     vals = q.value or []
     return [(int(dest), int(w)) for dest, w in vals]
 
 
 def get_last_update_block(substrate: SubstrateInterface, netuid: int, uid: int) -> int | None:
-    """
-    Reads SubtensorModule::LastUpdate(netuid) -> Vec<BlockNumber>
-    and returns entry for 'uid'
-    """
     q = substrate.query("SubtensorModule", "LastUpdate", [netuid], block_hash=None)
     arr = q.value
     if not arr or uid >= len(arr):
@@ -86,47 +77,31 @@ def get_last_update_block(substrate: SubstrateInterface, netuid: int, uid: int) 
 
 
 def get_block_timestamp(substrate: SubstrateInterface, block_number: int) -> int | None:
-    """
-    Returns timestamp (ms since UNIX epoch) at a given block.
-    Handles pruned block errors gracefully -> returns None.
-    """
     if block_number is None:
         return None
-
     try:
         block_hash = substrate.get_block_hash(block_number)
         if block_hash is None:
             return None
-
         ts_q = substrate.query("Timestamp", "Now", block_hash=block_hash)
-        ts = ts_q.value  # milliseconds
+        ts = ts_q.value
         return int(ts) if ts is not None else None
-
     except Exception:
         return None
 
 
 def get_current_block_and_timestamp(substrate: SubstrateInterface) -> tuple[int | None, int | None]:
-    """
-    Returns (current_block_number, current_timestamp_ms)
-    """
     header = substrate.get_block_header()
     try:
         current_block = int(header["header"]["number"])
     except Exception:
         current_block = None
-
     ts_q = substrate.query("Timestamp", "Now")
     current_ts = int(ts_q.value) if ts_q and ts_q.value is not None else None
-
     return current_block, current_ts
 
 
 def get_validator_uid(substrate: SubstrateInterface, netuid: int, hotkey: str) -> int | None:
-    """
-    Map validator hotkey -> UID on that subnet.
-    Query: SubtensorModule::Uids(netuid, hotkey) -> u16
-    """
     try:
         q = substrate.query("SubtensorModule", "Uids", [netuid, hotkey])
         if q and q.value is not None:
@@ -136,30 +111,65 @@ def get_validator_uid(substrate: SubstrateInterface, netuid: int, hotkey: str) -
         return None
 
 
-def fetch_validator_weights_info(uid: int, netuid: int, endpoint: str, top_n: int = 25):
-    """
-    Returns (info_dict, error_msg).
+def summarize_last_set_time(
+    last_block: int | None,
+    last_ts_ms: int | None,
+    current_block: int | None,
+    current_ts_ms: int | None,
+    avg_block_seconds: float = 12.0,
+):
+    if last_block is not None and current_block is not None:
+        blocks_since = current_block - last_block
+        if blocks_since < 0:
+            blocks_since = 0
+    else:
+        blocks_since = None
+    if last_ts_ms is not None and current_ts_ms is not None:
+        last_ts_human = fmt_ts(last_ts_ms)
+        time_since = human_delta(last_ts_ms, current_ts_ms)
+        return {
+            "last_ts_human": last_ts_human,
+            "time_since": time_since,
+            "blocks_since": blocks_since,
+        }
+    if (
+        last_ts_ms is None
+        and current_ts_ms is not None
+        and blocks_since is not None
+        and blocks_since >= 0
+    ):
+        est_delta_seconds = blocks_since * avg_block_seconds
+        est_then_ms = current_ts_ms - int(est_delta_seconds * 1000)
+        last_ts_human = fmt_ts(est_then_ms)
+        time_since = human_delta(est_then_ms, current_ts_ms)
+        return {
+            "last_ts_human": last_ts_human + " (est)",
+            "time_since": time_since + " (est)",
+            "blocks_since": blocks_since,
+        }
+    return {
+        "last_ts_human": "unknown",
+        "time_since": "unknown",
+        "blocks_since": blocks_since,
+    }
 
-    info_dict:
-      - current_block
-      - current_ts_human
-      - last_block
-      - last_ts_human
-      - time_since
-      - blocks_since
-      - weights_df (top N dest weights with share)
-    """
+
+def fetch_validator_weights_info(uid: int, netuid: int, endpoint: str, top_n: int = 25):
     try:
         substrate = connect_substrate(endpoint)
-        current_block, current_ts = get_current_block_and_timestamp(substrate)
-
+        current_block, current_ts_ms = get_current_block_and_timestamp(substrate)
         weights = read_weights_by_uid(substrate, netuid, uid)
         last_block = get_last_update_block(substrate, netuid, uid)
-        last_ts = get_block_timestamp(substrate, last_block)
-
+        last_ts_ms = get_block_timestamp(substrate, last_block)
+        timing = summarize_last_set_time(
+            last_block=last_block,
+            last_ts_ms=last_ts_ms,
+            current_block=current_block,
+            current_ts_ms=current_ts_ms,
+            avg_block_seconds=12.0,
+        )
         weights_sorted = sorted(weights, key=lambda x: x[1], reverse=True)
         total = sum(w for _, w in weights_sorted) or 1
-
         top_rows = []
         for dest_uid, w in weights_sorted[:top_n]:
             share = w / total
@@ -172,70 +182,49 @@ def fetch_validator_weights_info(uid: int, netuid: int, endpoint: str, top_n: in
                 }
             )
         weights_df = pd.DataFrame(top_rows)
-
         info = {
             "current_block": current_block,
-            "current_ts_human": fmt_ts(current_ts),
+            "current_ts_human": fmt_ts(current_ts_ms),
             "last_block": last_block,
-            "last_ts_human": fmt_ts(last_ts),
-            "time_since": human_delta(last_ts, current_ts),
-            "blocks_since": (
-                current_block - last_block
-                if (current_block is not None and last_block is not None)
-                else None
-            ),
+            "last_ts_human": timing["last_ts_human"],
+            "time_since": timing["time_since"],
+            "blocks_since": timing["blocks_since"],
             "weights_df": weights_df,
         }
-
         return info, None
     except Exception as e:
         return None, str(e)
 
 
 def summarize_last_set_weights_for_hotkey(hotkey: str, endpoint: str = DEFAULT_ENDPOINT):
-    """
-    For validator table:
-      - resolve UID from hotkey
-      - pull last set_weights time
-      - return dict with "last_ts_human" and "time_since"
-
-    If we can't resolve anything, returns "unknown".
-    """
     try:
         substrate = connect_substrate(endpoint)
     except Exception:
         return {"last_ts_human": "unknown", "time_since": "unknown"}
-
     uid = get_validator_uid(substrate, DEFAULT_NETUID, hotkey)
     if uid is None:
         return {"last_ts_human": "unknown", "time_since": "unknown"}
-
-    current_block, current_ts = get_current_block_and_timestamp(substrate)
+    current_block, current_ts_ms = get_current_block_and_timestamp(substrate)
     last_block = get_last_update_block(substrate, DEFAULT_NETUID, uid)
-    last_ts = get_block_timestamp(substrate, last_block)
-
+    last_ts_ms = get_block_timestamp(substrate, last_block)
+    timing = summarize_last_set_time(
+        last_block=last_block,
+        last_ts_ms=last_ts_ms,
+        current_block=current_block,
+        current_ts_ms=current_ts_ms,
+        avg_block_seconds=12.0,
+    )
     return {
-        "last_ts_human": fmt_ts(last_ts),
-        "time_since": human_delta(last_ts, current_ts),
+        "last_ts_human": timing["last_ts_human"],
+        "time_since": timing["time_since"],
     }
 
-
-# =========================
-# Mock data
-# =========================
 
 def _mock_now():
     return datetime.utcnow()
 
 
 def _mock_overview_df():
-    """
-    Mock miner_metrics rows, with response_time in SECONDS.
-    Columns:
-      ts, block, uid, problem_id, success,
-      response_time, exact_match, partial_correctness,
-      grid_similarity, efficiency_score, accuracy
-    """
     rows = []
     base_block = 100000
     uids = [101, 202, 303]
@@ -243,12 +232,11 @@ def _mock_overview_df():
         for i in range(80):
             ts = _mock_now() - timedelta(minutes=i)
             block = base_block + i
-            response_time = random.uniform(0.05, 0.8)  # seconds
+            response_time = random.uniform(0.05, 0.8)
             exact_flag = random.random() < 0.4 + (0.2 if uid == 202 else 0.0)
             partial_correctness = random.uniform(0.2, 0.95)
             grid_similarity = random.uniform(0.3, 0.99)
             efficiency_score = random.uniform(0.4, 1.0)
-
             rows.append(
                 {
                     "ts": ts,
@@ -264,16 +252,10 @@ def _mock_overview_df():
                     "accuracy": 1 if exact_flag else 0,
                 }
             )
-
     return pd.DataFrame(rows)
 
 
 def _mock_validator_versions_df():
-    """
-    Mock heartbeat table:
-    wallet_hotkey, version, cycle_count, ts
-    We'll compute freshness + last set_weights later.
-    """
     latest_version = "v1.3.7"
     data = [
         {
@@ -318,14 +300,12 @@ def _mock_miner_stats_df(df_overview, uid):
                 "avg_efficiency",
             ],
         )
-
     total_queries = len(d)
     accuracy = d["accuracy"].mean()
     avg_latency = d["response_time"].mean()
     avg_partial = d["partial_correctness"].mean()
     avg_grid = d["grid_similarity"].mean()
     avg_eff = d["efficiency_score"].mean()
-
     row = {
         "uid": uid,
         "total_queries": total_queries,
@@ -355,16 +335,12 @@ def _mock_recent_for_miner(df_overview, uid, limit=50):
         ]
     ]
 
+
 @st.cache_resource(show_spinner=False)
 def get_db_connection():
-    """
-    Cached DB connection. Returns None if we can't connect or
-    if DATABASE_URL is not provided. That triggers mock mode.
-    """
     db_url = os.getenv("DATABASE_URL")
     if not db_url:
         return None
-
     try:
         parsed = urlparse(db_url)
         conn = psycopg2.connect(
@@ -382,14 +358,9 @@ def get_db_connection():
 
 
 def sql_df(query, params=None):
-    """
-    Run a SQL query and return a DataFrame.
-    Raises RuntimeError if DB is missing -> caller should catch and fallback.
-    """
     conn = get_db_connection()
     if conn is None:
         raise RuntimeError("DB not available")
-
     with conn.cursor() as cur:
         cur.execute(query, params or [])
         cols = [desc[0] for desc in cur.description]
@@ -408,14 +379,6 @@ def get_miners_list(full_df_overview=None):
 
 
 def get_overview_data(days_window: int, selected_miners):
-    """
-    Pulls last X days of miner_metrics (up to 5000 rows).
-    Expect columns:
-      ts, block, uid, problem_id, success,
-      response_time, exact_match, partial_correctness,
-      grid_similarity, efficiency_score
-    We add accuracy = int(exact_match).
-    """
     try:
         base_q = """
             SELECT
@@ -433,20 +396,15 @@ def get_overview_data(days_window: int, selected_miners):
             WHERE ts >= NOW() - (%s || ' days')::interval
         """
         params = [str(days_window)]
-
         if selected_miners:
             base_q += " AND uid = ANY(%s)"
             params.append(selected_miners)
-
         base_q += " ORDER BY ts DESC LIMIT 5000"
-
         df = sql_df(base_q, params)
         if df.empty:
             return df
-
         df["accuracy"] = df["exact_match"].astype(int)
         return df
-
     except Exception:
         df = _mock_overview_df()
         cutoff = datetime.utcnow() - timedelta(days=days_window)
@@ -507,12 +465,6 @@ def get_miner_recent_samples(uid, limit=50, fallback_df=None):
 
 
 def get_validator_versions():
-    """
-    Returns df_heartbeat, latest_version
-    df_heartbeat columns:
-      wallet_hotkey, version, cycle_count, ts
-    We'll decorate it with freshness, last weight set, etc.
-    """
     try:
         q = """
             SELECT DISTINCT ON (wallet_hotkey)
@@ -524,7 +476,6 @@ def get_validator_versions():
             ORDER BY wallet_hotkey, ts DESC
         """
         df = sql_df(q)
-
         q2 = """
             SELECT version
             FROM validator_heartbeat
@@ -535,7 +486,6 @@ def get_validator_versions():
         ref_df = sql_df(q2, [REFERENCE_VALIDATOR])
         latest_version = ref_df.iloc[0]["version"] if not ref_df.empty else None
         return df, latest_version
-
     except Exception:
         df, latest_version = _mock_validator_versions_df()
         return df, latest_version
@@ -558,26 +508,16 @@ def parse_semver(v: str | None):
 
 
 def version_status_label_and_color(v: str | None, latest: str | None):
-    """
-    Returns (label, colored_dot):
-      🟢 up to date
-      🟠 slightly behind
-      🔴 far behind
-      ⚪ unknown
-    """
     if v is None or latest is None:
         return ("unknown", "⚪")
     if v == latest:
         return ("up to date", "🟢")
-
     pv = parse_semver(v)
     pl = parse_semver(latest)
     if pv is None or pl is None:
         return ("behind", "🟠")
-
     v_maj, v_min, v_patch = pv
     l_maj, l_min, l_patch = pl
-
     if v_maj == l_maj and v_min == l_min:
         if (v_patch or 0) < (l_patch or 0):
             return ("slightly behind", "🟠")
@@ -585,7 +525,6 @@ def version_status_label_and_color(v: str | None, latest: str | None):
             return ("unknown", "⚪")
     else:
         return ("far behind", "🔴")
-
 
 
 def page_overview():
@@ -621,7 +560,7 @@ def page_overview():
         st.warning("No data found for this selection yet.")
         return
 
-    st.subheader("Accuracy vs Latency (ARC Prize style)")
+    st.subheader("Accuracy vs Latency")
     st.caption("accuracy = exact_match (1=true, 0=false); response_time ~ latency in seconds")
 
     fig_scatter = px.scatter(
