@@ -1,0 +1,48 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:16
+    container_name: telemetry-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: telemetry
+      POSTGRES_PASSWORD: telemetry
+      POSTGRES_DB: telemetry
+    ports:
+      - "5433:5432"   # host -> container
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U telemetry -d telemetry"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: ./api
+    container_name: telemetry-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://telemetry:telemetry@db:5432/telemetry
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  dashboard:
+    build: ./dashboard
+    container_name: telemetry-dashboard
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://telemetry:telemetry@db:5432/telemetry
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+
+volumes:
+  db_data:
