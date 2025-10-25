@@ -71,7 +71,7 @@ log "âœ… Update completed successfully!"
 if [ -n "$DISCORD_WEBHOOK_URL" ]; then
   COMMIT_MSG=$(git log -1 --pretty=%B)
   COMMIT_AUTHOR=$(git log -1 --pretty=%an)
-  COMMIT_URL="https://github.com/your-username/hone/commit/$LATEST_COMMIT"
+  COMMIT_URL="https://github.com/manifold-inc/hone/commit/$LATEST_COMMIT"
   
   # discord webhook
   curl -s -X POST -H "Content-Type: application/json" \
