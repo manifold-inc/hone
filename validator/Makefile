@@ -9,9 +9,8 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 .PHONY: up down logs status check-autoupdate install-autoupdate start-autoupdate restart update logs-update logs-service help
 
 up: check-autoupdate
-	@echo "Checking for existing containers and networks..."
 	@echo "Starting validator services..."
-	docker compose -f $(COMPOSE_FILE) up -d --build
+	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build
 	@echo "✅ Validator started successfully!"
 	@echo "📝 To view logs, run: make logs"
 	@echo "🔄 Auto-updates are enabled - the validator will automatically pull and apply changes"
