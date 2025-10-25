@@ -386,7 +386,7 @@ async def query_miners_with_problems(
                         "uid": uid,
                         "problem_id": res["problem_id"],
                         "success": res["success"],
-                        "response_time_s": res["rt"],
+                        "response_time": res["rt"],
                         "metrics": {
                             "exact_match": res["metrics"]["exact_match"],
                             "partial_correctness": res["metrics"]["partial_correctness"],
