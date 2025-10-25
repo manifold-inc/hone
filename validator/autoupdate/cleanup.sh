@@ -3,6 +3,7 @@ set -euo pipefail
 
 echo "🧹 Performing thorough cleanup of validator resources..."
 
+# figure out paths
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALIDATOR_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${VALIDATOR_DIR}/docker-compose.yml"
@@ -20,7 +21,8 @@ else
   COMPOSE_CMD="docker compose"
 fi
 
-$COMPOSE_CMD -f "${COMPOSE_FILE}" down --remove-orphans || true
+# Bring down the stack (validator, db, adminer)
+$COMPOSE_CMD -f "${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
 
 echo "Checking for remaining validator containers..."
 docker rm -f $(docker ps -aq -f "name=^validator-") 2>/dev/null || echo "No validator containers to remove"
@@ -28,7 +30,7 @@ docker rm -f $(docker ps -aq -f "name=^validator-") 2>/dev/null || echo "No vali
 echo "Removing validator network if orphaned..."
 docker network rm validator_default 2>/dev/null || echo "No validator network to remove"
 
-echo "Pruning unused docker networks..."
+echo "Pruning unused networks..."
 docker network prune -f >/dev/null 2>&1 || true
 
 echo "✅ Cleanup complete! Database data volume (postgres_data) is preserved."

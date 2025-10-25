@@ -9,16 +9,24 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 .PHONY: up down logs status check-autoupdate install-autoupdate start-autoupdate restart update logs-update logs-service help
 
 # Robust up target that handles container conflicts
-up: check-autoupdate
+up:
 	@echo "🚀 Starting validator services..."
+	@echo "Temporarily stopping auto-updater (if running)..."
+	@sudo systemctl stop $(SERVICE_NAME) 2>/dev/null || true
+
 	@echo "Checking for existing containers..."
 	@if docker ps -a --format '{{.Names}}' | grep -q "validator-db-1\|validator-validator-1\|validator-adminer-1"; then \
 		echo "Found existing validator containers. Stopping and removing..."; \
 		docker stop validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
-		docker rm validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
+		docker rm   validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
 	fi
+
 	@echo "Starting fresh containers..."
 	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build --remove-orphans
+
+	@echo "Ensuring auto-updater is installed and running..."
+	@$(MAKE) check-autoupdate
+
 	@echo "✅ Validator started successfully!"
 	@echo "📝 To view logs, run: make logs"
 	@echo "🔄 Auto-updates are enabled - the validator will automatically pull and apply changes"
