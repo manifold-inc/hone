@@ -51,7 +51,7 @@ class Validator:
             max_queue_size=1000,
             flush_interval_s=1.0,
             request_timeout_s=3.0,
-            max_retries=3,
+            max_retries=1,
         )
 
         self.last_cleanup_time = None
