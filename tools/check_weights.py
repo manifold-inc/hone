@@ -42,12 +42,20 @@ def get_block_timestamp(substrate: SubstrateInterface, block_number: int) -> int
     """
     if block_number is None:
         return None
-    block_hash = substrate.get_block_hash(block_number)
-    if block_hash is None:
+    
+    try:
+        block_hash = substrate.get_block_hash(block_number)
+        if block_hash is None:
+            return None
+        
+        ts_q = substrate.query("Timestamp", "Now", block_hash=block_hash)
+        ts = ts_q.value  # milliseconds
+        return int(ts) if ts is not None else None
+    
+    except Exception as e:
+        print(f"\nWarning: Could not retrieve timestamp for block {block_number}. The block state may have been pruned.")
+        print(f"Error details: {str(e)}")
         return None
-    ts_q = substrate.query("Timestamp", "Now", block_hash=block_hash)
-    ts = ts_q.value  # milliseconds
-    return int(ts) if ts is not None else None
 
 
 def get_current_block_and_timestamp(substrate: SubstrateInterface) -> tuple[int | None, int | None]:
