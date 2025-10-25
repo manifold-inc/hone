@@ -410,7 +410,6 @@ class ChainInterface:
         
         success = set_node_weights(
             substrate=self.substrate,
-            keypair=self.keypair,
             node_ids=uids,
             node_weights=weights,
             netuid=self.netuid,
