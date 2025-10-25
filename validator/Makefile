@@ -9,8 +9,14 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 .PHONY: up down logs status check-autoupdate install-autoupdate start-autoupdate restart update logs-update logs-service help
 
 up: check-autoupdate
+	@echo "Checking for existing containers..."
+	@if [ "$$(docker ps -aq -f name=validator-validator)" ]; then \
+		echo "Existing validator container found. Stopping and removing..."; \
+		docker stop $$(docker ps -aq -f name=validator-validator) 2>/dev/null || true; \
+		docker rm $$(docker ps -aq -f name=validator-validator) 2>/dev/null || true; \
+	fi
 	@echo "Starting validator services..."
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build
+	docker compose -f $(COMPOSE_FILE) up -d --build
 	@echo "✅ Validator started successfully!"
 	@echo "📝 To view logs, run: make logs"
 	@echo "🔄 Auto-updates are enabled - the validator will automatically pull and apply changes"
@@ -76,6 +82,13 @@ logs-service:
 update:
 	@echo "Manually running update check..."
 	@$(AUTOUPDATE_DIR)/update.sh
+
+purge:
+	sudo systemctl stop hone-validator-updater.service
+	sudo systemctl disable hone-validator-updater.service
+	sudo rm /etc/systemd/system/hone-validator-updater.service
+	sudo systemctl daemon-reload
+	rm -rf /root/hone/validator/logs/autoupdate/
 
 help:
 	@echo "Hone Validator Management Commands:"
