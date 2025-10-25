@@ -7,7 +7,7 @@ import json
 
 from common.epistula import Epistula
 from common.constants import QUERY_ENDPOINT, CHECK_TASK_ENDPOINT, MAX_POLL_ATTEMPTS, POLL_INTERVAL 
-
+from validator.telemetry import TelemetryClient
 
 def calculate_grid_similarity(grid1: List[List[int]], grid2: List[List[int]]) -> float:
     """Calculate pixel-wise similarity between two grids"""
@@ -339,7 +339,8 @@ async def query_miners_with_problems(
     config,
     miners: Dict[int, Dict],
     problems_batch: List[Dict],
-    current_block: int
+    current_block: int,
+    telemetry_client: TelemetryClient
 ) -> Dict[int, List[Dict]]:
     """Query all miners with multiple problems using task-based approach"""
     results: Dict[int, List[Dict]] = {uid: [] for uid in miners.keys()}
@@ -376,6 +377,27 @@ async def query_miners_with_problems(
                 transformation_chain=res.get("transformation_chain"),
                 num_train_examples=res.get("num_train_examples")
             )
+            try:
+                telemetry_client.publish(
+                    "/validator/ingest_miner_metrics",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "block": current_block,
+                        "uid": uid,
+                        "problem_id": res["problem_id"],
+                        "success": res["success"],
+                        "response_time_s": res["rt"],
+                        "metrics": {
+                            "exact_match": res["metrics"]["exact_match"],
+                            "partial_correctness": res["metrics"]["partial_correctness"],
+                            "grid_similarity": res["metrics"]["grid_similarity"],
+                            "efficiency_score": res["metrics"]["efficiency_score"],
+                        },
+                    },
+                )
+            except Exception as e:
+                logger.warning("Couldn't send query data & results to the dashboard API - error : {e}")
+
     
     total_queries = sum(len(r) for r in results.values())
     successful = sum(1 for uid_results in results.values() for r in uid_results if r["success"])

@@ -3,6 +3,7 @@ import hashlib
 from loguru import logger
 from validator import discovery, query, scoring
 import random
+from datetime import datetime, timezone
 
 async def run_query_cycle(validator, state):
     """Run continuous queries for CYCLE_DURATION blocks"""
@@ -90,7 +91,8 @@ async def run_query_cycle(validator, state):
                 validator.config, 
                 miners, 
                 problems_batch,
-                current_block
+                current_block,
+                validator.telemetry
             )
             queries_in_cycle += 1
             await validator.maybe_cleanup_database()
@@ -122,7 +124,27 @@ async def run_weights_cycle(validator, state):
 
 async def run_continuous(validator, stop_event: asyncio.Event = None):
     """Main loop that runs cycles continuously"""
-    
+
+    try:
+        with open(".version", "r") as f:
+            validator_version = f.read().strip()
+    except Exception as e:
+        logger.warning(f"Could not read .version file: {e}")
+        validator_version = "unknown"
+
+    try:
+        validator.telemetry_client.publish(
+            "/validator/heartbeat",
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "version": validator_version,
+                "cycle_count": validator.state.get("cycle_count"),
+                "wallet_hotkey": getattr(validator, "wallet_hotkey", None),
+            },
+        )
+    except Exception as e:
+        logger.warning(f"failed to publish telemetry heartbeat: {e}")
+
     while True:
         if stop_event and stop_event.is_set():
             logger.info("Cycle runner stopping...")
