@@ -8,10 +8,17 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 
 .PHONY: up down logs status check-autoupdate install-autoupdate start-autoupdate restart update logs-update logs-service help
 
-# Simple up target that just calls docker compose directly
+# Robust up target that handles container conflicts
 up: check-autoupdate
-	@echo "Starting validator services..."
-	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build
+	@echo "🚀 Starting validator services..."
+	@echo "Checking for existing containers..."
+	@if docker ps -a --format '{{.Names}}' | grep -q "validator-db-1\|validator-validator-1\|validator-adminer-1"; then \
+		echo "Found existing validator containers. Stopping and removing..."; \
+		docker stop validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
+		docker rm validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
+	fi
+	@echo "Starting fresh containers..."
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build --remove-orphans
 	@echo "✅ Validator started successfully!"
 	@echo "📝 To view logs, run: make logs"
 	@echo "🔄 Auto-updates are enabled - the validator will automatically pull and apply changes"
@@ -21,10 +28,13 @@ down:
 	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down
 	@echo "✅ Validator stopped successfully!"
 
-restart: down up
+restart:
+	@echo "Restarting validator services..."
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) restart
+	@echo "✅ Validator restarted successfully!"
 
 logs:
-	$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) logs -f
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) logs -f
 
 status:
 	@echo "Checking auto-updater status..."
@@ -79,11 +89,19 @@ update:
 	@$(AUTOUPDATE_DIR)/update.sh
 
 purge:
-	sudo systemctl stop hone-validator-updater.service || true
-	sudo systemctl disable hone-validator-updater.service || true
-	sudo rm /etc/systemd/system/hone-validator-updater.service || true
-	sudo systemctl daemon-reload || true
-	rm -rf /root/hone/validator/logs/autoupdate/ || true
+	@echo "Stopping services..."
+	@sudo systemctl stop hone-validator-updater.service 2>/dev/null || true
+	@sudo systemctl disable hone-validator-updater.service 2>/dev/null || true
+	@sudo rm /etc/systemd/system/hone-validator-updater.service 2>/dev/null || true
+	@sudo systemctl daemon-reload 2>/dev/null || true
+	@echo "Removing containers and networks..."
+	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) down --remove-orphans 2>/dev/null || true
+	@docker stop validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true
+	@docker rm validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true
+	@docker network rm validator_default 2>/dev/null || true
+	@echo "Cleaning up logs..."
+	@rm -rf $(LOGS_DIR) 2>/dev/null || true
+	@echo "✅ Purge complete (data volumes preserved)"
 
 help:
 	@echo "Hone Validator Management Commands:"
@@ -102,6 +120,7 @@ help:
 	@echo "Advanced commands:"
 	@echo "  make install-autoupdate - Install auto-updater service manually"
 	@echo "  make start-autoupdate   - Start auto-updater service manually"
+	@echo "  make purge              - Clean up all services (preserving data)"
 	@echo ""
 
 .DEFAULT_GOAL := help
