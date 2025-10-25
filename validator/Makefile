@@ -8,7 +8,6 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 
 .PHONY: up down logs status check-autoupdate install-autoupdate start-autoupdate restart update logs-update logs-service help
 
-# Robust up target that handles container conflicts
 up:
 	@echo "🚀 Starting validator services..."
 	@echo "Temporarily stopping auto-updater (if running)..."

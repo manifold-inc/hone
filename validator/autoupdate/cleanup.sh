@@ -3,7 +3,6 @@ set -euo pipefail
 
 echo "🧹 Performing thorough cleanup of validator resources..."
 
-# figure out paths
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALIDATOR_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 COMPOSE_FILE="${VALIDATOR_DIR}/docker-compose.yml"
@@ -21,7 +20,6 @@ else
   COMPOSE_CMD="docker compose"
 fi
 
-# Bring down the stack (validator, db, adminer)
 $COMPOSE_CMD -f "${COMPOSE_FILE}" down --remove-orphans 2>/dev/null || true
 
 echo "Checking for remaining validator containers..."
