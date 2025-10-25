@@ -62,9 +62,9 @@ else
   COMPOSE_CMD="docker compose"
 fi
 
-$COMPOSE_CMD -f "$COMPOSE_FILE" down || handle_error "Failed to stop services"
-
+$$COMPOSE_CMD -f "$COMPOSE_FILE" down || log "Warning: Failed to stop services, continuing anyway"
 $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build || handle_error "Failed to start services"
+
 
 log "✅ Update completed successfully!"
 
