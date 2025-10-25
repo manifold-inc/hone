@@ -133,6 +133,7 @@ async def run_continuous(validator, stop_event: asyncio.Event = None):
         validator_version = "unknown"
 
     try:
+        logger.info(f"publishing validator version")
         validator.telemetry_client.publish(
             "/validator/heartbeat",
             {

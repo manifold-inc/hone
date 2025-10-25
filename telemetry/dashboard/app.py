@@ -2,6 +2,7 @@ import os
 import random
 from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
+from typing import Optional, Dict, List
 
 import psycopg2
 import pandas as pd
@@ -109,6 +110,30 @@ def get_validator_uid(substrate: SubstrateInterface, netuid: int, hotkey: str) -
         return None
     except Exception:
         return None
+
+
+def get_hotkey_for_uid(substrate: SubstrateInterface, netuid: int, uid: int) -> Optional[str]:
+    try:
+        q = substrate.query("SubtensorModule", "Keys", [netuid, uid])
+        if q and q.value is not None:
+            return str(q.value)
+        return None
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False)
+def resolve_hotkeys_for_uids(uids: List[int], netuid: int = DEFAULT_NETUID, endpoint: str = DEFAULT_ENDPOINT) -> Dict[int, str]:
+    out: Dict[int, str] = {}
+    try:
+        substrate = connect_substrate(endpoint)
+    except Exception:
+        return out
+    for uid in uids:
+        hk = get_hotkey_for_uid(substrate, netuid, uid)
+        if hk:
+            out[uid] = hk
+    return out
 
 
 def summarize_last_set_time(
@@ -545,6 +570,7 @@ def page_overview():
             step=1,
             help="Show only queries newer than now() - X days",
         )
+
     mock_df_full = _mock_overview_df()
     with control_row[1]:
         miner_list = get_miners_list(mock_df_full)
@@ -560,67 +586,88 @@ def page_overview():
         st.warning("No data found for this selection yet.")
         return
 
-    st.subheader("Accuracy vs Latency")
-    st.caption("accuracy = exact_match (1=true, 0=false); response_time ~ latency in seconds")
-
-    fig_scatter = px.scatter(
-        df,
-        x="response_time",
-        y="accuracy",
-        color=df["uid"].astype(str),
-        hover_data=[
-            "uid",
-            "problem_id",
-            "block",
-            "partial_correctness",
-            "grid_similarity",
-            "efficiency_score",
-            "response_time",
-        ],
-        labels={
-            "response_time": "Latency (s)",
-            "accuracy": "Exact Match (1=correct)",
-            "color": "Miner UID",
-        },
-        title="Accuracy vs Latency",
+    agg = (
+        df.groupby("uid", as_index=False)
+        .agg(
+            avg_latency_s=("response_time", "mean"),
+            accuracy=("accuracy", "mean"),
+            queries=("uid", "size"),
+        )
     )
-    st.plotly_chart(fig_scatter, use_container_width=True)
 
-    st.markdown("---")
+    uid_list = agg["uid"].tolist()
+    hotkey_map = resolve_hotkeys_for_uids(uid_list)
+    agg["hotkey"] = agg["uid"].map(lambda u: hotkey_map.get(u, ""))
 
-    st.subheader("Latency distribution per miner")
-    fig_box = px.box(
-        df,
-        x=df["uid"].astype(str),
-        y="response_time",
-        points=False,
-        labels={
-            "x": "Miner UID",
-            "response_time": "Latency (s)",
-        },
-        title="Response Time Distribution",
+    search_term = st.text_input(
+        "Search by UID or hotkey (live filter)",
+        value="",
+        help="Type part of a UID or hotkey address to filter the chart/table.",
     )
-    st.plotly_chart(fig_box, use_container_width=True)
 
-    st.markdown("---")
+    if search_term:
+        s = str(search_term).lower()
+        mask = (
+            agg["uid"].astype(str).str.contains(s, case=False)
+            | agg["hotkey"].astype(str).str.lower().str.contains(s, case=False)
+        )
+        agg_filtered = agg[mask].copy()
+    else:
+        agg_filtered = agg.copy()
 
-    st.subheader("Raw sample (latest)")
-    st.dataframe(
-        df[
-            [
-                "ts",
+    st.subheader("Accuracy vs Latency (Per Miner)")
+    st.caption("Each point is one miner UID. Accuracy = mean(exact_match). Latency = mean(response_time in s).")
+
+    if agg_filtered.empty:
+        st.info("No miners match this filter.")
+    else:
+        fig_scatter = px.scatter(
+            agg_filtered,
+            x="avg_latency_s",
+            y="accuracy",
+            size="queries",
+            color=agg_filtered["uid"].astype(str),
+            hover_data=[
                 "uid",
-                "problem_id",
-                "block",
+                "hotkey",
+                "queries",
+                "avg_latency_s",
                 "accuracy",
-                "response_time",
-                "partial_correctness",
-                "grid_similarity",
-                "efficiency_score",
-            ]
-        ].head(200),
-        use_container_width=True,
+            ],
+            labels={
+                "avg_latency_s": "Avg Latency (s)",
+                "accuracy": "Exact Match Rate",
+                "queries": "# Queries",
+                "color": "Miner UID",
+            },
+            title="Miner Accuracy vs Latency",
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+    st.markdown("---")
+
+    st.subheader("Miner summary table")
+    nice_table = agg_filtered.copy()
+    nice_table["accuracy_pct"] = (nice_table["accuracy"] * 100.0).round(2)
+    nice_table["avg_latency_ms"] = (nice_table["avg_latency_s"] * 1000.0).round(2)
+    nice_table = nice_table[
+        [
+            "uid",
+            "hotkey",
+            "queries",
+            "accuracy_pct",
+            "avg_latency_s",
+        ]
+    ].rename(
+        columns={
+            "uid": "UID",
+            "hotkey": "Hotkey",
+            "queries": "Total queries",
+            "accuracy_pct": "Accuracy (%)",
+            "avg_latency_s": "Avg latency (s)",
+        }
     )
+    st.dataframe(nice_table, use_container_width=True)
 
 
 def page_miner_detail():
