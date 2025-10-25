@@ -16,7 +16,6 @@ up: check-autoupdate
 		echo "Found existing validator containers. Stopping and removing..."; \
 		docker stop validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
 		docker rm validator-db-1 validator-validator-1 validator-adminer-1 2>/dev/null || true; \
-		docker network prune -f; \
 	fi
 	@echo "Starting fresh containers..."
 	@$(DOCKER_COMPOSE) -f $(COMPOSE_FILE) up -d --build --remove-orphans
