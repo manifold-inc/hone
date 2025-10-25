@@ -10,3 +10,4 @@ loguru
 tenacity
 numpy
 bittensor
+httpx

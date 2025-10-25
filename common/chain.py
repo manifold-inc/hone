@@ -158,20 +158,33 @@ def get_nodes_for_netuid(substrate: SubstrateInterface, netuid: int, block: int 
 
 
 def _normalize_and_quantize_weights(node_ids: list[int], node_weights: list[float]) -> tuple[list[int], list[int]]:
-    """Normalize and quantize weights for chain submission"""
+    """
+    Normalize and quantize weights for chain submission.
+    
+    CRITICAL: Returns ALL UIDs with their weights (including zeros) to prevent 
+    commit-reveal and chain normalization issues.
+    """
     if len(node_ids) != len(node_weights) or any(uid < 0 for uid in node_ids) or any(weight < 0 for weight in node_weights):
         raise ValueError("Invalid input: length mismatch or negative values")
     if not any(node_weights):
         return [], []
     
-    scaling_factor = U16_MAX / max(node_weights)
+    total_weight = sum(node_weights)
+    scaling_factor = U16_MAX / total_weight
     
     node_weights_formatted = []
     node_ids_formatted = []
+    
     for node_id, node_weight in zip(node_ids, node_weights):
-        if node_weight > 0:
-            node_ids_formatted.append(node_id)
-            node_weights_formatted.append(round(node_weight * scaling_factor))
+        node_ids_formatted.append(node_id)
+        quantized_weight = round(node_weight * scaling_factor) if node_weight > 0 else 0
+        node_weights_formatted.append(quantized_weight)
+    
+    actual_sum = sum(node_weights_formatted)
+    drift = U16_MAX - actual_sum
+    if drift != 0:
+        max_idx = max(range(len(node_weights_formatted)), key=lambda i: node_weights_formatted[i])
+        node_weights_formatted[max_idx] += drift
     
     return node_ids_formatted, node_weights_formatted
 
@@ -212,80 +225,27 @@ def can_set_weights(substrate: SubstrateInterface, netuid: int, validator_node_i
     return can_set_weights
 
 
-def _send_weights_to_chain(
-    substrate: SubstrateInterface,
-    keypair: Keypair,
-    node_ids: list[int],
-    node_weights: list[int],
-    netuid: int,
-    version_key: int = 0,
-    wait_for_inclusion: bool = False,
-    wait_for_finalization: bool = False,
-) -> tuple[bool, str | None]:
-    """Send weights to chain with retries"""
-    
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1.5, min=2, max=5),
-        reraise=True,
-    )
-    def _send_weights():
-        try:
-            with substrate as si:
-                rpc_call = si.compose_call(
-                    call_module="SubtensorModule",
-                    call_function="set_weights",
-                    call_params={
-                        "dests": node_ids,
-                        "weights": node_weights,
-                        "netuid": netuid,
-                        "version_key": version_key,
-                    },
-                )
-                extrinsic_to_send = si.create_signed_extrinsic(
-                    call=rpc_call, 
-                    keypair=keypair, 
-                    era={"period": 5}
-                )
-                
-                response = si.submit_extrinsic(
-                    extrinsic_to_send,
-                    wait_for_inclusion=wait_for_inclusion,
-                    wait_for_finalization=wait_for_finalization,
-                )
-                
-                if not wait_for_finalization and not wait_for_inclusion:
-                    return True, "Not waiting for finalization or inclusion."
-                
-                response.process_events()
-                
-                if response.is_success:
-                    return True, "Successfully set weights."
-                
-                return False, format_error_message(response.error_message)
-                
-        except Exception as e:
-            logger.exception(f"Exception in _send_weights: {str(e)}")
-            raise
-    
-    return _send_weights()
-
-
 def set_node_weights(
     substrate: SubstrateInterface,
-    keypair: Keypair,
     node_ids: list[int],
     node_weights: list[float],
     netuid: int,
     validator_node_id: int,
-    version_key: int = 0,
-    wait_for_inclusion: bool = False,
-    wait_for_finalization: bool = True,
     wallet_name: Optional[str] = None,
     wallet_hotkey: Optional[str] = None,
     wallet_path: Optional[str] = None,
 ) -> bool:
     """Set node weights with all checks"""
+    
+    logger.info("=" * 60)
+    logger.info("Setting weights for the following UIDs:")
+    total_weight = sum(node_weights)
+    for uid, weight in zip(node_ids, node_weights):
+        if weight > 0:
+            percentage = (weight / total_weight * 100) if total_weight > 0 else 0
+            logger.info(f"  UID {uid:>3} - Weight: {percentage:>6.2f}%")
+    logger.info("=" * 60)
+    
     node_ids_formatted, node_weights_formatted = _normalize_and_quantize_weights(node_ids, node_weights)
 
     substrate = get_substrate(subtensor_address=substrate.url)
@@ -314,23 +274,31 @@ def set_node_weights(
         try:
             config = bt.subtensor.config()
             config.subtensor.chain_endpoint = substrate.url
-            config.subtensor.network = None
+            config.subtensor.network = 'finney'
             
             subtensor = bt.subtensor(config=config)
             
-            max_weight = max(node_weights_formatted) if node_weights_formatted else 1
-            node_weights_float = [w / max_weight for w in node_weights_formatted]
+            total_weight_formatted = sum(node_weights_formatted)
+            if total_weight_formatted > 0:
+                node_weights_float = [w / total_weight_formatted for w in node_weights_formatted]
+            else:
+                node_weights_float = node_weights_formatted
             
             wallet = bt.wallet(name=wallet_name, hotkey=wallet_hotkey, path=wallet_path)
+            
+            logger.info("Quantized weights (ticks) being sent to chain:")
+            for uid, weight_tick, weight_float in zip(node_ids_formatted, node_weights_formatted, node_weights_float):
+                if weight_tick > 0:
+                    logger.info(f"  UID {uid:>3} - Ticks: {weight_tick:>5} - Normalized: {weight_float:.8f}")
             
             result, msg = subtensor.set_weights(
                 wallet=wallet,
                 netuid=netuid,
                 uids=node_ids_formatted,
                 weights=node_weights_float,
-                version_key=version_key,
-                wait_for_finalization=wait_for_finalization,
-                wait_for_inclusion=wait_for_inclusion,
+                version_key=803,
+                wait_for_finalization=True,
+                wait_for_inclusion=True,
             )
             
             if result:
@@ -343,38 +311,6 @@ def set_node_weights(
         except Exception as e:
             logger.error(f"Exception during commit-reveal weight setting: {e}")
             return False
-
-    logger.info(f"Setting weights for subnet {netuid} with version key {version_key}...")
-    
-    try:
-        success, error_message = _send_weights_to_chain(
-            substrate,
-            keypair,
-            node_ids_formatted,
-            node_weights_formatted,
-            netuid,
-            version_key,
-            wait_for_inclusion,
-            wait_for_finalization,
-        )
-    except Exception as e:
-        logger.error(f"Exception during weight setting: {e}")
-        substrate.close()
-        return False
-
-    if success:
-        if wait_for_finalization:
-            logger.info("✅ Successfully set weights and finalized")
-        elif wait_for_inclusion:
-            logger.info("✅ Successfully set weights and included")
-        else:
-            logger.info("✅ Successfully set weights")
-    else:
-        logger.error(f"❌ Failed to set weights: {error_message}")
-
-    substrate.close()
-    return success
-
 
 class ChainInterface:
     
@@ -450,10 +386,19 @@ class ChainInterface:
         self,
         uids: List[int],
         weights: List[float],
-        version: int = 0,
-        wait_for_inclusion: bool = False,
+        wait_for_inclusion: bool = True,
         wait_for_finalization: bool = True
     ) -> Optional[str]:
+        """
+        Set weights for specified UIDs.
+        
+        IMPORTANT: Pass ALL UIDs in the subnet with their weights (including 0.0 for unused UIDs)
+        to prevent commit-reveal issues.
+        
+        Args:
+            uids: List of ALL UIDs in subnet (e.g., [0, 1, 2, ..., 255])
+            weights: List of weights corresponding to UIDs (e.g., [0.0, 0.5, 0.0, ..., 0.5])
+        """
         
         assert self.substrate, "Call connect() first"
         assert self.keypair, "Keypair required to sign transactions"
@@ -465,14 +410,10 @@ class ChainInterface:
         
         success = set_node_weights(
             substrate=self.substrate,
-            keypair=self.keypair,
             node_ids=uids,
             node_weights=weights,
             netuid=self.netuid,
             validator_node_id=self.validator_uid,
-            version_key=version,
-            wait_for_inclusion=wait_for_inclusion,
-            wait_for_finalization=wait_for_finalization,
             wallet_name=self.wallet_name,
             wallet_hotkey=self.wallet_hotkey,
             wallet_path=self.wallet_path,

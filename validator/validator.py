@@ -2,12 +2,14 @@ import asyncio
 from loguru import logger
 import signal
 import time
+import os
 
 from common.chain import ChainInterface
 from validator.config import ValidatorConfig
 from validator.db import Database
 from validator import cycle
 from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator
+from validator.telemetry import TelemetryClient
 
 class Validator:
     def __init__(self, config: ValidatorConfig):
@@ -43,6 +45,14 @@ class Validator:
         }
 
         self.synthetic_generator = ARC2Generator(max_chain_length=6)
+
+        self.telemetry_client  = TelemetryClient(
+            endpoint_base_url=os.getenv("TELEMETRY_ENDPOINT", ""),
+            max_queue_size=1000,
+            flush_interval_s=1.0,
+            request_timeout_s=3.0,
+            max_retries=1,
+        )
 
         self.last_cleanup_time = None
     

@@ -10,7 +10,7 @@ services:
     ports:
       - "${DB_PORT:-5432}:5432"
     volumes:
-      - db_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
       - ./sql/init.sql:/docker-entrypoint-initdb.d/00_init.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-hone}"]
@@ -52,4 +52,4 @@ services:
       - ~/.bittensor/wallets:/root/.bittensor/wallets:ro
 
 volumes:
-  db_data:
+  postgres_data:

@@ -8,6 +8,26 @@ from common.constants import (
     NETUID_MAINNET,
 )
 
+import bittensor as bt
+
+def resolve_hotkey(wallet_name: str | None, wallet_path: str | None) -> Optional[str]:
+    """
+    Returns the SS58 hotkey address for this wallet, or None if it can't be loaded.
+    """
+    if not wallet_name:
+        return None
+
+    try:
+        wallet = bt.wallet(
+            name=wallet_name,
+            path=wallet_path.replace("~", os.path.expanduser("~")) if wallet_path else None,
+        )
+        return wallet.hotkey.ss58_address
+    except Exception as e:
+        print(f"could not resolve wallet hotkey ss58: {e}")
+        return None
+
+
 @dataclass
 class ValidatorConfig:
     netuid: int = int(os.getenv("NETUID", str(NETUID_MAINNET)))
@@ -17,6 +37,8 @@ class ValidatorConfig:
     wallet_name: Optional[str] = os.getenv("WALLET_NAME")
     wallet_hotkey: Optional[str] = os.getenv("WALLET_HOTKEY")
     wallet_path: Optional[str] = os.getenv("WALLET_PATH", "~/.bittensor/wallets")
+
+    hotkey: Optional[str] = resolve_hotkey(wallet_name=wallet_name, wallet_path=wallet_path)
 
     default_miner_port: int = int(os.getenv("MINER_PORT", "8091"))
 

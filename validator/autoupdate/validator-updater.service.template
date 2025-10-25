@@ -1,0 +1,19 @@
+[Unit]
+Description=Hone Validator Auto-Update Service
+After=network.target
+
+[Service]
+Type=simple
+User=%%USER%%
+WorkingDirectory=%%REPO_DIR%%
+ExecStart=%%REPO_DIR%%/validator/autoupdate/service.sh
+Restart=always
+RestartSec=60
+
+# Security hardening
+ProtectSystem=full
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
