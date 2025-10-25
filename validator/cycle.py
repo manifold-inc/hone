@@ -92,7 +92,7 @@ async def run_query_cycle(validator, state):
                 miners, 
                 problems_batch,
                 current_block,
-                validator.telemetry
+                validator.telemetry_client
             )
             queries_in_cycle += 1
             await validator.maybe_cleanup_database()
