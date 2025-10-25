@@ -19,7 +19,7 @@ handle_error() {
   
   if [ -n "$DISCORD_WEBHOOK_URL" ]; then
     curl -s -X POST -H "Content-Type: application/json" \
-      --data "{\"embeds\":[{\"title\":\"❌ Validator Update Failed\",\"description\":\"$error_msg\",\"color\":16711680}]}" \
+      --data "{\"embeds\":[{\"title\":\"âŒ Validator Update Failed\",\"description\":\"$error_msg\",\"color\":16711680}]}" \
       "$DISCORD_WEBHOOK_URL"
   fi
   
@@ -62,11 +62,11 @@ else
   COMPOSE_CMD="docker compose"
 fi
 
-$$COMPOSE_CMD -f "$COMPOSE_FILE" down || log "Warning: Failed to stop services, continuing anyway"
+$COMPOSE_CMD -f "$COMPOSE_FILE" down || log "Warning: Failed to stop services, continuing anyway"
 $COMPOSE_CMD -f "$COMPOSE_FILE" up -d --build || handle_error "Failed to start services"
 
 
-log "✅ Update completed successfully!"
+log "âœ… Update completed successfully!"
 
 if [ -n "$DISCORD_WEBHOOK_URL" ]; then
   COMMIT_MSG=$(git log -1 --pretty=%B)
@@ -77,7 +77,7 @@ if [ -n "$DISCORD_WEBHOOK_URL" ]; then
   curl -s -X POST -H "Content-Type: application/json" \
     --data "{
       \"embeds\":[{
-        \"title\":\"✅ Validator Updated Successfully\",
+        \"title\":\"âœ… Validator Updated Successfully\",
         \"description\":\"Updated from \`${CURRENT_COMMIT:0:7}\` to \`${LATEST_COMMIT:0:7}\`\",
         \"color\":5763719,
         \"fields\":[

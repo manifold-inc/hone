@@ -10,10 +10,6 @@ DOCKER_COMPOSE := $(shell if command -v docker-compose > /dev/null; then echo "d
 
 up: check-autoupdate
 	@echo "Checking for existing containers and networks..."
-	@if docker network inspect validator_default &>/dev/null; then \
-		echo "Removing existing validator network..."; \
-		docker network rm validator_default &>/dev/null || true; \
-	fi
 	@echo "Starting validator services..."
 	docker compose -f $(COMPOSE_FILE) up -d --build
 	@echo "✅ Validator started successfully!"
