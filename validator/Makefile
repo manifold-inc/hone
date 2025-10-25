@@ -84,7 +84,7 @@ update:
 	@$(AUTOUPDATE_DIR)/update.sh
 
 purge:
-	sudo systemctl stop hone-validator-updater.service || tru
+	sudo systemctl stop hone-validator-updater.service || true
 	sudo systemctl disable hone-validator-updater.service || true
 	sudo rm /etc/systemd/system/hone-validator-updater.service || true
 	sudo systemctl daemon-reload || true
