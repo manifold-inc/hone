@@ -95,18 +95,6 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
     return {uid: metrics["score"] for uid, metrics in scores.items()}
 
 
-def _normalize_scores(scores: Dict[int, float], weight_max: int = 65535) -> Dict[int, float]:
-    if not scores:
-        return {}
-    
-    total = sum(scores.values())
-    if total <= 0:
-        return {uid: 0.0 for uid in scores.keys()}
-    
-    normalized = {uid: (s / total) * weight_max for uid, s in scores.items()}
-    return normalized
-
-
 def _validate_scores(scores: Dict[int, float]) -> bool:
     if not scores:
         logger.warning("No scores provided")
