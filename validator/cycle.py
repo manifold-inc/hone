@@ -140,7 +140,7 @@ async def run_continuous(validator, stop_event: asyncio.Event = None):
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "version": validator_version,
                 "cycle_count": validator.state.get("cycle_count"),
-                "wallet_hotkey": validator.config.wallet_hotkey
+                "wallet_hotkey": validator.config.hotkey
             },
         )
     except Exception as e:
