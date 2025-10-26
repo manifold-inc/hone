@@ -45,7 +45,7 @@ class ValidatorConfig:
     wallet_hotkey: Optional[str] = os.getenv("WALLET_HOTKEY")
     wallet_path: Optional[str] = os.getenv("WALLET_PATH", "~/.bittensor/wallets")
 
-    hotkey: Optional[str] = resolve_hotkey(wallet_name=wallet_name, wallet_path=wallet_path)
+    hotkey: Optional[str] = resolve_hotkey(wallet_name=wallet_name, wallet_hotkey=wallet_hotkey, wallet_path=wallet_path)
 
     default_miner_port: int = int(os.getenv("MINER_PORT", "8091"))
 
