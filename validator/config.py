@@ -10,7 +10,11 @@ from common.constants import (
 
 import bittensor as bt
 
-def resolve_hotkey(wallet_name: str | None, wallet_path: str | None) -> Optional[str]:
+def resolve_hotkey(
+    wallet_name: str | None, 
+    wallet_hotkey: str | None,
+    wallet_path: str | None
+) -> Optional[str]:
     """
     Returns the SS58 hotkey address for this wallet, or None if it can't be loaded.
     """
@@ -18,13 +22,16 @@ def resolve_hotkey(wallet_name: str | None, wallet_path: str | None) -> Optional
         return None
 
     try:
+        expanded_path = os.path.expanduser(wallet_path) if wallet_path else None
+        
         wallet = bt.wallet(
             name=wallet_name,
-            path=wallet_path.replace("~", os.path.expanduser("~")) if wallet_path else None,
+            hotkey=wallet_hotkey,
+            path=expanded_path,
         )
         return wallet.hotkey.ss58_address
     except Exception as e:
-        print(f"could not resolve wallet hotkey ss58: {e}")
+        print(f"Could not resolve wallet hotkey ss58: {e}")
         return None
 
 
