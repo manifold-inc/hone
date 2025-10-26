@@ -10,4 +10,4 @@ loguru
 tenacity
 numpy
 bittensor
-httpx
+httpx[http2]
