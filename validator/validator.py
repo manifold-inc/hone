@@ -45,13 +45,12 @@ class Validator:
         }
 
         self.synthetic_generator = ARC2Generator(max_chain_length=6)
+        
 
         self.telemetry_client  = TelemetryClient(
             endpoint_base_url=os.getenv("TELEMETRY_ENDPOINT", ""),
             max_queue_size=1000,
-            flush_interval_s=1.0,
-            request_timeout_s=3.0,
-            max_retries=1,
+            request_timeout_s=5.0,
         )
 
         self.last_cleanup_time = None

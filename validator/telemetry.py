@@ -12,7 +12,7 @@ class TelemetryClient:
         endpoint_base_url: Optional[str],
         max_queue_size: int = 1000,
         flush_interval_s: float = 1.0,
-        request_timeout_s: float = 3.0,
+        request_timeout_s: float = 5.0,
         max_retries: int = 3,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
@@ -33,12 +33,21 @@ class TelemetryClient:
         self._loop = loop or asyncio.get_event_loop()
 
         # httpx async client, reused for connection pooling
-        self._client = httpx.AsyncClient(timeout=self.request_timeout_s)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(
+                connect=self.request_timeout_s,
+                read=self.request_timeout_s,
+                write=self.request_timeout_s,
+                pool=self.request_timeout_s,
+            ),
+            http2=True,
+        )
+
 
         # spawn the worker immediately
         self._worker_task = self._loop.create_task(self._worker_loop(), name="telemetry-worker")
 
-        logger.info("TelemetryClient initialized (enabled=%s)", self.enabled)
+        logger.info(f"TelemetryClient initialized (enabled={self.enabled})")
 
     def publish(self, route: str, payload: dict) -> None:
 
@@ -106,7 +115,6 @@ class TelemetryClient:
                             f"Telemetry exception: {e} "
                             f"(attempt {attempt}/{self.max_retries})"
                         )
-                        logger.exception(e)
                         await asyncio.sleep(0.5)
 
                 if not sent:
