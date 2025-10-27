@@ -327,7 +327,7 @@ async def _query_one_with_problem(
     
     result = await _poll_task_result(
         session, chain, config, uid, miner, task_id, problem_data,
-        max_attempts=50,
+        max_attempts=18,
         poll_interval=10
     )
     
