@@ -28,7 +28,8 @@ def create_app(cfg: MinerConfig) -> FastAPI:
     return app
 
 def run():
-    cfg = MinerConfig()
+    # Parse CLI arguments with fallback to .env variables and defaults
+    cfg = MinerConfig.from_args()
     app = create_app(cfg)
     
     logger.info(
