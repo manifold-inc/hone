@@ -245,7 +245,7 @@ class Visualizer:
 
 
 # ---------- CLI demo ----------
-def _demo(task_num:int|None=None) -> None:
+def _demo() -> None:
     """
     Generates ONE problem, then resamples the same base task 3+1 times and
     applies the SAME chain (with params if present) to produce train/test examples.
@@ -253,7 +253,7 @@ def _demo(task_num:int|None=None) -> None:
     try:
 
         gen = ARC2Generator()
-        problem = gen.generate_problem(task_num=task_num, return_metadata=True)
+        problem = gen.generate_problem(return_metadata=True)
 
         meta = problem.get("metadata", {}) or {}
         base_task = meta.get("base_task")
@@ -271,13 +271,10 @@ def _demo(task_num:int|None=None) -> None:
         test = [make_example() for _ in range(1)]
 
         fig = Visualizer().plot(problem, train_examples=train, test_examples=test)
-        plt.savefig(f"samples/{task_num}.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        print("Visualization saved as arc_visualization.png")
+        plt.show()
     except Exception as e:
         print("viz demo failed:", e)
 
 
 if __name__ == "__main__":
-    for task_id in range(1, 400):
-        _demo(task_id)
+    _demo()
