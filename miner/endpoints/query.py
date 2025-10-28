@@ -26,8 +26,10 @@ async def query(request: Request, body: Dict[str, Any]) -> JSONResponse:
             query_data = body['data']
         else:
             query_data = body
+        
         # test mode - create task and return task ID
         response_data = handle_query(request.app.state, query_data)
+        
         return JSONResponse(
             content={"data": response_data},
             headers={"Content-Type": "application/json"}
@@ -44,7 +46,9 @@ async def query(request: Request, body: Dict[str, Any]) -> JSONResponse:
         
         if parsed_body['signed_for'] != request.app.state.cfg.hotkey:
             raise HTTPException(status_code=403, detail="Request not intended for this miner")
+        
         query_data = Epistula.extract_data(parsed_body)
+        
         response_data = handle_query(request.app.state, query_data)
         
         response_body, response_headers = Epistula.create_request(
