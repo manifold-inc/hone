@@ -419,6 +419,7 @@ def get_overview_data(days_window: int, selected_miners):
                 efficiency_score
             FROM miner_metrics
             WHERE ts >= NOW() - (%s || ' days')::interval
+            AND ts < NOW() - INTERVAL '1 hour'
         """
         params = [str(days_window)]
         if selected_miners:
@@ -452,6 +453,7 @@ def get_miner_stats(uid, fallback_df=None):
                 AVG(efficiency_score) AS avg_efficiency
             FROM miner_metrics
             WHERE uid = %s
+            AND ts < NOW() - INTERVAL '1 hour'
         GROUP BY uid
         """
         df = sql_df(q, [uid])
@@ -476,6 +478,7 @@ def get_miner_recent_samples(uid, limit=50, fallback_df=None):
                 efficiency_score
             FROM miner_metrics
             WHERE uid = %s
+            AND ts < NOW() - INTERVAL '1 hour'
             ORDER BY ts DESC
             LIMIT %s
         """
