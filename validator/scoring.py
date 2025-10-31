@@ -12,6 +12,9 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
     - Partial correctness (30% weight) 
     - Grid similarity (20% weight)
     - Efficiency (10% weight)
+    
+    - If accuracy is 0 AND similarity metrics < 0.9, score = 0
+    - Efficiency is excluded from scoring when accuracy = 0 and similarity < 0.9
     """
     current_block = config.current_block_provider()
     window_blocks = config.score_window_blocks
@@ -44,7 +47,6 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
             stats['similarity_sum'] += float(r.get('grid_similarity', 0.0))
             stats['efficiency_sum'] += float(r.get('efficiency_score', 0.0))
     
-    # weighted scores
     scores: Dict[int, Dict[str, float]] = {}
     weights = {
         'exact_match': 0.4,
@@ -72,12 +74,39 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
         similarity_avg = stats['similarity_sum'] / stats['successful_responses']
         efficiency_avg = stats['efficiency_sum'] / stats['successful_responses']
         
-        final_score = (
-            weights['exact_match'] * exact_rate +
-            weights['partial'] * partial_avg +
-            weights['similarity'] * similarity_avg +
-            weights['efficiency'] * efficiency_avg
-        )
+        poor_quality = (exact_rate == 0.0 and 
+                       partial_avg < 0.9 and 
+                       similarity_avg < 0.9)
+        
+        if poor_quality:
+            final_score = 0.0
+            logger.info(f"UID {uid} | Score: 0.0 (poor quality - acc=0, similarity<0.9)")
+        else:
+            if exact_rate == 0.0 and (partial_avg < 0.9 or similarity_avg < 0.9):
+                adjusted_weights = {
+                    'exact_match': 0.4 / 0.9,  # 44.4%
+                    'partial': 0.3 / 0.9,      # 33.3%
+                    'similarity': 0.2 / 0.9,   # 22.2%
+                    'efficiency': 0.0          # 0%
+                }
+                final_score = (
+                    adjusted_weights['exact_match'] * exact_rate +
+                    adjusted_weights['partial'] * partial_avg +
+                    adjusted_weights['similarity'] * similarity_avg
+                )
+                logger.info(f"UID {uid} | Score: {final_score:.3f} (no efficiency - low acc) | "
+                           f"Exact: {exact_rate:.2f} | Partial: {partial_avg:.2f} | "
+                           f"Similarity: {similarity_avg:.2f}")
+            else:
+                final_score = (
+                    weights['exact_match'] * exact_rate +
+                    weights['partial'] * partial_avg +
+                    weights['similarity'] * similarity_avg +
+                    weights['efficiency'] * efficiency_avg
+                )
+                logger.info(f"UID {uid} | Score: {final_score:.3f} | "
+                           f"Exact: {exact_rate:.2f} | Partial: {partial_avg:.2f} | "
+                           f"Efficiency: {efficiency_avg:.2f}")
         
         scores[uid] = {
             "score": final_score,
@@ -85,10 +114,6 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
             "partial_correctness_avg": partial_avg,
             "efficiency_avg": efficiency_avg
         }
-        
-        logger.info(f"UID {uid} | Score: {final_score:.3f} | "
-                   f"Exact: {exact_rate:.2f} | Partial: {partial_avg:.2f} | "
-                   f"Efficiency: {efficiency_avg:.2f}")
     
     await db.save_scores(scores)
     
