@@ -1,0 +1,131 @@
+# Hone Subnet Sandbox Runner Configuration
+# This is a sample configuration file with recommended settings
+
+runner:
+  id: "runner-1"
+  name: "Sandbox Runner Instance 1"
+  location: "us-east-1"
+
+api:
+  port: 8443
+  require_epistula: true
+  require_api_key: true
+  rate_limit_per_validator: 100  # requests per minute
+  
+  # SSL/TLS certificates (required for HTTPS)
+  # Generate self-signed certs for testing:
+  # openssl req -x509 -newkey rsa:4096 -nodes -keyout runner.key -out runner.crt -days 365
+  ssl_cert_path: "/etc/ssl/certs/runner.crt"
+  ssl_key_path: "/etc/ssl/private/runner.key"
+  
+  # Header names for authentication
+  api_key_header: "X-API-Key"
+  epistula_signature_header: "X-Epistula-Signature"
+  epistula_request_id_header: "X-Epistula-Request-ID"
+  epistula_timestamp_header: "X-Epistula-Timestamp"
+
+hardware:
+  gpu_count: 8
+  gpu_type: "H200"
+  cpu_cores: 96
+  memory_gb: 1024
+
+execution:
+  # Execution mode: "docker+gvisor" | "docker" | "direct"
+  # docker+gvisor: Most secure, uses gVisor runtime
+  # docker: Secure, standard Docker isolation
+  # direct: Process-level isolation with cgroups
+  mode: "docker+gvisor"
+  
+  # Enable fallback to next mode if current mode fails
+  fallback_on_error: true
+  
+  # Resource limits per job
+  cpu_limit: 32              # CPU cores
+  memory_limit_gb: 256       # RAM in GB
+  disk_quota_gb: 100         # Disk space
+  max_processes: 128         # Max processes per job
+  
+  # Timeouts
+  prep_timeout_seconds: 7200      # 2 hours for prep phase
+  inference_timeout_seconds: 3600  # 1 hour for inference
+  repo_clone_timeout_seconds: 600  # 10 minutes for git clone
+  repo_build_timeout_seconds: 3600 # 1 hour for Docker build
+  
+  # Allowed repository hosts
+  allowed_repo_hosts:
+    - "github.com"
+    - "gitlab.com"
+
+security:
+  # gVisor configuration (user-space kernel for containers)
+  gvisor:
+    enabled: true
+    platform: "ptrace"  # ptrace | kvm
+    network_mode: "none"
+    file_access: "exclusive"
+    overlay: true
+  
+  # Seccomp (syscall filtering)
+  seccomp:
+    enabled: true
+    default_action: "SCMP_ACT_ERRNO"
+    # profile_path: "/etc/sandbox/seccomp-profile.json"
+  
+  # Network policy (two-phase execution)
+  network_policy:
+    prep_allow_internet: true    # Allow internet in prep phase
+    inference_block_internet: true  # Block internet in inference
+    
+    # Domains allowed during prep phase
+    allowed_prep_domains:
+      - "huggingface.co"
+      - "github.com"
+      - "gitlab.com"
+      - "raw.githubusercontent.com"
+      - "cdn.jsdelivr.net"
+    
+    # Always blocked domains
+    blocked_domains: []
+  
+  # Additional security settings
+  readonly_rootfs: true
+  no_new_privileges: true
+  
+  # Capabilities to drop from containers
+  drop_capabilities:
+    - "CAP_SYS_ADMIN"
+    - "CAP_NET_ADMIN"
+    - "CAP_SYS_MODULE"
+    - "CAP_SYS_RAWIO"
+    - "CAP_SYS_PTRACE"
+  
+  # AppArmor/SELinux profiles (optional)
+  # apparmor_profile: "docker-sandbox"
+  # selinux_context: "system_u:system_r:svirt_sandbox_t:s0"
+
+monitoring:
+  prometheus_port: 9090
+  prometheus_path: "/metrics"
+  
+  # Falco runtime security (optional)
+  enable_falco: true
+  # falco_rules_path: "/etc/falco/rules.d/sandbox.yaml"
+  
+  # Logging
+  log_format: "json"  # json | text
+  # log_file: "/var/log/sandbox-runner/runner.log"
+
+storage:
+  # S3 configuration
+  s3_bucket: "hone-subnet-data"
+  s3_region: "us-east-1"
+  # s3_endpoint: "https://s3.us-east-1.amazonaws.com"
+  
+  # S3 credentials (can also use IAM roles)
+  # s3_access_key: "YOUR_ACCESS_KEY"
+  # s3_secret_key: "YOUR_SECRET_KEY"
+  
+  # S3 path prefixes
+  input_prefix: "inputs/"
+  output_prefix: "outputs/"
