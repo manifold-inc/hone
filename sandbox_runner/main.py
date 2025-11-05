@@ -133,8 +133,8 @@ def main():
             app,
             host="0.0.0.0",
             port=config.api.port,
-            ssl_keyfile=ssl_keyfile,
-            ssl_certfile=ssl_certfile,
+            #ssl_keyfile=ssl_keyfile,
+            #ssl_certfile=ssl_certfile,
             log_level=args.log_level.lower(),
             access_log=True,
         )

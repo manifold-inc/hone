@@ -8,7 +8,7 @@ runner:
 
 api:
   port: 8080
-  require_epistula: true
+  require_epistula: false
   require_api_key: true
   rate_limit_per_validator: 100  # requests per minute
   
