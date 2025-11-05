@@ -465,10 +465,7 @@ class DockerGVisorExecutor:
         timeout_seconds: int = 3600
     ) -> str:
         """
-        Build Docker image from repository.
-        
-        Note: Image building is the same for gVisor and regular Docker.
-        gVisor runtime is only used when running containers.
+        Build Docker image with real-time monitoring and early failure detection.
         
         Args:
             repo_path: Path to repository directory
@@ -479,119 +476,235 @@ class DockerGVisorExecutor:
             Docker image ID
             
         Raises:
-            DockerExecutionError: If build fails
+            DockerExecutionError: If build fails or times out
         """
         image_tag = f"sandbox-job-{job_id}"
         
-        logger.info(f"Building Docker image for gVisor: {image_tag}")
+        logger.info(f"Building Docker image: {image_tag} (timeout={timeout_seconds}s)")
+        
+        # Check if Dockerfile exists
+        dockerfile_path = repo_path / 'Dockerfile'
+        if not dockerfile_path.exists():
+            raise DockerExecutionError("Dockerfile not found")
         
         try:
-            # Check if Dockerfile exists
-            dockerfile_path = repo_path / 'Dockerfile'
-            if not dockerfile_path.exists():
-                raise DockerExecutionError("Dockerfile not found")
-            
-            # Build image (standard Docker build)
-            image, build_logs = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.docker_client.images.build(
-                    path=str(repo_path),
-                    tag=image_tag,
-                    rm=True,  # Remove intermediate containers
-                    forcerm=True,  # Always remove intermediate containers
-                    timeout=timeout_seconds
-                )
+            # Build with streaming logs for early error detection
+            image_id = await self._build_with_streaming(
+                repo_path, image_tag, timeout_seconds
             )
             
-            # Log build output
-            for log in build_logs:
-                if 'stream' in log:
-                    logger.info(f"Build: {log['stream'].strip()}")
+            logger.info(f"Docker image built: {image_id[:12]} ({image_tag})")
+            return image_id
             
-            logger.info(
-                f"Docker image built for gVisor: {image.id[:12]} ({image_tag})"
-            )
-            
-            return image.id
-            
-        except DockerException as e:
-            logger.error(f"Docker build failed: {e}")
-            raise DockerExecutionError(f"Docker build failed: {e}")
-    
-    async def build_image_from_requirements(
+        except DockerExecutionError:
+            # Already logged, just re-raise
+            raise
+        
+        except Exception as e:
+            logger.exception(f"Unexpected build error: {e}")
+            raise DockerExecutionError(f"Build error: {e}")
+
+    async def _build_with_streaming(
         self,
         repo_path: Path,
-        job_id: str,
-        base_image: str = "python:3.11-slim"
+        image_tag: str,
+        timeout_seconds: int
     ) -> str:
         """
-        Build Docker image from requirements.txt (no Dockerfile).
+        Build image with streaming logs to detect failures immediately.
+        
+        This monitors the build output in real-time and terminates
+        immediately if an error is detected.
         
         Args:
-            repo_path: Path to repository directory
-            job_id: Job identifier for tagging
-            base_image: Base Docker image to use
+            repo_path: Repository path
+            image_tag: Image tag
+            timeout_seconds: Timeout in seconds
             
         Returns:
-            Docker image ID
+            Image ID
             
         Raises:
-            DockerExecutionError: If build fails
+            DockerExecutionError: On failure or timeout
         """
-        image_tag = f"sandbox-job-{job_id}"
+        build_started = asyncio.Event()
+        build_failed = asyncio.Event()
+        error_message = None
+        image_id = None
         
-        logger.info(f"Building Docker image from requirements for gVisor: {image_tag}")
-        
-        # Create temporary Dockerfile
-        dockerfile_content = f"""
-FROM {base_image}
-
-# Set working directory
-WORKDIR /workspace
-
-# Copy repository contents
-COPY . /workspace/
-
-# Install requirements
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Set user
-USER nobody
-
-# Entry point
-CMD ["python", "inference.py"]
-"""
-        
-        temp_dockerfile = repo_path / 'Dockerfile.generated'
-        try:
-            temp_dockerfile.write_text(dockerfile_content)
+        def build_worker():
+            """Worker thread that builds the image."""
+            nonlocal image_id, error_message
             
-            # Build image using temporary Dockerfile
-            image, build_logs = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.docker_client.images.build(
+            try:
+                # Get low-level API client for streaming
+                api_client = self.docker_client.api
+                
+                # Start build with streaming
+                build_logs = api_client.build(
                     path=str(repo_path),
-                    dockerfile='Dockerfile.generated',
                     tag=image_tag,
                     rm=True,
-                    forcerm=True
+                    forcerm=True,
+                    decode=True  # Decode JSON responses
                 )
-            )
-            
-            logger.info(
-                f"Docker image built from requirements for gVisor: {image.id[:12]}"
-            )
-            
-            return image.id
-            
-        except DockerException as e:
-            logger.error(f"Docker build from requirements failed: {e}")
-            raise DockerExecutionError(f"Docker build failed: {e}")
+                
+                build_started.set()
+                
+                # Process streaming logs
+                for log_entry in build_logs:
+                    if 'stream' in log_entry:
+                        line = log_entry['stream'].strip()
+                        if line:
+                            logger.info(f"Build: {line}")
+                    
+                    # Check for errors
+                    if 'error' in log_entry:
+                        error_message = log_entry['error']
+                        logger.error(f"Build error detected: {error_message}")
+                        build_failed.set()
+                        return None
+                    
+                    if 'errorDetail' in log_entry:
+                        error_message = log_entry['errorDetail'].get('message', 'Unknown error')
+                        logger.error(f"Build error detail: {error_message}")
+                        build_failed.set()
+                        return None
+                
+                # Build succeeded, get image
+                images = self.docker_client.images.list(name=image_tag)
+                if images:
+                    image_id = images[0].id
+                    return image_id
+                else:
+                    error_message = "Image not found after build"
+                    build_failed.set()
+                    return None
+                    
+            except Exception as e:
+                error_message = str(e)
+                logger.error(f"Build worker exception: {e}")
+                build_failed.set()
+                return None
         
-        finally:
-            # Clean up temporary Dockerfile
-            if temp_dockerfile.exists():
-                temp_dockerfile.unlink()
+        # Start build in thread
+        build_task = asyncio.get_event_loop().run_in_executor(None, build_worker)
+        
+        # Wait for build to start
+        try:
+            await asyncio.wait_for(build_started.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.error("Build failed to start within 30 seconds")
+            raise DockerExecutionError("Build failed to start")
+        
+        # Monitor build with timeout
+        start_time = asyncio.get_event_loop().time()
+        check_interval = 1.0  # Check every second
+        
+        while True:
+            # Check if build failed
+            if build_failed.is_set():
+                # Kill immediately
+                logger.error(f"Build failed: {error_message}")
+                await self._kill_build_process(image_tag)
+                await self._cleanup_partial_image(image_tag)
+                raise DockerExecutionError(f"Build failed: {error_message}")
+            
+            # Check if build completed
+            if build_task.done():
+                try:
+                    result = build_task.result()
+                    if result:
+                        return result
+                    else:
+                        # Build failed
+                        await self._kill_build_process(image_tag)
+                        await self._cleanup_partial_image(image_tag)
+                        raise DockerExecutionError(f"Build failed: {error_message or 'Unknown error'}")
+                except Exception as e:
+                    await self._kill_build_process(image_tag)
+                    await self._cleanup_partial_image(image_tag)
+                    raise DockerExecutionError(f"Build error: {e}")
+            
+            # Check timeout
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > timeout_seconds:
+                logger.error(f"Build timeout after {elapsed:.1f}s")
+                build_task.cancel()
+                await self._kill_build_process(image_tag)
+                await self._cleanup_partial_image(image_tag)
+                raise DockerExecutionError(f"Build timeout after {timeout_seconds}s")
+            
+            # Wait before next check
+            await asyncio.sleep(check_interval)
+
+    async def _kill_build_process(self, image_tag: str):
+        """
+        Immediately kill Docker build processes.
+        
+        Args:
+            image_tag: Image tag being built
+        """
+        try:
+            logger.warning(f"Killing Docker build for {image_tag}")
+            
+            # Kill all containers with this tag
+            def kill_containers():
+                try:
+                    # List all containers (including stopped ones)
+                    all_containers = self.docker_client.containers.list(all=True)
+                    
+                    for container in all_containers:
+                        # Check if container is related to this build
+                        if image_tag in str(container.image) or image_tag in container.name:
+                            try:
+                                logger.info(f"Killing container: {container.id[:12]}")
+                                container.kill()
+                                container.remove(force=True)
+                            except Exception as e:
+                                logger.warning(f"Failed to kill container {container.id[:12]}: {e}")
+                except Exception as e:
+                    logger.warning(f"Error listing containers: {e}")
+            
+            await asyncio.get_event_loop().run_in_executor(None, kill_containers)
+            
+            # Prune build cache
+            await asyncio.get_event_loop().run_in_executor(
+                None,
+                self.docker_client.api.prune_builds
+            )
+            
+            logger.info("Build processes killed")
+            
+        except Exception as e:
+            logger.warning(f"Failed to kill build process: {e}")
+
+    async def _cleanup_partial_image(self, image_tag: str):
+        """
+        Remove partial/failed image immediately.
+        
+        Args:
+            image_tag: Image tag to remove
+        """
+        try:
+            logger.info(f"Cleaning up partial image: {image_tag}")
+            
+            def remove_images():
+                try:
+                    images = self.docker_client.images.list(name=image_tag)
+                    for image in images:
+                        try:
+                            logger.info(f"Removing image: {image.id[:12]}")
+                            self.docker_client.images.remove(image.id, force=True)
+                        except Exception as e:
+                            logger.warning(f"Failed to remove image: {e}")
+                except Exception as e:
+                    logger.warning(f"Error listing images: {e}")
+            
+            await asyncio.get_event_loop().run_in_executor(None, remove_images)
+            
+        except Exception as e:
+            logger.warning(f"Failed to cleanup image: {e}")
     
     async def remove_image(self, image_id: str):
         """
