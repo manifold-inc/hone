@@ -444,6 +444,7 @@ class Executor:
             
         except Exception as e:
             logger.error(f"Prep phase error: {e}")
+            logger.exception(e)
             job.error_message = f"Prep phase error: {str(e)}"
             return False
     
