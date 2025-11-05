@@ -149,6 +149,20 @@ class Executor:
             job.progress_percentage = 10.0
             repo_path = await self._clone_repository(job, work_dir)
 
+            if job.repo_path:
+                work_dir_path = repo_path / job.repo_path
+                logger.info(f"Using subdirectory: {work_dir_path}")
+                logger.info(f"Subdirectory exists: {work_dir_path.exists()}")
+                if work_dir_path.exists():
+                    logger.info(f"Files in subdirectory: {list(work_dir_path.iterdir())}")
+                
+                if not work_dir_path.exists():
+                    raise ExecutorError(f"Specified repo path does not exist: {job.repo_path}")
+            else:
+                work_dir_path = repo_path
+                logger.info(f"Using repo root: {work_dir_path}")
+
+
             work_dir_path = repo_path / job.repo_path if job.repo_path else repo_path
             if job.repo_path and not work_dir_path.exists():
                 raise ExecutorError(f"Specified repo path does not exist: {job.repo_path}")

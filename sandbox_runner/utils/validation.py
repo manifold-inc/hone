@@ -98,6 +98,8 @@ class RepositoryValidator:
         for required_file in self.REQUIRED_FILES:
             file_path = repo_path / required_file
             if not file_path.exists():
+                available_files = list(repo_path.iterdir()) if repo_path.exists() else []
+                logger.error(f"Available files in {repo_path}: {[f.name for f in available_files]}")
                 raise ValidationError(
                     f"Required file missing: {required_file}. "
                     f"Miner repositories must include: {', '.join(self.REQUIRED_FILES)}"
