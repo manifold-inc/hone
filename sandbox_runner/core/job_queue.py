@@ -70,6 +70,7 @@ class Job:
     repo_url: str
     repo_branch: str = "main"
     repo_commit: Optional[str] = None
+    repo_path: str = ""
     
     # Resource requirements
     weight_class: WeightClass = WeightClass.ONE_GPU

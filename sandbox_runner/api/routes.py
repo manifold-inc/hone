@@ -63,6 +63,12 @@ class JobSubmitRequest(BaseModel):
         description="Specific commit hash (optional)",
         example="abc123"
     )
+
+    repo_path: str = Field(
+        default="",
+        description="Subdirectory path within repo (e.g., 'miner', 'src/solver')",
+        example="miner"
+    )
     
     weight_class: WeightClass = Field(
         ...,
@@ -245,6 +251,7 @@ def create_router(config: Config) -> APIRouter:
             "repo_url": str(request.repo_url),
             "repo_branch": request.repo_branch,
             "repo_commit": request.repo_commit,
+            "repo_path": request.repo_path,
             "weight_class": request.weight_class.value,
             "input_data_s3_path": request.input_data_s3_path,
             "output_data_s3_path": request.output_data_s3_path,

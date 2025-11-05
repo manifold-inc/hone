@@ -148,6 +148,12 @@ class Executor:
             job.current_phase = "cloning"
             job.progress_percentage = 10.0
             repo_path = await self._clone_repository(job, work_dir)
+
+            work_dir_path = repo_path / job.repo_path if job.repo_path else repo_path
+            if job.repo_path and not work_dir_path.exists():
+                raise ExecutorError(f"Specified repo path does not exist: {job.repo_path}")
+
+
             
             # Validate repository
             self.validator.validate_all(repo_path, job.repo_url)
@@ -156,7 +162,7 @@ class Executor:
             job.status = JobStatus.BUILDING
             job.current_phase = "building"
             job.progress_percentage = 30.0
-            image_id = await self._build_docker_image(job, repo_path)
+            image_id = await self._build_docker_image(job, work_dir_path)
             
             # Phase 3: Download input data
             job.current_phase = "downloading_input"
