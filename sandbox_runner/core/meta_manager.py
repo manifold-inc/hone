@@ -170,7 +170,7 @@ class MetaManager:
             repo_url=request.get("repo_url"),
             repo_branch=request.get("repo_branch", "main"),
             repo_commit=request.get("repo_commit"),
-            repo_path=job_request.get("repo_path", ""),
+            repo_path=request.get("repo_path", ""),
             weight_class=WeightClass(request.get("weight_class", "1xH200")),
             input_s3_path=request.get("input_data_s3_path", ""),
             output_s3_path=request.get("output_data_s3_path", ""),
