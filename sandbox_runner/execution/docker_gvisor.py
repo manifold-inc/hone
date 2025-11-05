@@ -29,6 +29,7 @@ import json
 import sys
 import shutil
 from collections import deque
+import re
 
 import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
@@ -46,96 +47,188 @@ class DockerExecutionError(Exception):
 
 class BuildLogDisplay:
     """
-    Real-time build log display with fixed scrollable box.
-    Uses a simple approach: fixed box that shows last N lines.
+    Fixed-position scrolling build log display.
+    Creates a box that stays in one place while content scrolls inside it.
     """
     
-    def __init__(self, max_lines: int = 15):
+    def __init__(self, box_lines: int = 10):
         """
         Initialize build log display.
         
         Args:
-            max_lines: Maximum number of lines to display in the scrolling box
+            box_lines: Number of lines in the fixed box
         """
-        self.max_lines = max_lines
-        self.log_buffer = deque(maxlen=max_lines)
-        self.terminal_width = min(shutil.get_terminal_size((120, 20)).columns, 150)
+        self.box_lines = box_lines
+        self.log_buffer = deque(maxlen=box_lines)
+        self.terminal_width = min(shutil.get_terminal_size((120, 20)).columns, 140)
         self.box_active = False
-        self.line_count = 0
+        self.total_lines = 0
         
-    def start(self):
-        """Start the build log display box."""
-        if self.box_active:
-            return
+        # ANSI escape codes
+        self.SAVE_CURSOR = "\033[s"
+        self.RESTORE_CURSOR = "\033[u"
+        self.CLEAR_LINE = "\033[2K"
+        self.MOVE_UP = "\033[{}A"
+        self.MOVE_DOWN = "\033[{}B"
+        
+    def _strip_ansi(self, text: str) -> str:
+        """
+        Remove all ANSI escape sequences from text.
+        
+        Args:
+            text: Text with potential ANSI codes
             
-        self.box_active = True
-        
-        # Print header
-        print("\n" + "=" * self.terminal_width)
-        print(f"{'🔨 DOCKER BUILD LOGS (streaming...)':^{self.terminal_width}}")
-        print("=" * self.terminal_width)
-        print()
-        
+        Returns:
+            Clean text
+        """
+        ansi_pattern = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        return ansi_pattern.sub('', text)
+    
     def _clean_line(self, line: str) -> str:
         """
-        Clean a log line for display.
+        Clean and prepare a line for display.
         
         Args:
             line: Raw log line
             
         Returns:
-            Cleaned line without ANSI codes
+            Cleaned, truncated line
         """
-        # Remove ANSI escape sequences
-        import re
-        ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        cleaned = ansi_escape.sub('', line)
+        # Strip ANSI codes
+        cleaned = self._strip_ansi(line.rstrip())
         
-        # Truncate if too long
+        # Remove control characters
+        cleaned = ''.join(char for char in cleaned if char.isprintable() or char in '\t\n')
+        
+        # Truncate to fit
         max_width = self.terminal_width - 4
         if len(cleaned) > max_width:
-            cleaned = cleaned[:max_width-3] + "..."
+            cleaned = cleaned[:max_width - 3] + "..."
         
         return cleaned
     
-    def update(self, line: str):
+    def _should_display(self, line: str) -> bool:
         """
-        Add a new line to the build log display.
-        Simply prints it to stdout with a prefix.
+        Determine if a line should be displayed.
         
         Args:
-            line: New log line to display
+            line: Line to check
+            
+        Returns:
+            True if line should be shown
+        """
+        if not line.strip():
+            return False
+        
+        # Filter out repetitive progress lines
+        skip_patterns = [
+            r'^\(Reading database \.\.\. \d+%',
+            r'^Get:\d+ http',
+            r'^Fetched \d+',
+            r'^\s*$',
+            r'^Reading package lists\.\.\.',
+            r'^Building dependency tree\.\.\.',
+            r'^Reading state information\.\.\.',
+        ]
+        
+        for pattern in skip_patterns:
+            if re.search(pattern, line):
+                return False
+        
+        return True
+    
+    def start(self):
+        """Draw the initial empty box."""
+        if self.box_active:
+            return
+        
+        self.box_active = True
+        
+        # Draw header
+        border = "=" * self.terminal_width
+        header = f"{'🔨 BUILD LOGS':^{self.terminal_width}}"
+        
+        print(f"\n{border}")
+        print(header)
+        print(border)
+        
+        # Draw empty box
+        for _ in range(self.box_lines):
+            print(f"│{' ' * (self.terminal_width - 2)}│")
+        
+        # Draw footer
+        print(border)
+        print()  # Extra line for cursor position
+        
+        # Save cursor position (after the box)
+        sys.stdout.write(self.SAVE_CURSOR)
+        sys.stdout.flush()
+    
+    def update(self, line: str):
+        """
+        Add a new line to the scrolling box.
+        
+        Args:
+            line: New log line
         """
         if not self.box_active:
             self.start()
         
         # Clean the line
-        cleaned = self._clean_line(line.rstrip())
+        cleaned = self._clean_line(line)
         
-        if not cleaned:  # Skip empty lines
+        # Check if we should display it
+        if not self._should_display(cleaned):
             return
         
         # Add to buffer
         self.log_buffer.append(cleaned)
-        self.line_count += 1
+        self.total_lines += 1
         
-        # Print with a simple prefix
-        print(f"│ {cleaned}")
+        # Restore cursor to saved position
+        sys.stdout.write(self.RESTORE_CURSOR)
+        
+        # Move up to the start of the box content (box_lines + 2 for borders)
+        sys.stdout.write(self.MOVE_UP.format(self.box_lines + 2))
+        
+        # Redraw all lines in the box
+        for i in range(self.box_lines):
+            sys.stdout.write(self.CLEAR_LINE)
+            
+            if i < len(self.log_buffer):
+                content = self.log_buffer[i]
+                # Ensure content fits
+                padding = self.terminal_width - len(content) - 3
+                sys.stdout.write(f"│ {content}{' ' * padding}│\n")
+            else:
+                # Empty line
+                sys.stdout.write(f"│{' ' * (self.terminal_width - 2)}│\n")
+        
+        # Skip the bottom border
+        sys.stdout.write(self.MOVE_DOWN.format(1))
+        
+        # Save cursor position again
+        sys.stdout.write(self.SAVE_CURSOR)
         sys.stdout.flush()
     
     def end(self):
-        """End the build log display box."""
+        """End the build log display."""
         if not self.box_active:
             return
         
         self.box_active = False
         
-        # Print footer
-        print()
-        print("=" * self.terminal_width)
-        print(f"{'✅ BUILD COMPLETE ({self.line_count} lines)':^{self.terminal_width}}")
-        print("=" * self.terminal_width)
-        print()
+        # Restore cursor
+        sys.stdout.write(self.RESTORE_CURSOR)
+        
+        # Print completion message below the box
+        border = "=" * self.terminal_width
+        completion = f"{'✅ BUILD COMPLETE (' + str(self.total_lines) + ' lines processed)':^{self.terminal_width}}"
+        
+        print(border)
+        print(completion)
+        print(f"{border}\n")
+        sys.stdout.flush()
 
 
 class DockerGVisorExecutor:
@@ -555,35 +648,6 @@ class DockerGVisorExecutor:
         except Exception as e:
             logger.warning(f"Failed to remove gVisor container: {e}")
     
-    def _should_show_log_line(self, line: str) -> bool:
-        """
-        Determine if a log line should be displayed.
-        Filters out progress bars, repetitive updates, etc.
-        
-        Args:
-            line: Log line to check
-            
-        Returns:
-            True if line should be shown
-        """
-        # Skip empty lines
-        if not line.strip():
-            return False
-        
-        # Skip lines that are just progress indicators
-        progress_indicators = [
-            'Reading package lists...',
-            '(Reading database',
-            'Fetched ',
-            'Get:',
-        ]
-        
-        for indicator in progress_indicators:
-            if indicator in line and line.count('%') > 0:
-                return False
-        
-        return True
-    
     async def _stream_build_logs(self, build_generator, display: BuildLogDisplay):
         """
         Stream build logs in real-time to the display.
@@ -592,26 +656,16 @@ class DockerGVisorExecutor:
             build_generator: Docker build log generator
             display: BuildLogDisplay instance for rendering logs
         """
-        last_step = None
-        
         for log_entry in build_generator:
             try:
                 if 'stream' in log_entry:
                     line = log_entry['stream'].rstrip()
-                    
-                    if not line:
-                        continue
-                    
-                    # Track build steps
-                    if line.startswith('Step '):
-                        last_step = line
+                    if line:
                         display.update(line)
-                    elif self._should_show_log_line(line):
-                        display.update(line)
-                    
-                    # Also log important lines to file
-                    if 'Step ' in line or 'ERROR' in line or 'Successfully' in line:
-                        logger.info(f"Build: {line}")
+                        
+                        # Log important lines to file
+                        if any(keyword in line for keyword in ['Step ', 'ERROR', 'Successfully', 'Failed']):
+                            logger.debug(f"Build: {line}")
                 
                 elif 'error' in log_entry:
                     error_line = f"❌ ERROR: {log_entry['error']}"
@@ -619,18 +673,16 @@ class DockerGVisorExecutor:
                     logger.error(f"Build error: {log_entry['error']}")
                 
                 elif 'status' in log_entry:
-                    # Handle pull/push status messages
                     status = log_entry['status']
                     if 'id' in log_entry:
                         status = f"[{log_entry['id']}] {status}"
-                    if self._should_show_log_line(status):
-                        display.update(status)
+                    display.update(status)
                 
-                # Small delay to prevent overwhelming output
-                await asyncio.sleep(0.005)
+                # Small delay to prevent overwhelming
+                await asyncio.sleep(0.01)
                 
             except Exception as e:
-                logger.warning(f"Error processing build log entry: {e}")
+                logger.warning(f"Error processing build log: {e}")
                 continue
     
     async def build_image(
@@ -660,8 +712,8 @@ class DockerGVisorExecutor:
         
         logger.info(f"Building Docker image for gVisor: {image_tag}")
         
-        # Initialize build log display
-        display = BuildLogDisplay(max_lines=15)
+        # Initialize build log display with 10 lines
+        display = BuildLogDisplay(box_lines=10)
         
         try:
             # Check if Dockerfile exists
@@ -680,7 +732,7 @@ class DockerGVisorExecutor:
                     tag=image_tag,
                     rm=True,
                     forcerm=True,
-                    decode=True,  # Decode JSON logs
+                    decode=True,
                     timeout=timeout_seconds
                 )
             
@@ -739,7 +791,7 @@ class DockerGVisorExecutor:
         logger.info(f"Building Docker image from requirements for gVisor: {image_tag}")
         
         # Initialize build log display
-        display = BuildLogDisplay(max_lines=15)
+        display = BuildLogDisplay(box_lines=10)
         
         # Create temporary Dockerfile
         dockerfile_content = f"""
