@@ -506,7 +506,7 @@ class DockerGVisorExecutor:
             # Log build output
             for log in build_logs:
                 if 'stream' in log:
-                    logger.debug(f"Build: {log['stream'].strip()}")
+                    logger.info(f"Build: {log['stream'].strip()}")
             
             logger.info(
                 f"Docker image built for gVisor: {image.id[:12]} ({image_tag})"
