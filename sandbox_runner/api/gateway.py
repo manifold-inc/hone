@@ -70,8 +70,8 @@ def create_app(config: Config) -> FastAPI:
         title="Hone Subnet Sandbox Runner API",
         description="Secure GPU execution service for Bittensor subnet miners",
         version="1.0.0",
-        docs_url="/docs" if config.api.port != 8443 else None,
-        redoc_url="/redoc" if config.api.port != 8443 else None,
+        docs_url="/docs",
+        redoc_url="/redoc",
         lifespan=lifespan
     )
     

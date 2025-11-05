@@ -15,8 +15,8 @@ api:
   # SSL/TLS certificates (required for HTTPS)
   # Generate self-signed certs for testing:
   # openssl req -x509 -newkey rsa:4096 -nodes -keyout runner.key -out runner.crt -days 365
-  ssl_cert_path: "/etc/ssl/certs/runner.crt"
-  ssl_key_path: "/etc/ssl/private/runner.key"
+  #ssl_cert_path: "/etc/ssl/certs/runner.crt"
+  #ssl_key_path: "/etc/ssl/private/runner.key"
   
   # Header names for authentication
   api_key_header: "X-API-Key"
