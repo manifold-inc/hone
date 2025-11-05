@@ -154,9 +154,8 @@ class Executor:
                 raise ExecutorError(f"Specified repo path does not exist: {job.repo_path}")
 
 
-            
             # Validate repository
-            self.validator.validate_all(repo_path, job.repo_url)
+            self.validator.validate_all(work_dir_path, job.repo_url)
             
             # Phase 2: Build Docker image
             job.status = JobStatus.BUILDING
