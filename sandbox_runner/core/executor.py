@@ -25,8 +25,8 @@ from datetime import datetime
 from typing import Optional, Dict
 import tempfile
 
-from job_queue import Job, JobStatus
-from gpu_pool import GPUPoolManager
+from core.job_queue import Job, JobStatus
+from core.gpu_pool import GPUPoolManager
 from config import Config
 from utils.s3 import S3Manager, S3TransferError
 from utils.validation import RepositoryValidator, ValidationError

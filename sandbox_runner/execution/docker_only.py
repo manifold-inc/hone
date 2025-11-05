@@ -22,7 +22,7 @@ import time
 import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
 
-from job_queue import Job
+from core.job_queue import Job
 from config import Config
 
 logger = logging.getLogger(__name__)

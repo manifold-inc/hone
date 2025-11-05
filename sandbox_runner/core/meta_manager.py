@@ -23,10 +23,10 @@ from datetime import datetime
 from typing import Optional, Dict, List
 from dataclasses import asdict
 
-from job_queue import Job, JobQueue, JobStatus, WeightClass
-from gpu_pool import GPUPoolManager
-from scheduler import IntelligentScheduler
-from executor import Executor
+from core.job_queue import Job, JobQueue, JobStatus, WeightClass
+from core.gpu_pool import GPUPoolManager
+from core.scheduler import IntelligentScheduler
+from core.executor import Executor
 from config import Config
 
 logger = logging.getLogger(__name__)

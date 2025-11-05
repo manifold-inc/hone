@@ -16,8 +16,8 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict
 from collections import defaultdict
 
-from job_queue import Job, JobQueue, WeightClass
-from gpu_pool import GPUPoolManager
+from core.job_queue import Job, JobQueue, WeightClass
+from core.gpu_pool import GPUPoolManager
 
 logger = logging.getLogger(__name__)
 

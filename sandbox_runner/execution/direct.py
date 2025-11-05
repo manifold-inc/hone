@@ -25,7 +25,7 @@ from typing import Optional, Tuple, Dict
 import tempfile
 import shutil
 
-from job_queue import Job
+from core.job_queue import Job
 from config import Config
 from security.cgroups import CgroupManager
 from security.isolation import NamespaceManager
