@@ -344,7 +344,7 @@ class Executor:
         
         try:
             image_id = await executor.build_image(
-                job=job,
+                job=job.job_id,
                 repo_path=repo_path,
                 timeout_seconds=self.config.execution.repo_build_timeout_seconds
             )
