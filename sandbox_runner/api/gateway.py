@@ -162,20 +162,7 @@ def _add_middleware(app: FastAPI, config: Config):
         
         return response
     
-    @app.middleware("http")
-    async def add_security_headers(request: Request, call_next):
-        """Add security headers."""
-        response = await call_next(request)
-        
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Strict-Transport-Security"] = "max-age=31536000"
-        response.headers["Content-Security-Policy"] = "default-src 'self'"
-        
-        return response
-
-
+    
 def _add_exception_handlers(app: FastAPI):
     """Add custom exception handlers."""
     
