@@ -498,8 +498,8 @@ class DockerGVisorExecutor:
             'command': command,
             'environment': env_vars,
             'network_mode': network_mode,
-            'mem_limit': mem_limit,
-            'nano_cpus': nano_cpus,
+            #'mem_limit': mem_limit,
+            #'nano_cpus': nano_cpus,
             'volumes': volumes,
             'working_dir': '/workspace',
             'user': 'nobody',  # Run as non-root user
