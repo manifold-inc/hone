@@ -1,16 +1,17 @@
-FROM nvidia/cuda:12.1.0-runtime-ubuntu22.04
+FROM nvidia/cuda:12.2.0-runtime-ubuntu22.04
 
-# Install Python
+# Install Python and dependencies
 RUN apt-get update && apt-get install -y \
     python3.10 \
     python3-pip \
     git \
+    wget \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements
+# Copy requirements first for better caching
 COPY requirements.txt .
 
 # Install Python dependencies
