@@ -360,6 +360,39 @@ class DockerGVisorExecutor:
                 extra={"container_id": container.id, "runtime": self.gvisor_runtime}
             )
             
+            # Inspect container configuration for debugging
+            try:
+                container_details = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.docker_client.api.inspect_container(container.id)
+                )
+                
+                logger.info(
+                    f"Container details - Image: {container_details.get('Image', 'unknown')[:12]}, "
+                    f"Cmd: {container_details['Config'].get('Cmd')}, "
+                    f"Entrypoint: {container_details['Config'].get('Entrypoint')}, "
+                    f"WorkingDir: {container_details['Config'].get('WorkingDir')}, "
+                    f"User: {container_details['Config'].get('User')}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to inspect container: {e}")
+            
+            # Verify image exists and inspect it before starting
+            try:
+                image_details = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.docker_client.api.inspect_image(image_id)
+                )
+                logger.info(
+                    f"Image inspection before start - "
+                    f"Cmd: {image_details['Config'].get('Cmd')}, "
+                    f"Entrypoint: {image_details['Config'].get('Entrypoint')}, "
+                    f"WorkingDir: {image_details['Config'].get('WorkingDir')}, "
+                    f"User: {image_details['Config'].get('User')}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to inspect image {image_id}: {e}")
+            
             # Start container
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -374,16 +407,42 @@ class DockerGVisorExecutor:
             # Get logs
             stdout, stderr = await self._get_container_logs(container)
             
+            # Get detailed container state
+            container_state = container.attrs['State']
+            
             logger.info(
                 f"gVisor container finished: {container.id[:12]} (exit_code={exit_code})",
                 extra={
                     "job_id": job.job_id,
                     "phase": phase,
                     "exit_code": exit_code,
-                    "stdout_lines": len(stdout.split('\n')),
-                    "stderr_lines": len(stderr.split('\n'))
+                    "started_at": container_state.get('StartedAt'),
+                    "finished_at": container_state.get('FinishedAt'),
+                    "error": container_state.get('Error', ''),
+                    "oom_killed": container_state.get('OOMKilled', False),
+                    "stdout_lines": len(stdout.split('\n')) if stdout else 0,
+                    "stderr_lines": len(stderr.split('\n')) if stderr else 0
                 }
             )
+            
+            # Log container output if exit code is non-zero
+            if exit_code != 0:
+                logger.error(
+                    f"Container failed with exit code {exit_code}. "
+                    f"Exit code 127 typically means 'command not found'.",
+                    extra={
+                        "exit_code": exit_code,
+                        "container_error": container_state.get('Error', ''),
+                        "stdout_preview": stdout[:500] if stdout else "(empty)",
+                        "stderr_preview": stderr[:500] if stderr else "(empty)"
+                    }
+                )
+                
+                # Log full output at debug level
+                if stdout:
+                    logger.debug(f"Container stdout:\n{stdout}")
+                if stderr:
+                    logger.debug(f"Container stderr:\n{stderr}")
             
             return exit_code, stdout, stderr
             
@@ -454,11 +513,22 @@ class DockerGVisorExecutor:
         
         # Prepare command
         command = [
-            'python', 'inference.py',
+            'python3', 'inference.py',  # Changed from 'python' to 'python3'
             '--phase', phase,
             '--input', '/input',
             '--output', '/output'
         ]
+        
+        logger.info(
+            f"Container command for {phase} phase: {' '.join(command)}",
+            extra={
+                "job_id": job.job_id,
+                "phase": phase,
+                "working_dir": '/workspace',
+                "user": 'nobody',
+                "network_mode": "TBD"  # Will be determined below
+            }
+        )
         
         # Network mode based on gVisor config and phase
         if self.config.security.gvisor.network_mode == "none" or not network_enabled:
@@ -841,6 +911,101 @@ CMD ["python", "inference.py"]
             logger.debug(f"Image not found (already removed?): {image_id[:12]}")
         except Exception as e:
             logger.warning(f"Failed to remove image {image_id[:12]}: {e}")
+    
+    async def inspect_image_for_command(self, image_id: str) -> Dict:
+        """
+        Inspect an image to verify the command/entrypoint configuration.
+        Useful for debugging command execution issues.
+        
+        Args:
+            image_id: Docker image ID
+            
+        Returns:
+            Dictionary with image command configuration
+        """
+        try:
+            image_details = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.docker_client.api.inspect_image(image_id)
+            )
+            
+            config = image_details.get('Config', {})
+            
+            info = {
+                "cmd": config.get('Cmd'),
+                "entrypoint": config.get('Entrypoint'),
+                "working_dir": config.get('WorkingDir'),
+                "user": config.get('User'),
+                "env": [e for e in config.get('Env', []) if 'PATH' in e],
+            }
+            
+            logger.info(
+                f"Image {image_id[:12]} configuration: "
+                f"Cmd={info['cmd']}, "
+                f"Entrypoint={info['entrypoint']}, "
+                f"WorkingDir={info['working_dir']}, "
+                f"User={info['user']}"
+            )
+            
+            if not info.get('cmd') and not info.get('entrypoint'):
+                logger.warning(
+                    f"Image {image_id[:12]} has no CMD or ENTRYPOINT defined! "
+                    "This will cause the container command to fail."
+                )
+            
+            return info
+            
+        except Exception as e:
+            logger.error(f"Failed to inspect image {image_id}: {e}")
+            return {}
+    
+    async def verify_container_environment(
+        self, 
+        image_id: str,
+    ) -> Dict:
+        """
+        Run diagnostic commands in a container to verify the environment.
+        Useful for debugging 'command not found' errors (exit code 127).
+        
+        Args:
+            image_id: Docker image ID
+            
+        Returns:
+            Dictionary with diagnostic results
+        """
+        results = {}
+        
+        diagnostic_commands = [
+            ('which_python', ['which', 'python']),
+            ('which_python3', ['which', 'python3']),
+            ('ls_workspace', ['ls', '-la', '/workspace']),
+            ('ls_root', ['ls', '-la', '/']),
+            ('pwd', ['pwd']),
+            ('whoami', ['whoami']),
+            ('env', ['env']),
+        ]
+        
+        logger.info(f"Running diagnostics on image {image_id[:12]}...")
+        
+        for test_name, cmd in diagnostic_commands:
+            try:
+                container = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.docker_client.containers.run(
+                        image=image_id,
+                        command=cmd,
+                        detach=False,
+                        remove=True,
+                        runtime=self.gvisor_runtime,
+                    )
+                )
+                results[test_name] = container.decode('utf-8').strip()
+                logger.info(f"✓ Diagnostic {test_name}: {results[test_name][:100]}")
+            except Exception as e:
+                results[test_name] = f"ERROR: {e}"
+                logger.warning(f"✗ Diagnostic {test_name} failed: {e}")
+        
+        return results
     
     def is_available(self) -> bool:
         """
