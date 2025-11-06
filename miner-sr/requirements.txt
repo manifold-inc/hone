@@ -1,10 +1,10 @@
 # Core dependencies
-vllm==0.6.3
-torch>=2.1.0
-transformers>=4.35.0
-huggingface-hub>=0.19.0
+vllm
+torch
+transformers
+huggingface-hub
 
 # Required
-accelerate>=0.25.0
-sentencepiece>=0.1.99
-protobuf>=3.20.0
+accelerate
+sentencepiece
+protobuf
