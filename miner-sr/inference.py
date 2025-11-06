@@ -64,7 +64,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     
     # Load input to see what model we need
     input_data = load_input_data(input_dir)
-    model_name = input_data.get("model", "facebook/opt-125m")
+    model_name = input_data.get("model", "Qwen/Qwen3-0.6B")
     
     print(f"\n[1/3] Model to download: {model_name}")
     
@@ -148,7 +148,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     
     # Get parameters
     prompts = input_data.get("prompts", ["Hello! How are you today?"])
-    model_name = input_data.get("model", "facebook/opt-125m")
+    model_name = input_data.get("model", "Qwen/Qwen3-0.6B")
     max_tokens = input_data.get("max_tokens", 50)
     temperature = input_data.get("temperature", 0.7)
     
