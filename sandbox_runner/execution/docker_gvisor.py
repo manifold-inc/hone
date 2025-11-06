@@ -234,6 +234,37 @@ async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
         display.update(f"ERROR: {ex}")
         await asyncio.sleep(0)
 
+async def _stream_container_logs(self, container, display: BuildLogDisplay) -> str:
+    """
+    Stream container logs in real time into the BuildLogDisplay.
+    Returns the concatenated text (stdout+stderr, Docker doesn't separate by default).
+    """
+    loop = asyncio.get_event_loop()
+    collected: List[str] = []
+
+    def _read_logs_blocking():
+        try:
+            # Using logs(..., stream=True, follow=True) yields bytes chunks until container exits
+            for chunk in container.logs(stdout=True, stderr=True, stream=True, follow=True):
+                try:
+                    text = chunk.decode("utf-8", errors="replace")
+                except Exception:
+                    text = str(chunk)
+                # Split to update the box line-by-line
+                for ln in text.splitlines():
+                    display.update(ln)
+                    collected.append(ln + "\n")
+        except Exception as e:
+            # Stream might be closed if container dies very quickly; show something useful
+            display.update(f"[log-stream] ERROR: {e}")
+
+    # Run the blocking generator in a thread
+    task = loop.run_in_executor(None, _read_logs_blocking)
+    # Wait for the log stream to finish (it ends when the container stops)
+    await task
+
+    return "".join(collected)
+
 
 class DockerGVisorExecutor:
     """
@@ -307,25 +338,9 @@ class DockerGVisorExecutor:
         work_dir: Path,
         timeout_seconds: int
     ) -> Tuple[int, str, str]:
-        """
-        Run a container for a specific job phase with gVisor.
-        
-        Args:
-            image_id: Docker image ID or tag
-            job: Job object with execution details
-            phase: Execution phase ("prep" or "inference")
-            network_enabled: Whether to enable network access
-            work_dir: Working directory on host
-            timeout_seconds: Execution timeout in seconds
-            
-        Returns:
-            Tuple of (exit_code, stdout, stderr)
-            
-        Raises:
-            DockerExecutionError: If container execution fails
-        """
+
         container_name = f"sandbox-{job.job_id}-{phase}-gvisor"
-        
+
         logger.info(
             f"Starting gVisor container: {container_name}",
             extra={
@@ -336,8 +351,8 @@ class DockerGVisorExecutor:
                 "gvisor_platform": self.gvisor_platform
             }
         )
-        
-        # Prepare container configuration with gVisor runtime
+
+        # Build config (unchanged)
         container_config = self._build_container_config(
             image_id=image_id,
             job=job,
@@ -346,27 +361,26 @@ class DockerGVisorExecutor:
             work_dir=work_dir,
             container_name=container_name
         )
-        
+
         container = None
+        # Create a scrolling box for execution logs
+        display = BuildLogDisplay(box_lines=10, title=f"🧪 {phase.upper()} LOGS")
+
         try:
-            # Create container with gVisor runtime
+            # Create container
             container = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.docker_client.containers.create(**container_config)
+                None, lambda: self.docker_client.containers.create(**container_config)
             )
-            
             logger.info(
                 f"gVisor container created: {container.id[:12]}",
                 extra={"container_id": container.id, "runtime": self.gvisor_runtime}
             )
-            
-            # Inspect container configuration for debugging
+
+            # Optional: inspect (your existing debugging)
             try:
                 container_details = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.docker_client.api.inspect_container(container.id)
+                    None, lambda: self.docker_client.api.inspect_container(container.id)
                 )
-                
                 logger.info(
                     f"Container details - Image: {container_details.get('Image', 'unknown')[:12]}, "
                     f"Cmd: {container_details['Config'].get('Cmd')}, "
@@ -376,12 +390,11 @@ class DockerGVisorExecutor:
                 )
             except Exception as e:
                 logger.warning(f"Failed to inspect container: {e}")
-            
-            # Verify image exists and inspect it before starting
+
+            # Optional: image inspect (your existing debugging)
             try:
                 image_details = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.docker_client.api.inspect_image(image_id)
+                    None, lambda: self.docker_client.api.inspect_image(image_id)
                 )
                 logger.info(
                     f"Image inspection before start - "
@@ -392,24 +405,42 @@ class DockerGVisorExecutor:
                 )
             except Exception as e:
                 logger.error(f"Failed to inspect image {image_id}: {e}")
-            
+
+            # Start the box **before** starting the container, so early logs show up
+            display.start()
+
             # Start container
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                container.start
-            )
-            
+            await asyncio.get_event_loop().run_in_executor(None, container.start)
             logger.info(f"gVisor container started: {container.id[:12]}")
-            
-            # Wait for container with timeout
+
+            # Start streaming logs concurrently
+            logs_task = asyncio.create_task(self._stream_container_logs(container, display))
+
+            # Wait for exit (poll loop) with timeout
             exit_code = await self._wait_for_container(container, timeout_seconds)
-            
-            # Get logs
-            stdout, stderr = await self._get_container_logs(container)
-            
-            # Get detailed container state
+
+            # Ensure log streaming finished
+            try:
+                combined_logs = await asyncio.wait_for(logs_task, timeout=5)
+            except asyncio.TimeoutError:
+                # If logs stream didn't finish promptly, cancel and fallback to a final fetch
+                logs_task.cancel()
+                try:
+                    _ = await logs_task
+                except Exception:
+                    pass
+                # Final safety read (non-stream) in case anything is left
+                final = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+                )
+                combined_logs = final
+
+            # Close the box with a status banner
+            status_txt = "✅ EXECUTION COMPLETE" if exit_code == 0 else f"❌ EXECUTION FAILED (code {exit_code})"
+            display.end(status_txt)
+
+            # Gather detailed container state
             container_state = container.attrs['State']
-            
             logger.info(
                 f"gVisor container finished: {container.id[:12]} (exit_code={exit_code})",
                 extra={
@@ -420,12 +451,12 @@ class DockerGVisorExecutor:
                     "finished_at": container_state.get('FinishedAt'),
                     "error": container_state.get('Error', ''),
                     "oom_killed": container_state.get('OOMKilled', False),
-                    "stdout_lines": len(stdout.split('\n')) if stdout else 0,
-                    "stderr_lines": len(stderr.split('\n')) if stderr else 0
+                    "stdout_lines": len(combined_logs.splitlines()) if combined_logs else 0,
+                    "stderr_lines": 0  # We merged streams; Docker doesn't split by default
                 }
             )
-            
-            # Log container output if exit code is non-zero
+
+            # If non-zero, log previews
             if exit_code != 0:
                 logger.error(
                     f"Container failed with exit code {exit_code}. "
@@ -433,41 +464,37 @@ class DockerGVisorExecutor:
                     extra={
                         "exit_code": exit_code,
                         "container_error": container_state.get('Error', ''),
-                        "stdout_preview": stdout[:500] if stdout else "(empty)",
-                        "stderr_preview": stderr[:500] if stderr else "(empty)"
+                        "stdout_preview": (combined_logs[:500] if combined_logs else "(empty)"),
+                        "stderr_preview": "(merged into stdout)"
                     }
                 )
-                
-                # Log full output at debug level
-                if stdout:
-                    logger.info(f"Container stdout:\n{stdout}")
-                if stderr:
-                    logger.error(f"Container stderr:\n{stderr}")
-            
-            return exit_code, stdout, stderr
-            
+                if combined_logs:
+                    logger.info(f"Container combined logs:\n{combined_logs}")
+
+            # We return combined logs as stdout, keep stderr empty (consistent with current behavior)
+            return exit_code, combined_logs or "", ""
+
         except asyncio.TimeoutError:
-            logger.error(
-                f"gVisor container timeout after {timeout_seconds}s: {container_name}"
-            )
+            display.update(f"[timeout] Container exceeded {timeout_seconds}s → killing…")
             if container:
                 await self._kill_container(container)
-            raise DockerExecutionError(
-                f"Container timeout after {timeout_seconds}s"
-            )
-        
+            display.end(f"⏱️ EXECUTION TIMEOUT ({timeout_seconds}s)")
+            raise DockerExecutionError(f"Container timeout after {timeout_seconds}s")
+
         except ContainerError as e:
+            display.end("❌ EXECUTION ERROR")
             logger.error(f"gVisor container execution error: {e}")
             raise DockerExecutionError(f"Container execution failed: {e}")
-        
+
         except DockerException as e:
+            display.end("❌ DOCKER ERROR")
             logger.error(f"Docker error with gVisor: {e}")
             raise DockerExecutionError(f"Docker error: {e}")
-        
+
         finally:
-            # Clean up container
             if container:
                 await self._cleanup_container(container)
+
     
     def _build_container_config(
         self,
