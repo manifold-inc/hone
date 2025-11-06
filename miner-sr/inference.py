@@ -86,12 +86,18 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     
     try:
         # Download all model files
-        local_model_path = snapshot_download(
-            repo_id=model_name,
-            cache_dir=str(cache_dir),
-            resume_download=True,
-            local_files_only=False,  # Allow downloading
-            ignore_patterns=None,  # Download everything
+        from vllm import LLM, SamplingParams
+        
+        llm = LLM(
+            model=model_name,
+            download_dir=str(cache_dir),
+            dtype="half",
+            gpu_memory_utilization=0.8,
+            max_model_len=2048,
+            trust_remote_code=True,
+            tensor_parallel_size=1,
+            tokenizer_mode="auto",
+            load_format="auto",
         )
         print(f"✓ Model downloaded successfully to: {local_model_path}")
         
@@ -201,6 +207,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
             trust_remote_code=True,
             tensor_parallel_size=1,
             # IMPORTANT: Only use cached files, no downloads
+            local_files_only=True,
             tokenizer_mode="auto",
             load_format="auto",
         )
