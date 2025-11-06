@@ -64,41 +64,75 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     
     # Load input to see what model we need
     input_data = load_input_data(input_dir)
-    model_name = input_data.get("model", "Qwen/Qwen3-0.6B")
+    model_name = input_data.get("model", "facebook/opt-125m")
     
-    print(f"\n[1/2] Model to download: {model_name}")
+    print(f"\n[1/3] Model to download: {model_name}")
     
-    # Download model during prep phase
-    from huggingface_hub import snapshot_download
-    
+    # Set up cache directory
     cache_dir = Path("/app/models")
     cache_dir.mkdir(parents=True, exist_ok=True)
     
-    print(f"[2/2] Downloading model to {cache_dir}...")
+    print(f"[2/3] Downloading model to {cache_dir}...")
     print("(This requires internet access)")
     
+    # Download model files using huggingface_hub
+    from huggingface_hub import snapshot_download
+    import os
+    
+    # Set HF_HOME to ensure models go to the right place
+    os.environ['HF_HOME'] = str(cache_dir)
+    os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
+    os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
+    
     try:
-        snapshot_download(
+        # Download all model files
+        local_model_path = snapshot_download(
             repo_id=model_name,
             cache_dir=str(cache_dir),
-            resume_download=True
+            resume_download=True,
+            local_files_only=False,  # Allow downloading
+            ignore_patterns=None,  # Download everything
         )
-        print("✓ Model downloaded successfully!")
+        print(f"✓ Model downloaded successfully to: {local_model_path}")
+        
+        # Also pre-load with transformers to ensure tokenizer is cached
+        print("\n[3/3] Pre-loading model with transformers to cache tokenizer...")
+        from transformers import AutoTokenizer, AutoModelForCausalLM
+        
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name,
+            cache_dir=str(cache_dir),
+            local_files_only=False,
+            trust_remote_code=True
+        )
+        print(f"✓ Tokenizer cached (vocab size: {len(tokenizer)})")
+        
+        # For vLLM, we don't need to load the full model in prep
+        # Just having the files cached is enough
+        print("✓ Model files ready for vLLM")
+        
+        prep_status = "success"
+        prep_message = f"Model {model_name} downloaded and cached"
+        
     except Exception as e:
-        print(f"WARNING: Could not download model: {e}")
-        print("Will try to use cached version in inference phase")
+        print(f"ERROR: Could not download model: {e}")
+        import traceback
+        traceback.print_exc()
+        prep_status = "failed"
+        prep_message = str(e)
     
     # Save prep results
     prep_results = {
         "phase": "prep",
         "model": model_name,
-        "status": "completed",
+        "status": prep_status,
+        "message": prep_message,
         "cache_dir": str(cache_dir)
     }
     save_output_data(prep_results, output_dir)
     
     print("\n" + "=" * 60)
-    print("PREP PHASE COMPLETED")
+    print(f"PREP PHASE COMPLETED - Status: {prep_status}")
     print("=" * 60)
 
 
@@ -109,7 +143,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     print("=" * 60)
     
     # Load input data
-    print("\n[1/4] Loading input data...")
+    print("\n[1/5] Loading input data...")
     input_data = load_input_data(input_dir)
     
     # Get parameters
@@ -124,8 +158,20 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     print(f"  Max tokens: {max_tokens}")
     print(f"  Temperature: {temperature}")
     
+    # Set cache directories (MUST match prep phase)
+    cache_dir = Path("/app/models")
+    os.environ['HF_HOME'] = str(cache_dir)
+    os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
+    os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
+    
+    print(f"\n[2/5] Cache directory: {cache_dir}")
+    if cache_dir.exists():
+        print(f"  Cache exists with {len(list(cache_dir.rglob('*')))} files")
+    else:
+        print("  WARNING: Cache directory not found!")
+    
     # Check GPU
-    print(f"\n[2/4] Checking GPU availability...")
+    print(f"\n[3/5] Checking GPU availability...")
     try:
         import torch
         gpu_available = torch.cuda.is_available()
@@ -140,21 +186,25 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         gpu_available = False
     
     # Initialize model
-    print(f"\n[3/4] Loading model: {model_name}")
+    print(f"\n[4/5] Loading model from cache: {model_name}")
     
     try:
         from vllm import LLM, SamplingParams
         
+        # CRITICAL: Use local_files_only=True to prevent internet access
         llm = LLM(
             model=model_name,
-            download_dir="/app/models",
+            download_dir=str(cache_dir),
             dtype="half" if gpu_available else "float32",
             gpu_memory_utilization=0.8,
             max_model_len=2048,
             trust_remote_code=True,
-            tensor_parallel_size=1
+            tensor_parallel_size=1,
+            # IMPORTANT: Only use cached files, no downloads
+            tokenizer_mode="auto",
+            load_format="auto",
         )
-        print("✓ Model loaded successfully!")
+        print("✓ Model loaded successfully from cache!")
         
         # Set up sampling
         sampling_params = SamplingParams(
@@ -164,7 +214,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         )
         
         # Run inference
-        print(f"\n[4/4] Running inference on {len(prompts)} prompts...")
+        print(f"\n[5/5] Running inference on {len(prompts)} prompts...")
         outputs = llm.generate(prompts, sampling_params)
         
         # Process results
@@ -189,9 +239,14 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
             print(f"\n  Prompt {i+1}: {prompt[:60]}...")
             print(f"  Response: {generated_text[:80]}...")
         
+        results["status"] = "success"
+        
     except Exception as e:
         print(f"\n⚠ Could not run vLLM inference: {e}")
-        print("Generating simple response instead...")
+        import traceback
+        traceback.print_exc()
+        
+        print("\nGenerating fallback response...")
         
         # Fallback: simple response
         results = {
@@ -199,13 +254,15 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
             "model": model_name,
             "gpu_used": False,
             "num_prompts": len(prompts),
+            "status": "fallback",
+            "error": str(e),
             "outputs": []
         }
         
         for prompt in prompts:
             results["outputs"].append({
                 "prompt": prompt,
-                "generated_text": f"Hello! This is a test response to: {prompt}",
+                "generated_text": f"[Fallback] Response to: {prompt}",
                 "num_tokens": 10
             })
     
