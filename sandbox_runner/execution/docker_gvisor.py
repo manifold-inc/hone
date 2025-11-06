@@ -440,9 +440,9 @@ class DockerGVisorExecutor:
                 
                 # Log full output at debug level
                 if stdout:
-                    logger.debug(f"Container stdout:\n{stdout}")
+                    logger.info(f"Container stdout:\n{stdout}")
                 if stderr:
-                    logger.debug(f"Container stderr:\n{stderr}")
+                    logger.error(f"Container stderr:\n{stderr}")
             
             return exit_code, stdout, stderr
             
