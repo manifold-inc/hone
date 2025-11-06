@@ -35,7 +35,7 @@ setup:
 
 # Run locally
 run:
-	python3 main.py --config config.yaml
+	python3 -m main --config config.local.yaml
 
 # Run with debug logging
 run-debug:

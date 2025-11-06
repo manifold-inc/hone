@@ -1,8 +1,3 @@
-"""
-1. Epistula signature verification (cryptographic proof from validators)
-2. API key validation (simple bearer token authentication)
-"""
-
 import hashlib
 import hmac
 import time
@@ -27,18 +22,12 @@ class APIKeyVerificationError(Exception):
 
 class AuthenticationManager:
     """
-    Manages authentication for API requests using Epistula signatures and API keys.
-    
-    Epistula is a cryptographic signature system used in the Bittensor network
-    to verify that requests come from legitimate validators. Each request includes:
-    - Signature: Cryptographic signature of the request
-    - Request ID: Unique identifier for replay attack prevention
-    - Timestamp: Request timestamp for time-based validation
+    Manages authentication for API requests using Epistula signatures and API keys    
     """
     
     def __init__(self, config: APIConfig):
         """
-        Initialize authentication manager.
+        Initialize authentication manager
         
         Args:
             config: API configuration with auth settings
@@ -54,11 +43,9 @@ class AuthenticationManager:
         
         self._validator_hotkeys = {}
         
-        # Simple in-memory API key storage
-        # In production, this should be loaded from environment variables or secrets manager
+        # TODO: read env var properly
         self._valid_api_keys: Set[str] = {
-            "dev-key-12345",  # Development key
-            "test-key-67890",  # Test key
+            "dev-key-12345",
         }
         
     async def verify_epistula_signature(
@@ -70,7 +57,7 @@ class AuthenticationManager:
         validator_hotkey: Optional[str] = Header(None, alias="X-Validator-Hotkey")
     ) -> str:
         """
-        Verify Epistula cryptographic signature from validator.
+        Verify Epistula cryptographic signature from validator
         
         The signature proves that:
         1. Request comes from a legitimate validator
@@ -156,7 +143,7 @@ class AuthenticationManager:
         self, message: str, signature: str, public_key: str
     ) -> bool:
         """
-        Verify cryptographic signature using validator's public key.
+        Verify cryptographic signature using validator's public key
         
         This is a placeholder implementation. In production, this should:
         1. Use the actual public key from the Bittensor network
@@ -171,13 +158,7 @@ class AuthenticationManager:
         Returns:
             True if signature is valid, False otherwise
         """
-        # PLACEHOLDER: Implement actual cryptographic verification in production
-        # This should use proper Ed25519 signature verification with:
-        # - Substrate key handling (SS58 address decoding)
-        # - Ed25519 signature verification (using nacl or cryptography library)
-        # - Proper error handling for malformed signatures
-        
-        # For development/testing, accept any non-empty signature
+        # TODO : implement properly
         return len(signature) > 0
     
     async def verify_api_key(
@@ -185,11 +166,8 @@ class AuthenticationManager:
         api_key: Optional[str] = Header(None, alias="X-API-Key")
     ) -> str:
         """
-        Verify API key from request headers.
-        
-        This is a simpler authentication method for internal services
-        or trusted partners that don't use Epistula signatures.
-        
+        Verify API key from request headers
+                
         Args:
             api_key: API key from request header
             
@@ -208,7 +186,6 @@ class AuthenticationManager:
                 detail="Missing API key"
             )
         
-        # Verify API key against stored keys
         if not self._validate_api_key(api_key):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
@@ -219,27 +196,22 @@ class AuthenticationManager:
     
     def _validate_api_key(self, api_key: str) -> bool:
         """
-        Validate API key against stored keys.
-        
-        Simple in-memory validation. In production, this should:
-        1. Query a database of valid API keys
-        2. Check key expiration
-        3. Check rate limits per key
-        4. Log usage for auditing
-        
+        Validate API key against stored keys
+                
         Args:
             api_key: API key to validate
             
         Returns:
             True if key is valid, False otherwise
         """
+        # TODO : handle this properly
         # Simple in-memory validation
         return True
         #return api_key in self._valid_api_keys
     
     def add_api_key(self, api_key: str):
         """
-        Add a new API key to the valid keys set.
+        Add a new API key to the valid keys set
         
         Args:
             api_key: API key to add
@@ -248,7 +220,7 @@ class AuthenticationManager:
     
     def remove_api_key(self, api_key: str):
         """
-        Remove an API key from the valid keys set.
+        Remove an API key from the valid keys set
         
         Args:
             api_key: API key to remove
@@ -257,7 +229,7 @@ class AuthenticationManager:
     
     def list_api_keys(self) -> Set[str]:
         """
-        Get list of valid API keys.
+        Get list of valid API keys
         
         Returns:
             Set of valid API keys
@@ -266,10 +238,7 @@ class AuthenticationManager:
     
     def _cleanup_expired_request_ids(self):
         """
-        Remove expired request IDs from memory.
-        
-        This prevents unbounded memory growth by removing request IDs
-        that are past their expiration time.
+        Remove expired request IDs from memory        
         """
         current_time = datetime.utcnow()
         expired_ids = [
@@ -283,9 +252,9 @@ class AuthenticationManager:
     
     def register_validator(self, hotkey: str, public_key: bytes):
         """
-        Register a validator's public key for Epistula verification.
+        Register a validator's public key for Epistula verification
         
-        In production, this should:
+        this should:
         1. Query the blockchain for registered validators
         2. Cache keys for performance
         3. Refresh periodically
@@ -294,12 +263,13 @@ class AuthenticationManager:
             hotkey: Validator's hotkey (SS58 address)
             public_key: Raw public key bytes
         """
+        # TODO: handle this properly
         self._validator_hotkeys[hotkey] = public_key
 
 
 class RateLimiter:
     """
-    Simple in-memory rate limiter for API endpoints.
+    Simple in-memory rate limiter for API endpoints
     
     In production, this should use Redis or similar distributed cache
     to work across multiple instances.
@@ -317,7 +287,7 @@ class RateLimiter:
     
     async def check_rate_limit(self, identifier: str):
         """
-        Check if request is within rate limit.
+        Check if request is within rate limit
         
         Args:
             identifier: Unique identifier (validator hotkey or API key)
@@ -328,11 +298,9 @@ class RateLimiter:
         current_time = time.time()
         window_start = current_time - 60  # 1 minute window
         
-        # Initialize log for this identifier if needed
         if identifier not in self._request_log:
             self._request_log[identifier] = []
         
-        # Remove old requests outside the window
         self._request_log[identifier] = [
             timestamp for timestamp in self._request_log[identifier]
             if timestamp > window_start

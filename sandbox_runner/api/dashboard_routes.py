@@ -1,13 +1,3 @@
-"""
-Dashboard API Routes Extension
-
-Additional endpoints to support the real-time monitoring dashboard:
-- /v1/dashboard/gpus - Detailed GPU status
-- /v1/dashboard/queue - Queue breakdown by weight class
-- /v1/dashboard/jobs/active - List of active jobs with details
-- /v1/dashboard/jobs/{job_id}/logs - Job logs
-"""
-
 from typing import List, Dict
 from datetime import datetime
 
@@ -17,6 +7,11 @@ import logging
 
 from config import Config
 from api.auth import AuthenticationManager, RateLimiter
+from api.routes import (
+        authenticate_request,
+        get_meta_manager,
+        get_config
+    )
 
 logger = logging.getLogger("api.dashboard")
 
@@ -62,7 +57,7 @@ class ActiveJobDetail(BaseModel):
 class JobLogs(BaseModel):
     """Job execution logs."""
     job_id: str
-    logs: List[Dict]  # List of log entries with timestamp and message
+    logs: List[Dict]
     total_lines: int
     has_more: bool = False
 
@@ -103,13 +98,6 @@ def create_dashboard_router(config: Config) -> APIRouter:
     """Create dashboard API router."""
     router = APIRouter(tags=["dashboard"])
     
-    # Import dependencies
-    from api.routes import (
-        authenticate_request,
-        get_meta_manager,
-        get_config
-    )
-    
     @router.get(
         "/dashboard/summary",
         response_model=DashboardSummary,
@@ -126,16 +114,9 @@ def create_dashboard_router(config: Config) -> APIRouter:
         """
         logger.info("Dashboard summary requested")
         
-        # Get runner status
-        runner_status = await meta_manager.get_runner_status()
-        
-        # Get GPU stats
-        gpu_stats = runner_status.get("gpu_stats", {})
-        
-        # Get queue stats
-        queue_stats = runner_status.get("queue_stats", {})
-        
-        # Calculate derived metrics
+        runner_status = await meta_manager.get_runner_status()        
+        gpu_stats = runner_status.get("gpu_stats", {})        
+        queue_stats = runner_status.get("queue_stats", {})        
         total_finished = (
             runner_status.get("total_completed", 0) + 
             runner_status.get("total_failed", 0)
@@ -146,7 +127,6 @@ def create_dashboard_router(config: Config) -> APIRouter:
                 runner_status.get("total_completed", 0) / total_finished * 100
             )
         
-        # Estimate queue time (simple calculation)
         active_jobs = runner_status.get("active_jobs", 0)
         queued_jobs = queue_stats.get("total_jobs", 0)
         avg_job_duration = 1800  # 30 minutes default
@@ -186,7 +166,6 @@ def create_dashboard_router(config: Config) -> APIRouter:
         """Get detailed status of all GPUs."""
         logger.info("GPU details requested")
         
-        # Get GPU status from meta-manager
         gpu_status = await meta_manager.get_gpu_status()
         
         result = []
@@ -216,11 +195,8 @@ def create_dashboard_router(config: Config) -> APIRouter:
         meta_manager = Depends(get_meta_manager)
     ):
         """Get detailed queue breakdown by weight class."""
-        logger.info("Queue breakdown requested")
-        
-        # Get queue breakdown from meta-manager
+        logger.info("Queue breakdown requested")        
         queue_data = await meta_manager.get_queue_breakdown()
-        
         result = []
         for weight_class, data in queue_data.items():
             result.append(QueueBreakdown(
@@ -241,9 +217,7 @@ def create_dashboard_router(config: Config) -> APIRouter:
         meta_manager = Depends(get_meta_manager)
     ):
         """Get list of currently active jobs with detailed information."""
-        logger.info("Active jobs requested")
-        
-        # Get active jobs from meta-manager
+        logger.info("Active jobs requested")        
         active_jobs = await meta_manager.get_active_jobs()
         
         result = []
@@ -286,9 +260,7 @@ def create_dashboard_router(config: Config) -> APIRouter:
             lines: Number of log lines to return (default: 100)
             offset: Starting line offset (default: 0)
         """
-        logger.info(f"Job logs requested: {job_id}")
-        
-        # Get logs from meta-manager
+        logger.info(f"Job logs requested: {job_id}")        
         log_data = await meta_manager.get_job_logs(job_id, lines, offset)
         
         if not log_data:
