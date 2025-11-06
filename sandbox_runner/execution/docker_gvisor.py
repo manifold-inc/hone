@@ -234,7 +234,7 @@ async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
         display.update(f"ERROR: {ex}")
         await asyncio.sleep(0)
 
-async def _stream_container_logs(self, container, display: BuildLogDisplay) -> str:
+async def _stream_container_logs(container, display: BuildLogDisplay) -> str:
     """
     Stream container logs in real time into the BuildLogDisplay.
     Returns the concatenated text (stdout+stderr, Docker doesn't separate by default).
@@ -414,7 +414,7 @@ class DockerGVisorExecutor:
             logger.info(f"gVisor container started: {container.id[:12]}")
 
             # Start streaming logs concurrently
-            logs_task = asyncio.create_task(self._stream_container_logs(container, display))
+            logs_task = asyncio.create_task(_stream_container_logs(container, display))
 
             # Wait for exit (poll loop) with timeout
             exit_code = await self._wait_for_container(container, timeout_seconds)
