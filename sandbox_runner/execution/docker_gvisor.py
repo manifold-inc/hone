@@ -707,8 +707,7 @@ class DockerGVisorExecutor:
             # Get build generator
             build_generator = await asyncio.get_event_loop().run_in_executor(None, build_with_logs)
 
-            async for _ in _stream_docker_logs(build_generator, display):
-                pass
+            await _stream_docker_logs(build_generator, display)
 
             display.end("✅ BUILD COMPLETE")
             
