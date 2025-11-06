@@ -64,7 +64,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     
     # Load input to see what model we need
     input_data = load_input_data(input_dir)
-    model_name = input_data.get("model", "facebook/opt-125m")
+    model_name = input_data.get("model", "Qwen/Qwen3-0.6B")
     
     print(f"\n[1/2] Model to download: {model_name}")
     

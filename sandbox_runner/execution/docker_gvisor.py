@@ -553,7 +553,7 @@ class DockerGVisorExecutor:
                 "job_id": job.job_id,
                 "phase": phase,
                 "working_dir": '/app',
-                "user": 'nobody',
+                "user": 'root',
                 "network_mode": "TBD"  # Will be determined below
             }
         )
@@ -565,7 +565,7 @@ class DockerGVisorExecutor:
             network_mode = 'host'
         else:
             # Sandbox network (default for gVisor)
-            network_mode = 'bridge'
+            network_mode = 'host'
         
         # For inference, always block network
         if phase == "inference":
@@ -604,7 +604,7 @@ class DockerGVisorExecutor:
             #'nano_cpus': nano_cpus,
             'volumes': volumes,
             'working_dir': '/app',
-            'user': 'nobody',  # Run as non-root user
+            'user': 'root',  # Run as non-root user
             'detach': True,
             'auto_remove': False,  # Don't auto-remove, we need logs
             'security_opt': security_opt,
@@ -862,7 +862,7 @@ COPY . /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Set user
-USER nobody
+USER root
 
 # Entry point
 CMD ["python", "inference.py"]
