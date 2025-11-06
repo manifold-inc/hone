@@ -641,8 +641,7 @@ class DockerGVisorExecutor:
             # Add tmpfs for directories that need write access
             config['tmpfs'] = {
                 '/tmp': 'rw,noexec,nosuid,size=1g',
-                '/var/tmp': 'rw,noexec,nosuid,size=1g',
-                '/app/models': 'rw,size=20g'
+                '/var/tmp': 'rw,noexec,nosuid,size=1g'
             }
         
         return config
