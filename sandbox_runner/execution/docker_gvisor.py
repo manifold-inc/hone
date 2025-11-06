@@ -637,22 +637,15 @@ class DockerGVisorExecutor:
     
     async def _cleanup_container(self, container):
         """
-        Remove a container.
-        
-        Args:
-            container: Docker container object
+        Remove a container
         """
         try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                container.remove,
-                True  # force=True
-            )
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, lambda: container.remove(force=True))
             logger.debug(f"gVisor container removed: {container.id[:12]}")
         except Exception as e:
-            logger.exception(e)
-            logger.warning(f"Failed to remove gVisor container: {e}")
-    
+            logger.warning(f"Failed to remove gVisor container: {e}", exc_info=True)
+
     async def build_image(
         self,
         repo_path: Path,
