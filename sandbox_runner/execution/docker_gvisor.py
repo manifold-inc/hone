@@ -47,188 +47,192 @@ class DockerExecutionError(Exception):
 
 class BuildLogDisplay:
     """
-    Fixed-position scrolling build log display.
-    Creates a box that stays in one place while content scrolls inside it.
+    Fixed-position scrolling build log box that always shows the latest N lines.
+    When active, normal prints should go through write_below_box().
+    Falls back to plain prints if stdout is not a TTY.
     """
-    
-    def __init__(self, box_lines: int = 10):
-        """
-        Initialize build log display.
-        
-        Args:
-            box_lines: Number of lines in the fixed box
-        """
-        self.box_lines = box_lines
-        self.log_buffer = deque(maxlen=box_lines)
+    def __init__(self, box_lines: int = 10, title: str = "🔨 BUILD LOGS"):
+        import shutil, sys, re
+        from collections import deque
+
+        self.box_lines = max(3, box_lines)
+        self.title = title
+        self.log_buffer = deque(maxlen=self.box_lines)
         self.terminal_width = min(shutil.get_terminal_size((120, 20)).columns, 140)
         self.box_active = False
         self.total_lines = 0
-        
-        # ANSI escape codes
-        self.SAVE_CURSOR = "\033[s"
-        self.RESTORE_CURSOR = "\033[u"
+        self.is_tty = sys.stdout.isatty()
+
+        # ANSI codes
+        self.SAVE = "\033[s"
+        self.RESTORE = "\033[u"
         self.CLEAR_LINE = "\033[2K"
-        self.MOVE_UP = "\033[{}A"
-        self.MOVE_DOWN = "\033[{}B"
-        
-    def _strip_ansi(self, text: str) -> str:
-        """
-        Remove all ANSI escape sequences from text.
-        
-        Args:
-            text: Text with potential ANSI codes
-            
-        Returns:
-            Clean text
-        """
-        ansi_pattern = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-        return ansi_pattern.sub('', text)
-    
+        self.MOVE_UP_FMT = "\033[{}A"
+        self.MOVE_DOWN_FMT = "\033[{}B"
+        self.CARRIAGE = "\r"
+
+        self._ansi_re = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+        # Offsets (relative; we compute via moves, not multiple saved cursors)
+        # Layout we print in start():
+        #   ─ border (1)
+        #   title (1)
+        #   ─ border (1)
+        #   content box lines (box_lines)
+        #   ─ border (1)
+        #   (cursor ends AFTER the bottom border on a new empty line)
+        #
+        # From "after" to "top of content" = move up (box_lines + 1)
+        self._move_up_to_content = self.box_lines + 1
+
+    def _strip_ansi(self, s: str) -> str:
+        return self._ansi_re.sub("", s)
+
     def _clean_line(self, line: str) -> str:
-        """
-        Clean and prepare a line for display.
-        
-        Args:
-            line: Raw log line
-            
-        Returns:
-            Cleaned, truncated line
-        """
-        # Strip ANSI codes
-        cleaned = self._strip_ansi(line.rstrip())
-        
-        # Remove control characters
-        cleaned = ''.join(char for char in cleaned if char.isprintable() or char in '\t\n')
-        
-        # Truncate to fit
+        cleaned = self._strip_ansi(line.rstrip("\r\n"))
+        cleaned = ''.join(ch for ch in cleaned if ch.isprintable() or ch in '\t ')
         max_width = self.terminal_width - 4
         if len(cleaned) > max_width:
             cleaned = cleaned[:max_width - 3] + "..."
-        
         return cleaned
-    
+
     def _should_display(self, line: str) -> bool:
-        """
-        Determine if a line should be displayed.
-        
-        Args:
-            line: Line to check
-            
-        Returns:
-            True if line should be shown
-        """
         if not line.strip():
             return False
-        
-        # Filter out repetitive progress lines
         skip_patterns = [
             r'^\(Reading database \.\.\. \d+%',
             r'^Get:\d+ http',
             r'^Fetched \d+',
-            r'^\s*$',
             r'^Reading package lists\.\.\.',
             r'^Building dependency tree\.\.\.',
             r'^Reading state information\.\.\.',
         ]
-        
-        for pattern in skip_patterns:
-            if re.search(pattern, line):
-                return False
-        
-        return True
-    
+        import re
+        return not any(re.search(p, line) for p in skip_patterns)
+
     def start(self):
-        """Draw the initial empty box."""
         if self.box_active:
             return
-        
         self.box_active = True
-        
-        # Draw header
-        border = "=" * self.terminal_width
-        header = f"{'🔨 BUILD LOGS':^{self.terminal_width}}"
-        
-        print(f"\n{border}")
-        print(header)
-        print(border)
-        
-        # Draw empty box
+
+        if not self.is_tty:
+            print(f"\n{'='*self.terminal_width}\n{self.title:^{self.terminal_width}}\n{'='*self.terminal_width}")
+            print(f"[TTY not detected] Streaming logs plainly below...")
+            print('-'*self.terminal_width)
+            return
+
+        border = "─" * self.terminal_width
+        header = f"{self.title:^{self.terminal_width}}"
+
+        # Header
+        sys.stdout.write("\n" + border + "\n")
+        sys.stdout.write(header + "\n")
+        sys.stdout.write(border + "\n")
+
+        # Content box (empty lines)
         for _ in range(self.box_lines):
-            print(f"│{' ' * (self.terminal_width - 2)}│")
-        
-        # Draw footer
-        print(border)
-        print()  # Extra line for cursor position
-        
-        # Save cursor position (after the box)
-        sys.stdout.write(self.SAVE_CURSOR)
+            sys.stdout.write(f"│{' ' * (self.terminal_width - 2)}│\n")
+
+        # Footer border and final empty line where normal logs will continue
+        sys.stdout.write(border + "\n")
+        sys.stdout.write(self.SAVE)  # Save "anchor_after" (below the box)
         sys.stdout.flush()
-    
+
     def update(self, line: str):
-        """
-        Add a new line to the scrolling box.
-        
-        Args:
-            line: New log line
-        """
         if not self.box_active:
             self.start()
-        
-        # Clean the line
+
         cleaned = self._clean_line(line)
-        
-        # Check if we should display it
         if not self._should_display(cleaned):
             return
-        
-        # Add to buffer
+
         self.log_buffer.append(cleaned)
         self.total_lines += 1
-        
-        # Restore cursor to saved position
-        sys.stdout.write(self.RESTORE_CURSOR)
-        
-        # Move up to the start of the box content (box_lines + 2 for borders)
-        sys.stdout.write(self.MOVE_UP.format(self.box_lines + 2))
-        
-        # Redraw all lines in the box
+
+        if not self.is_tty:
+            # Plain print fallback
+            print(cleaned)
+            return
+
+        # Restore to "after box", move up into the content area
+        sys.stdout.write(self.RESTORE)
+        sys.stdout.write(self.MOVE_UP_FMT.format(self._move_up_to_content))
+
+        # Redraw content box
+        buf = list(self.log_buffer)
+        # Ensure we always draw exactly box_lines rows (right-aligned to latest)
+        start_idx = max(0, len(buf) - self.box_lines)
+        view = buf[start_idx:]
+
+        # Draw lines
         for i in range(self.box_lines):
-            sys.stdout.write(self.CLEAR_LINE)
-            
-            if i < len(self.log_buffer):
-                content = self.log_buffer[i]
-                # Ensure content fits
-                padding = self.terminal_width - len(content) - 3
+            sys.stdout.write(self.CLEAR_LINE + self.CARRIAGE)
+            if i < len(view):
+                content = view[i]
+                padding = self.terminal_width - 2 - 1 - len(content)
+                if padding < 0:
+                    padding = 0
                 sys.stdout.write(f"│ {content}{' ' * padding}│\n")
             else:
-                # Empty line
                 sys.stdout.write(f"│{' ' * (self.terminal_width - 2)}│\n")
-        
-        # Skip the bottom border
-        sys.stdout.write(self.MOVE_DOWN.format(1))
-        
-        # Save cursor position again
-        sys.stdout.write(self.SAVE_CURSOR)
+
+        # Move cursor back down to "after box" and re-save anchor
+        sys.stdout.write(self.MOVE_DOWN_FMT.format(self._move_up_to_content))
+        sys.stdout.write(self.SAVE)
         sys.stdout.flush()
-    
-    def end(self):
-        """End the build log display."""
+
+    def write_below_box(self, text: str):
+        """
+        Safely print a normal log line below the box while it is active.
+        """
+        if not self.box_active or not self.is_tty:
+            print(text)
+            return
+        sys.stdout.write(self.RESTORE)  # go to "after box"
+        sys.stdout.write(self.CLEAR_LINE + self.CARRIAGE)
+        sys.stdout.write(text.rstrip("\n") + "\n")
+        sys.stdout.write(self.SAVE)     # keep "after box" current
+        sys.stdout.flush()
+
+    def end(self, status: str = "✅ BUILD COMPLETE"):
         if not self.box_active:
             return
-        
         self.box_active = False
-        
-        # Restore cursor
-        sys.stdout.write(self.RESTORE_CURSOR)
-        
-        # Print completion message below the box
-        border = "=" * self.terminal_width
-        completion = f"{'✅ BUILD COMPLETE (' + str(self.total_lines) + ' lines processed)':^{self.terminal_width}}"
-        
-        print(border)
-        print(completion)
-        print(f"{border}\n")
+
+        if not self.is_tty:
+            print('-'*self.terminal_width)
+            print(f"{status} ({self.total_lines} lines processed)")
+            print('='*self.terminal_width + "\n")
+            return
+
+        # Go to after-box and print completion banner cleanly below it
+        sys.stdout.write(self.RESTORE)
+        sys.stdout.write(self.CLEAR_LINE + self.CARRIAGE)
+        border = "─" * self.terminal_width
+        msg = f"{status} ({self.total_lines} lines processed)"
+        sys.stdout.write(border + "\n")
+        sys.stdout.write(f"{msg:^{self.terminal_width}}\n")
+        sys.stdout.write(border + "\n\n")
         sys.stdout.flush()
+
+
+async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
+    loop = asyncio.get_event_loop()
+    try:
+        for entry in build_generator:
+            # Typical keys: 'stream', 'status', 'error', 'id', 'aux'
+            if 'error' in entry:
+                display.update(f"ERROR: {entry['error']}")
+            elif 'stream' in entry:
+                for ln in entry['stream'].splitlines():
+                    display.update(ln)
+            elif 'status' in entry:
+                msg = f"{entry.get('id', '')} {entry['status']}".strip()
+                display.update(msg)
+            await asyncio.sleep(0.01)
+    except Exception as ex:
+        display.update(f"ERROR: {ex}")
+        await asyncio.sleep(0)
 
 
 class DockerGVisorExecutor:
@@ -646,44 +650,8 @@ class DockerGVisorExecutor:
             )
             logger.debug(f"gVisor container removed: {container.id[:12]}")
         except Exception as e:
+            logger.exception(e)
             logger.warning(f"Failed to remove gVisor container: {e}")
-    
-    async def _stream_build_logs(self, build_generator, display: BuildLogDisplay):
-        """
-        Stream build logs in real-time to the display.
-        
-        Args:
-            build_generator: Docker build log generator
-            display: BuildLogDisplay instance for rendering logs
-        """
-        for log_entry in build_generator:
-            try:
-                if 'stream' in log_entry:
-                    line = log_entry['stream'].rstrip()
-                    if line:
-                        display.update(line)
-                        
-                        # Log important lines to file
-                        if any(keyword in line for keyword in ['Step ', 'ERROR', 'Successfully', 'Failed']):
-                            logger.debug(f"Build: {line}")
-                
-                elif 'error' in log_entry:
-                    error_line = f"❌ ERROR: {log_entry['error']}"
-                    display.update(error_line)
-                    logger.error(f"Build error: {log_entry['error']}")
-                
-                elif 'status' in log_entry:
-                    status = log_entry['status']
-                    if 'id' in log_entry:
-                        status = f"[{log_entry['id']}] {status}"
-                    display.update(status)
-                
-                # Small delay to prevent overwhelming
-                await asyncio.sleep(0.01)
-                
-            except Exception as e:
-                logger.warning(f"Error processing build log: {e}")
-                continue
     
     async def build_image(
         self,
@@ -737,16 +705,12 @@ class DockerGVisorExecutor:
                 )
             
             # Get build generator
-            build_generator = await asyncio.get_event_loop().run_in_executor(
-                None,
-                build_with_logs
-            )
-            
-            # Stream logs to display
-            await self._stream_build_logs(build_generator, display)
-            
-            # End display
-            display.end()
+            build_generator = await asyncio.get_event_loop().run_in_executor(None, build_with_logs)
+
+            async for _ in _stream_docker_logs(build_generator, display):
+                pass
+
+            display.end("✅ BUILD COMPLETE")
             
             # Get the built image
             image = self.docker_client.images.get(image_tag)
