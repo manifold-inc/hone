@@ -582,7 +582,7 @@ class DockerGVisorExecutor:
             'auto_remove': False,  # Don't auto-remove, we need logs
             'security_opt': security_opt,
             'cap_drop': cap_drop,
-            'runtime': self.gvisor_runtime,  # Use gVisor runtime
+            'runtime': 'nvidia' if job.assigned_gpus else self.gvisor_runtime,  # Use gVisor runtime
         }
         
         # Add GPU support if GPUs are assigned
@@ -590,13 +590,9 @@ class DockerGVisorExecutor:
             config['device_requests'] = [
                 docker.types.DeviceRequest(
                     device_ids=[str(gpu) for gpu in job.assigned_gpus],
-                    capabilities=[['gpu']]
+                    capabilities=[['gpu', 'compute', 'utility']]
                 )
             ]
-            config['devices'] = [f'/dev/nvidia{gpu}:/dev/nvidia{gpu}' for gpu in job.assigned_gpus]
-            config['devices'].append('/dev/nvidiactl:/dev/nvidiactl')
-            config['devices'].append('/dev/nvidia-uvm:/dev/nvidia-uvm')
-
         
         # Add gVisor-specific configuration via labels
         config['labels'] = {
@@ -615,6 +611,7 @@ class DockerGVisorExecutor:
             config['tmpfs'] = {
                 '/tmp': 'rw,noexec,nosuid,size=1g',
                 '/var/tmp': 'rw,noexec,nosuid,size=1g',
+                '/app/models': 'rw,size=20g'
             }
         
         return config
