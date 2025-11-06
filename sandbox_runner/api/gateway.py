@@ -8,7 +8,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware. import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 import logging
 
@@ -162,7 +162,7 @@ def _add_middleware(app: FastAPI, config: Config):
         
         return response
     
-    
+
 def _add_exception_handlers(app: FastAPI):
     """Add custom exception handlers."""
     

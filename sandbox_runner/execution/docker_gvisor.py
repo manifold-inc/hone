@@ -505,6 +505,7 @@ class DockerGVisorExecutor:
             env_vars['CUDA_VISIBLE_DEVICES'] = ','.join(
                 str(gpu) for gpu in job.assigned_gpus
             )
+
         else:
             env_vars['CUDA_VISIBLE_DEVICES'] = ''
         
@@ -524,7 +525,7 @@ class DockerGVisorExecutor:
             extra={
                 "job_id": job.job_id,
                 "phase": phase,
-                "working_dir": '/workspace',
+                "working_dir": '/app',
                 "user": 'nobody',
                 "network_mode": "TBD"  # Will be determined below
             }
@@ -575,7 +576,7 @@ class DockerGVisorExecutor:
             #'mem_limit': mem_limit,
             #'nano_cpus': nano_cpus,
             'volumes': volumes,
-            'working_dir': '/workspace',
+            'working_dir': '/app',
             'user': 'nobody',  # Run as non-root user
             'detach': True,
             'auto_remove': False,  # Don't auto-remove, we need logs
@@ -592,6 +593,10 @@ class DockerGVisorExecutor:
                     capabilities=[['gpu']]
                 )
             ]
+            config['devices'] = [f'/dev/nvidia{gpu}:/dev/nvidia{gpu}' for gpu in job.assigned_gpus]
+            config['devices'].append('/dev/nvidiactl:/dev/nvidiactl')
+            config['devices'].append('/dev/nvidia-uvm:/dev/nvidia-uvm')
+
         
         # Add gVisor-specific configuration via labels
         config['labels'] = {
@@ -824,10 +829,10 @@ class DockerGVisorExecutor:
 FROM {base_image}
 
 # Set working directory
-WORKDIR /workspace
+WORKDIR /app
 
 # Copy repository contents
-COPY . /workspace/
+COPY . /app/
 
 # Install requirements
 RUN pip install --no-cache-dir -r requirements.txt
@@ -978,7 +983,7 @@ CMD ["python", "inference.py"]
         diagnostic_commands = [
             ('which_python', ['which', 'python']),
             ('which_python3', ['which', 'python3']),
-            ('ls_workspace', ['ls', '-la', '/workspace']),
+            ('ls_app', ['ls', '-la', '/app']),
             ('ls_root', ['ls', '-la', '/']),
             ('pwd', ['pwd']),
             ('whoami', ['whoami']),
