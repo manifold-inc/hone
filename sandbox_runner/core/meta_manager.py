@@ -300,7 +300,13 @@ class MetaManager:
         
         # Get active jobs from executor
         active_jobs = self.executor.get_active_jobs()
-        
+
+        queue_breakdown = await self.get_queue_breakdown()
+        queue_by_weight = {
+            weight_class: data["count"]
+            for weight_class, data in queue_breakdown.items()
+        }
+
         return {
             "runner_id": self.config.runner.id,
             "status": "operational" if self._running else "stopped",
@@ -310,7 +316,11 @@ class MetaManager:
             "total_submitted": self._total_jobs_submitted,
             "total_completed": self._total_jobs_completed,
             "total_failed": self._total_jobs_failed,
-            "execution_mode": self.config.execution.mode
+            "execution_mode": self.config.execution.mode,
+            "queue_stats": {
+                "total_jobs": await self.job_queue.get_total_depth(),
+                "by_weight_class": queue_by_weight
+            }
         }
     
     async def _processing_loop(self):
@@ -553,3 +563,147 @@ class MetaManager:
             "miner_hotkey": job.miner_hotkey,
             "priority": job.priority
         }
+    
+    async def get_gpu_status(self) -> Dict[int, Dict]:
+        """Get detailed status of all GPUs."""
+        gpu_status_dict = await self.gpu_pool.get_gpu_status()
+        
+        result = {}
+        for gpu_id, gpu_info in gpu_status_dict.items():
+            result[gpu_id] = {
+                "gpu_id": gpu_info.gpu_id,
+                "status": gpu_info.status.value,
+                "allocated_to_job": gpu_info.allocated_to_job,
+                "utilization_percent": gpu_info.utilization_percent,
+                "memory_used_mb": gpu_info.memory_used_mb,
+                "memory_total_mb": gpu_info.memory_total_mb,
+                "temperature_celsius": gpu_info.temperature_celsius,
+                "last_updated": gpu_info.last_updated.isoformat()
+            }
+        
+        return result
+    
+    async def get_queue_breakdown(self) -> Dict[str, Dict]:
+        """Get queue breakdown by weight class."""
+        from core.job_queue import WeightClass
+        
+        result = {}
+        all_jobs = await self.job_queue.get_all_jobs()
+        
+        for weight_class in WeightClass:
+            class_jobs = [
+                job for job in all_jobs 
+                if job.weight_class == weight_class
+            ]
+            
+            result[weight_class.value] = {
+                "count": len(class_jobs),
+                "jobs": [
+                    {
+                        "job_id": job.job_id,
+                        "priority": job.priority,
+                        "submitted_at": job.submitted_at.isoformat(),
+                        "miner_hotkey": job.miner_hotkey
+                    }
+                    for job in class_jobs
+                ]
+            }
+        
+        return result
+    
+    async def get_active_jobs(self) -> List[Dict]:
+        """Get list of active jobs."""
+        active_jobs = []
+        
+        async with self._lock:
+            for job_id, job in self.active_jobs.items():
+                progress = self._calculate_job_progress(job)
+                
+                active_jobs.append({
+                    "job_id": job.job_id,
+                    "status": job.status.value,
+                    "weight_class": job.weight_class.value,
+                    "miner_hotkey": job.miner_hotkey,
+                    "validator_hotkey": job.validator_hotkey,
+                    "priority": job.priority,
+                    "progress_percentage": progress,
+                    "current_phase": job.current_phase,
+                    "assigned_gpus": job.assigned_gpus or [],
+                    "started_at": job.started_at.isoformat() if job.started_at else None
+                })
+        
+        return active_jobs
+    
+    async def get_job_logs(self, job_id: str, lines: int = 100, offset: int = 0) -> Optional[Dict]:
+        """Get job logs."""
+        job = None
+        
+        async with self._lock:
+            if job_id in self.active_jobs:
+                job = self.active_jobs[job_id]
+            elif hasattr(self, 'job_history') and job_id in self.job_history:
+                job = self.job_history[job_id]
+        
+        if not job:
+            return None
+        
+        # Generate mock logs (replace with real log reading)
+        logs = self._get_mock_logs(job)
+        
+        start_idx = offset
+        end_idx = offset + lines
+        paginated_logs = logs[start_idx:end_idx]
+        
+        return {
+            "logs": paginated_logs,
+            "total_lines": len(logs),
+            "has_more": end_idx < len(logs)
+        }
+    
+    def _calculate_job_progress(self, job) -> float:
+        """Calculate job progress percentage."""
+        from core.job_queue import JobStatus
+        
+        phase_progress = {
+            JobStatus.PENDING: 0,
+            JobStatus.CLONING: 5,
+            JobStatus.BUILDING: 20,
+            JobStatus.PREP: 45,
+            JobStatus.INFERENCE: 80,
+            JobStatus.COMPLETED: 100
+        }
+        
+        return phase_progress.get(job.status, 0)
+    
+    def _get_mock_logs(self, job) -> List[Dict]:
+        """Generate mock logs (replace with real implementation)."""
+        from datetime import timedelta
+        
+        logs = [
+            {
+                "timestamp": job.submitted_at.isoformat(),
+                "level": "INFO",
+                "message": f"Job {job.job_id} submitted"
+            }
+        ]
+        
+        if job.started_at:
+            logs.extend([
+                {
+                    "timestamp": job.started_at.isoformat(),
+                    "level": "INFO",
+                    "message": f"Job started on GPUs {job.assigned_gpus}"
+                },
+                {
+                    "timestamp": (job.started_at + timedelta(seconds=5)).isoformat(),
+                    "level": "INFO",
+                    "message": f"Cloning repository: {job.repo_url}"
+                },
+                {
+                    "timestamp": (job.started_at + timedelta(seconds=30)).isoformat(),
+                    "level": "INFO",
+                    "message": "Building Docker image..."
+                }
+            ])
+        
+        return logs

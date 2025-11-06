@@ -92,6 +92,11 @@ def create_app(config: Config) -> FastAPI:
     from api.routes import create_router
     router = create_router(config)
     app.include_router(router, prefix="/v1")
+
+    from api.dashboard_routes import create_dashboard_router
+    dashboard_router = create_dashboard_router(config)
+    app.include_router(dashboard_router, prefix="/v1")
+
     
     # Add metrics endpoint
     @app.get("/metrics")
