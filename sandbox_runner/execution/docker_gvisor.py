@@ -574,11 +574,15 @@ class DockerGVisorExecutor:
         # Resource limits
         mem_limit = f"{self.config.execution.memory_limit_gb}g"
         nano_cpus = int(self.config.execution.cpu_limit * 1e9)
+
+        model_cache_dir = work_dir / 'models'
+        model_cache_dir.mkdir(parents=True, exist_ok=True)
         
         # Volumes
         volumes = {
             str(work_dir / 'input'): {'bind': '/input', 'mode': 'ro'},
             str(work_dir / 'output'): {'bind': '/output', 'mode': 'rw'},
+            str(model_cache_dir): {'bind': '/app/models', 'mode': 'rw'},
         }
         
         # Security options for gVisor
