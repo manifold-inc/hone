@@ -19,7 +19,6 @@ from prometheus_client import (
     generate_latest,
     CONTENT_TYPE_LATEST
 )
-from typing import Optional
 import logging
 
 
@@ -28,17 +27,15 @@ logger = logging.getLogger(__name__)
 
 class MetricsManager:
     """
-    Central manager for Prometheus metrics.
-    
-    Provides a single interface for recording metrics across the application.
+    Central manager for Prometheus metrics
+    Provides a single interface for recording metrics across the application
     """
     
     def __init__(self):
-        """Initialize metrics manager with Prometheus registry."""
+        """Initialize metrics manager with Prometheus registry"""
         self.registry = CollectorRegistry()
         self._initialized = False
         
-        # Initialize all metrics
         self._init_job_metrics()
         self._init_gpu_metrics()
         self._init_queue_metrics()
@@ -46,8 +43,7 @@ class MetricsManager:
         self._init_system_metrics()
     
     def _init_job_metrics(self):
-        """Initialize job-related metrics."""
-        # Job submission counter
+        """Initialize job-related metrics"""
         self.jobs_submitted = Counter(
             "sandbox_jobs_submitted_total",
             "Total number of jobs submitted",
@@ -55,7 +51,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Job completion counter with status
         self.jobs_completed = Counter(
             "sandbox_jobs_completed_total",
             "Total number of jobs completed",
@@ -63,7 +58,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Currently active jobs
         self.jobs_active = Gauge(
             "sandbox_jobs_active",
             "Number of currently active jobs",
@@ -71,7 +65,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Job execution duration
         self.job_duration = Histogram(
             "sandbox_job_duration_seconds",
             "Job execution duration in seconds",
@@ -81,8 +74,7 @@ class MetricsManager:
         )
     
     def _init_gpu_metrics(self):
-        """Initialize GPU-related metrics."""
-        # GPU utilization per device
+        """Initialize GPU-related metrics"""
         self.gpu_utilization = Gauge(
             "sandbox_gpu_utilization_percent",
             "GPU utilization percentage",
@@ -90,7 +82,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # GPU memory usage
         self.gpu_memory_used = Gauge(
             "sandbox_gpu_memory_used_bytes",
             "GPU memory used in bytes",
@@ -98,7 +89,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # GPU memory total
         self.gpu_memory_total = Gauge(
             "sandbox_gpu_memory_total_bytes",
             "Total GPU memory in bytes",
@@ -106,7 +96,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # GPU allocation state
         self.gpu_allocated = Gauge(
             "sandbox_gpu_allocated",
             "GPU allocation state (1=allocated, 0=free)",
@@ -114,7 +103,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # GPU temperature
         self.gpu_temperature = Gauge(
             "sandbox_gpu_temperature_celsius",
             "GPU temperature in Celsius",
@@ -123,8 +111,7 @@ class MetricsManager:
         )
     
     def _init_queue_metrics(self):
-        """Initialize queue-related metrics."""
-        # Queue depth by priority
+        """Initialize queue-related metrics"""
         self.queue_depth = Gauge(
             "sandbox_queue_depth",
             "Number of jobs in queue",
@@ -132,7 +119,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Queue wait time
         self.queue_wait_time = Histogram(
             "sandbox_queue_wait_seconds",
             "Time spent waiting in queue",
@@ -142,8 +128,7 @@ class MetricsManager:
         )
     
     def _init_performance_metrics(self):
-        """Initialize performance-related metrics."""
-        # API request duration
+        """Initialize performance-related metrics"""
         self.api_request_duration = Histogram(
             "sandbox_api_request_duration_seconds",
             "API request duration",
@@ -152,7 +137,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # API request counter
         self.api_requests = Counter(
             "sandbox_api_requests_total",
             "Total API requests",
@@ -160,7 +144,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Rate limit hits
         self.rate_limit_hits = Counter(
             "sandbox_rate_limit_hits_total",
             "Number of rate limit violations",
@@ -168,7 +151,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Authentication failures
         self.auth_failures = Counter(
             "sandbox_auth_failures_total",
             "Authentication failures",
@@ -177,22 +159,19 @@ class MetricsManager:
         )
     
     def _init_system_metrics(self):
-        """Initialize system-level metrics."""
-        # System info
+        """Initialize system-level metrics"""
         self.system_info = Info(
             "sandbox_system",
             "System information",
             registry=self.registry
         )
         
-        # CPU usage
         self.cpu_usage = Gauge(
             "sandbox_cpu_usage_percent",
             "CPU usage percentage",
             registry=self.registry
         )
         
-        # Memory usage
         self.memory_used = Gauge(
             "sandbox_memory_used_bytes",
             "Memory used in bytes",
@@ -205,7 +184,6 @@ class MetricsManager:
             registry=self.registry
         )
         
-        # Disk usage
         self.disk_used = Gauge(
             "sandbox_disk_used_bytes",
             "Disk space used in bytes",
@@ -221,11 +199,10 @@ class MetricsManager:
         )
     
     def initialize(self):
-        """Initialize metrics with system information."""
+        """Initialize metrics with system information"""
         if self._initialized:
             return
         
-        # Set system info
         self.system_info.info({
             "version": "1.0.0",
             "service": "hone-subnet-sandbox-runner"
@@ -236,19 +213,16 @@ class MetricsManager:
     
     def export_metrics(self) -> tuple[bytes, str]:
         """
-        Export metrics in Prometheus format.
+        Export metrics in Prometheus format
         
         Returns:
             Tuple of (metrics_bytes, content_type)
         """
         return generate_latest(self.registry), CONTENT_TYPE_LATEST
     
-    # ========================================================================
-    # Convenience methods for recording metrics
-    # ========================================================================
     
     def record_job_submitted(self, validator: str, weight_class: str):
-        """Record a job submission."""
+        """Record a job submission"""
         self.jobs_submitted.labels(
             validator=validator,
             weight_class=weight_class
@@ -261,14 +235,13 @@ class MetricsManager:
         validator: str,
         duration: float
     ):
-        """Record a job completion with duration."""
+        """Record a job completion with duration"""
         self.jobs_completed.labels(
             status=status,
             weight_class=weight_class,
             validator=validator
         ).inc()
         
-        # Record duration (use 'total' for overall duration)
         self.job_duration.labels(
             phase="total",
             weight_class=weight_class
@@ -280,7 +253,7 @@ class MetricsManager:
         weight_class: str,
         duration: float
     ):
-        """Record duration of a specific job phase."""
+        """Record duration of a specific job phase"""
         self.job_duration.labels(
             phase=phase,
             weight_class=weight_class
@@ -310,7 +283,7 @@ class MetricsManager:
         status: int,
         duration: float
     ):
-        """Record an API request."""
+        """Record an API request"""
         self.api_requests.labels(
             method=method,
             endpoint=endpoint,
@@ -324,16 +297,15 @@ class MetricsManager:
         ).observe(duration)
     
     def record_rate_limit_hit(self, validator: str):
-        """Record a rate limit violation."""
+        """Record a rate limit violation"""
         self.rate_limit_hits.labels(validator=validator).inc()
     
     def record_auth_failure(self, auth_type: str, reason: str):
-        """Record an authentication failure."""
+        """Record an authentication failure"""
         self.auth_failures.labels(
             auth_type=auth_type,
             reason=reason
         ).inc()
 
 
-# Global metrics manager instance
 metrics_manager = MetricsManager()

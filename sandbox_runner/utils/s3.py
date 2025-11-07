@@ -11,8 +11,6 @@ Handles S3 data transfer for job input/output:
 import asyncio
 import logging
 from pathlib import Path
-from typing import Optional
-from urllib.parse import urlparse
 import aiohttp
 
 import boto3
@@ -25,13 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 class S3TransferError(Exception):
-    """Raised when S3 transfer fails."""
+    """Raised when S3 transfer fails"""
     pass
 
 
 class S3Manager:
     """
-    Manages S3 data transfers for job execution.
+    Manages S3 data transfers for job execution
     
     Features:
     - Asynchronous file transfers
@@ -42,10 +40,9 @@ class S3Manager:
     """
     
     def __init__(self, config: StorageConfig):
-        """Initialize S3 manager."""
+        """Initialize S3 manager"""
         self.config = config
         
-        # Configure boto3 with retries
         boto_config = Config(
             region_name=config.s3_region,
             retries={
@@ -54,9 +51,7 @@ class S3Manager:
             }
         )
         
-        # Initialize S3 client
         if config.s3_access_key and config.s3_secret_key:
-            # Use explicit credentials
             self.s3_client = boto3.client(
                 's3',
                 aws_access_key_id=config.s3_access_key,
@@ -65,7 +60,6 @@ class S3Manager:
                 config=boto_config
             )
         else:
-            # Use IAM role or environment credentials
             self.s3_client = boto3.client(
                 's3',
                 endpoint_url=config.s3_endpoint,
@@ -85,7 +79,7 @@ class S3Manager:
         max_retries: int = 3
     ) -> bool:
         """
-        Download input data from S3 to local filesystem.
+        Download input data from S3 to local filesystem
         
         Supports both:
         - s3://bucket/key URIs (uses boto3)
@@ -99,7 +93,6 @@ class S3Manager:
         Returns:
             True if download successful
         """
-        # Check if it's a presigned URL
         if self._is_presigned_url(s3_path):
             return await self._download_from_presigned_url(
                 s3_path, local_path, max_retries
@@ -115,10 +108,9 @@ class S3Manager:
         local_path: Path,
         max_retries: int = 3
     ) -> bool:
-        """Download from presigned URL using HTTP GET."""
+        """Download from presigned URL using HTTP GET"""
         logger.info(f"Downloading from presigned URL to {local_path}")
         
-        # Ensure parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
         
         for attempt in range(max_retries):
@@ -126,7 +118,6 @@ class S3Manager:
                 async with aiohttp.ClientSession() as session:
                     async with session.get(presigned_url) as response:
                         if response.status == 200:
-                            # Download file
                             with open(local_path, 'wb') as f:
                                 while True:
                                     chunk = await response.content.read(8192)
@@ -134,7 +125,6 @@ class S3Manager:
                                         break
                                     f.write(chunk)
                             
-                            # Verify
                             if not local_path.exists():
                                 raise S3TransferError(f"File not found after download")
                             
@@ -167,12 +157,11 @@ class S3Manager:
         local_path: Path,
         max_retries: int = 3
     ) -> bool:
-        """Download from S3 URI using boto3."""
+        """Download from S3 URI using boto3"""
         bucket, key = self._parse_s3_path(s3_path)
         
         logger.info(f"Downloading from s3://{bucket}/{key} to {local_path}")
         
-        # Ensure parent directory exists
         local_path.parent.mkdir(parents=True, exist_ok=True)
         
         for attempt in range(max_retries):
@@ -218,7 +207,7 @@ class S3Manager:
         max_retries: int = 3
     ) -> bool:
         """
-        Upload output data from local filesystem to S3.
+        Upload output data from local filesystem to S3
         
         Supports both:
         - s3://bucket/key URIs (uses boto3)
@@ -235,7 +224,6 @@ class S3Manager:
         if not local_path.exists():
             raise S3TransferError(f"Local file not found: {local_path}")
         
-        # Check if it's a presigned URL
         if self._is_presigned_url(s3_path):
             return await self._upload_to_presigned_url(
                 local_path, s3_path, max_retries
@@ -251,7 +239,7 @@ class S3Manager:
         presigned_url: str,
         max_retries: int = 3
     ) -> bool:
-        """Upload to presigned URL using HTTP PUT."""
+        """Upload to presigned URL using HTTP PUT"""
         file_size = local_path.stat().st_size
         logger.info(f"Uploading {file_size} bytes to presigned URL")
         
@@ -288,7 +276,7 @@ class S3Manager:
         s3_path: str,
         max_retries: int = 3
     ) -> bool:
-        """Upload to S3 URI using boto3."""
+        """Upload to S3 URI using boto3"""
         bucket, key = self._parse_s3_path(s3_path)
         
         file_size = local_path.stat().st_size
@@ -327,10 +315,8 @@ class S3Manager:
         local_dir: Path,
         max_retries: int = 3
     ) -> bool:
-        """Download directory - only works with S3 URIs, not presigned URLs."""
-        # Presigned URLs don't support directory listing
+        """Download directory - only works with S3 URIs, not presigned URLs"""
         if self._is_presigned_url(s3_prefix):
-            # Treat as single file
             filename = local_dir.name if local_dir.suffix else "input.json"
             return await self._download_from_presigned_url(
                 s3_prefix,
@@ -386,11 +372,10 @@ class S3Manager:
         s3_prefix: str,
         max_retries: int = 3
     ) -> bool:
-        """Upload directory - only works with S3 URIs."""
+        """Upload directory - only works with S3 URIs"""
         if not local_dir.exists():
             raise S3TransferError(f"Local directory not found: {local_dir}")
         
-        # Presigned URLs can't upload directories
         if self._is_presigned_url(s3_prefix):
             raise S3TransferError(
                 "Cannot upload directory to presigned URL. Use S3 URI instead."
@@ -428,7 +413,7 @@ class S3Manager:
         return True
     
     def _parse_s3_path(self, s3_path: str) -> tuple[str, str]:
-        """Parse S3 URI into bucket and key."""
+        """Parse S3 URI into bucket and key"""
         if s3_path.startswith('s3://'):
             s3_path = s3_path[5:]
         
@@ -439,15 +424,15 @@ class S3Manager:
         return parts[0], parts[1]
     
     def _download_file(self, bucket: str, key: str, local_path: Path):
-        """Blocking S3 download."""
+        """Blocking S3 download"""
         self.s3_client.download_file(bucket, key, str(local_path))
     
     def _upload_file(self, local_path: Path, bucket: str, key: str):
-        """Blocking S3 upload."""
+        """Blocking S3 upload"""
         self.s3_client.upload_file(str(local_path), bucket, key)
     
     def _list_objects(self, bucket: str, prefix: str) -> list:
-        """Blocking S3 list objects."""
+        """Blocking S3 list objects"""
         objects = []
         paginator = self.s3_client.get_paginator('list_objects_v2')
         

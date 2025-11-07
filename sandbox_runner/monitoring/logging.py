@@ -1,13 +1,3 @@
-"""
-Structured Logging Module
-
-Provides structured JSON logging for the sandbox runner with:
-- Consistent log format across all modules
-- Contextual information (request ID, job ID, etc.)
-- Log levels and filtering
-- File and console output
-"""
-
 import logging
 import sys
 import json
@@ -38,7 +28,6 @@ class JSONFormatter(logging.Formatter):
         Returns:
             JSON-formatted log string
         """
-        # Base log entry
         log_entry = {
             "timestamp": datetime.utcnow().isoformat() + "Z",
             "level": record.levelname,
@@ -46,11 +35,9 @@ class JSONFormatter(logging.Formatter):
             "message": record.getMessage(),
         }
         
-        # Add exception info if present
         if record.exc_info:
             log_entry["exception"] = self.formatException(record.exc_info)
         
-        # Add any extra fields from record
         extra_fields = {}
         for key, value in record.__dict__.items():
             if key not in [
@@ -64,7 +51,6 @@ class JSONFormatter(logging.Formatter):
         if extra_fields:
             log_entry["extra"] = extra_fields
         
-        # Add source location for errors
         if record.levelno >= logging.ERROR:
             log_entry["source"] = {
                 "file": record.pathname,
@@ -77,7 +63,7 @@ class JSONFormatter(logging.Formatter):
 
 class TextFormatter(logging.Formatter):
     """
-    Human-readable text formatter for console output.
+    Human-readable text formatter for console output
     
     Format: [TIMESTAMP] LEVEL - LOGGER - MESSAGE
     """
@@ -91,7 +77,7 @@ class TextFormatter(logging.Formatter):
 
 def setup_logging(log_level: str = "INFO", log_file: Path = None) -> logging.Logger:
     """
-    Setup structured logging for the application.
+    Setup structured logging for the application
     
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL)
@@ -100,20 +86,16 @@ def setup_logging(log_level: str = "INFO", log_file: Path = None) -> logging.Log
     Returns:
         Root logger instance
     """
-    # Get root logger
     root_logger = logging.getLogger()
     root_logger.setLevel(getattr(logging, log_level.upper()))
     
-    # Remove any existing handlers
     root_logger.handlers.clear()
     
-    # Console handler with text formatting (for human readability)
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(TextFormatter())
     root_logger.addHandler(console_handler)
     
-    # File handler with JSON formatting (for log aggregation)
     if log_file:
         log_file.parent.mkdir(parents=True, exist_ok=True)
         file_handler = logging.FileHandler(log_file)
@@ -121,7 +103,6 @@ def setup_logging(log_level: str = "INFO", log_file: Path = None) -> logging.Log
         file_handler.setFormatter(JSONFormatter())
         root_logger.addHandler(file_handler)
     
-    # Log startup message
     root_logger.info(
         "Logging initialized",
         extra={
@@ -135,7 +116,7 @@ def setup_logging(log_level: str = "INFO", log_file: Path = None) -> logging.Log
 
 class LogContext:
     """
-    Context manager for adding contextual information to log messages.
+    Context manager for adding contextual information to log messages
     
     Usage:
         with LogContext(job_id="job_123", validator="5ABC..."):
@@ -146,7 +127,7 @@ class LogContext:
     
     def __init__(self, **kwargs):
         """
-        Initialize log context with key-value pairs.
+        Initialize log context with key-value pairs
         
         Args:
             **kwargs: Context fields to add to log messages
@@ -155,28 +136,27 @@ class LogContext:
         self.old_context = None
     
     def __enter__(self):
-        """Enter context manager - save old context and apply new."""
+        """Enter context manager - save old context and apply new"""
         self.old_context = LogContext._context.copy()
         LogContext._context.update(self.context)
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Exit context manager - restore old context."""
+        """Exit context manager - restore old context"""
         LogContext._context = self.old_context
     
     @classmethod
     def get_context(cls) -> Dict[str, Any]:
-        """Get current log context."""
+        """Get current log context"""
         return cls._context.copy()
 
 
-# Custom log filter to inject context
 class ContextFilter(logging.Filter):
-    """Filter that injects context fields into log records."""
+    """Filter that injects context fields into log records"""
     
     def filter(self, record: logging.LogRecord) -> bool:
         """
-        Add context fields to log record.
+        Add context fields to log record
         
         Args:
             record: Log record to modify
@@ -184,7 +164,6 @@ class ContextFilter(logging.Filter):
         Returns:
             True (always allow record through)
         """
-        # Inject context fields
         for key, value in LogContext.get_context().items():
             setattr(record, key, value)
         
@@ -193,7 +172,7 @@ class ContextFilter(logging.Filter):
 
 def get_logger(name: str) -> logging.Logger:
     """
-    Get a logger with context filtering enabled.
+    Get a logger with context filtering enabled
     
     Args:
         name: Logger name (typically __name__)

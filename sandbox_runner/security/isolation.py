@@ -8,36 +8,33 @@ Provides process isolation using Linux namespaces:
 - UTS namespace: Isolate hostname
 - IPC namespace: Isolate inter-process communication
 - User namespace: Isolate user/group IDs (when available)
-
-Used primarily in direct execution mode to provide container-like isolation
-without actually using containers.
 """
 
 import logging
 import os
 import subprocess
-from typing import List, Optional
+from typing import List
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
 
 class NamespaceError(Exception):
-    """Raised when namespace operation fails."""
+    """Raised when namespace operation fails"""
     pass
 
 
 class NamespaceManager:
     """
-    Manager for Linux namespace isolation.
+    Manager for Linux namespace isolation
     
     Provides high-level interface for creating isolated execution environments
-    using Linux namespaces, similar to containers but without Docker.
+    using Linux namespaces, similar to containers but without Docker
     """
     
     def __init__(self):
         """
-        Initialize namespace manager.
+        Initialize namespace manager
         """
         self.unshare_available = self._check_unshare_available()
         
@@ -48,7 +45,7 @@ class NamespaceManager:
     
     def _check_unshare_available(self) -> bool:
         """
-        Check if unshare command is available.
+        Check if unshare command is available
         
         Returns:
             True if unshare is available
@@ -73,7 +70,7 @@ class NamespaceManager:
         isolate_ipc: bool = True
     ) -> List[str]:
         """
-        Wrap a command with namespace isolation.
+        Wrap a command with namespace isolation
         
         Args:
             command: Command to wrap
@@ -96,13 +93,11 @@ class NamespaceManager:
         
         unshare_cmd = ['unshare']
         
-        # Add namespace flags
         if isolate_network:
             unshare_cmd.append('--net')
         
         if isolate_pid:
             unshare_cmd.extend(['--pid', '--fork'])
-            # --fork is required for PID namespace to work properly
         
         if isolate_mount:
             unshare_cmd.append('--mount')
@@ -113,7 +108,6 @@ class NamespaceManager:
         if isolate_ipc:
             unshare_cmd.append('--ipc')
         
-        # Combine with original command
         full_command = unshare_cmd + ['--'] + command
         
         logger.debug(f"Wrapped command: {' '.join(full_command)}")
@@ -122,7 +116,7 @@ class NamespaceManager:
     
     def create_network_namespace(self, namespace_name: str) -> bool:
         """
-        Create a named network namespace.
+        Create a named network namespace
         
         Args:
             namespace_name: Name for the namespace
@@ -152,7 +146,7 @@ class NamespaceManager:
     
     def delete_network_namespace(self, namespace_name: str) -> bool:
         """
-        Delete a named network namespace.
+        Delete a named network namespace
         
         Args:
             namespace_name: Name of the namespace to delete
@@ -186,7 +180,7 @@ class NamespaceManager:
         command: List[str]
     ) -> subprocess.CompletedProcess:
         """
-        Execute a command in a named network namespace.
+        Execute a command in a named network namespace
         
         Args:
             namespace_name: Name of the namespace
@@ -214,14 +208,11 @@ class NamespaceManager:
         self,
         pid: int,
         network: bool = True,
-        pid_ns: bool = False  # Can't change PID namespace of existing process
+        pid_ns: bool = False  
     ) -> bool:
         """
-        Attempt to isolate an existing process.
-        
-        Note: Most namespace operations can't be done on existing processes.
-        This is mainly for network namespace isolation.
-        
+        Attempt to isolate an existing process
+                
         Args:
             pid: Process ID to isolate
             network: Isolate network namespace
@@ -236,17 +227,12 @@ class NamespaceManager:
             )
         
         if network:
-            # Move process to a new network namespace
-            # This requires root privileges
             try:
                 ns_name = f"sandbox_{pid}"
                 
-                # Create namespace
                 if not self.create_network_namespace(ns_name):
                     return False
                 
-                # Move process to namespace
-                # Note: This is complex and requires nsenter
                 logger.warning(
                     "Moving existing process to network namespace not implemented"
                 )
@@ -260,7 +246,7 @@ class NamespaceManager:
     
     def get_namespace_info(self, pid: int) -> dict:
         """
-        Get namespace information for a process.
+        Get namespace information for a process
         
         Args:
             pid: Process ID
@@ -277,11 +263,9 @@ class NamespaceManager:
                 logger.warning(f"Namespace info not found for PID {pid}")
                 return info
             
-            # Read namespace symlinks
             for ns_type in ['net', 'pid', 'mnt', 'uts', 'ipc', 'user']:
                 ns_link = ns_path / ns_type
                 if ns_link.exists():
-                    # Symlink target format: "net:[4026531840]"
                     target = os.readlink(str(ns_link))
                     info[ns_type] = target
             
@@ -297,7 +281,7 @@ class NamespaceManager:
         namespace_type: str = 'net'
     ) -> bool:
         """
-        Check if two processes are in different namespaces.
+        Check if two processes are in different namespaces
         
         Args:
             pid1: First process ID
@@ -322,7 +306,7 @@ class NamespaceManager:
     
     def is_available(self) -> bool:
         """
-        Check if namespace isolation is available.
+        Check if namespace isolation is available
         
         Returns:
             True if namespace isolation is available
@@ -331,20 +315,20 @@ class NamespaceManager:
     
     def get_required_capabilities(self) -> List[str]:
         """
-        Get list of Linux capabilities required for namespace operations.
+        Get list of Linux capabilities required for namespace operations
         
         Returns:
             List of capability names
         """
         return [
-            'CAP_SYS_ADMIN',  # Required for most namespace operations
-            'CAP_NET_ADMIN',  # Required for network namespace operations
-            'CAP_SYS_PTRACE',  # Required for PID namespace operations
+            'CAP_SYS_ADMIN', 
+            'CAP_NET_ADMIN', 
+            'CAP_SYS_PTRACE', 
         ]
     
     def create_pid_namespace_wrapper(self, command: List[str]) -> List[str]:
         """
-        Create a PID namespace wrapper for a command.
+        Create a PID namespace wrapper for a command
         
         This wraps the command to run in a new PID namespace where:
         - The command becomes PID 1 in the namespace
@@ -368,7 +352,7 @@ class NamespaceManager:
     
     def create_network_namespace_wrapper(self, command: List[str]) -> List[str]:
         """
-        Create a network namespace wrapper for a command.
+        Create a network namespace wrapper for a command
         
         This wraps the command to run in a new network namespace where:
         - The command has no network access by default
@@ -392,7 +376,7 @@ class NamespaceManager:
     
     def create_full_isolation_wrapper(self, command: List[str]) -> List[str]:
         """
-        Create a full isolation wrapper with all namespaces.
+        Create a full isolation wrapper with all namespaces
         
         Args:
             command: Command to wrap

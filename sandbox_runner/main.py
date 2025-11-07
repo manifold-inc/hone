@@ -1,10 +1,3 @@
-"""
-1. Loads configuration from YAML file and CLI arguments
-2. Initializes the FastAPI application
-3. Sets up logging and monitoring
-4. Starts the HTTPS server with uvicorn
-"""
-
 import argparse
 import asyncio
 import logging
@@ -19,7 +12,7 @@ from monitoring.logging import setup_logging
 
 
 def parse_args():
-    """Parse command-line arguments with support for config overrides."""
+    """Parse command-line arguments with support for config overrides"""
     parser = argparse.ArgumentParser(
         description="Hone Subnet Sandbox Runner - Secure GPU execution service"
     )
@@ -72,7 +65,7 @@ def parse_args():
 
 
 def apply_cli_overrides(config: Config, args: argparse.Namespace) -> Config:
-    """Apply command-line argument overrides to configuration."""
+    """Apply command-line argument overrides to configuration"""
     if args.port:
         config.api.port = args.port
     
@@ -92,13 +85,12 @@ def apply_cli_overrides(config: Config, args: argparse.Namespace) -> Config:
 
 
 async def startup_checks(config: Config, logger: logging.Logger):
-    """Perform startup validation and health checks."""
+    """Perform startup validation and health checks"""
     logger.info(f"Starting Hone Subnet Sandbox Runner (ID: {config.runner.id})")
     logger.info(f"Execution mode: {config.execution.mode}")
     logger.info(f"GPU count: {config.hardware.gpu_count}")
     logger.info(f"API port: {config.api.port}")
     
-    # SSL certificates exist
     if config.api.ssl_cert_path and not config.api.ssl_cert_path.exists():
         logger.error(f"SSL certificate not found: {config.api.ssl_cert_path}")
         sys.exit(1)
@@ -111,7 +103,7 @@ async def startup_checks(config: Config, logger: logging.Logger):
 
 
 def main():
-    """Main application entry point."""
+    """Main application entry point"""
     args = parse_args()    
     logger = setup_logging(args.log_level)
     

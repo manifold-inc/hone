@@ -1,18 +1,12 @@
 """
 Direct Execution Mode
 
-Executes jobs directly on the host without Docker containers.
-This is the fallback mode when Docker is not available.
-
 Security features (using OS-level isolation):
 - cgroups v2 for resource limits
 - Namespaces for isolation (PID, mount, network)
 - Seccomp for syscall filtering
 - Process runs as nobody user
 - Network namespace isolation
-
-This mode is less secure than Docker/gVisor but provides
-basic isolation when containers are not available.
 """
 
 import asyncio
@@ -21,10 +15,8 @@ import os
 import subprocess
 import signal
 from pathlib import Path
-from typing import Optional, Tuple, Dict
-import tempfile
-import shutil
-
+from typing import Tuple, Dict
+import pwd
 from core.job_queue import Job
 from config import Config
 from security.cgroups import CgroupManager
@@ -35,33 +27,30 @@ logger = logging.getLogger(__name__)
 
 
 class DirectExecutionError(Exception):
-    """Raised when direct execution fails."""
+    """Raised when direct execution fails"""
     pass
 
 
 class DirectExecutor:
     """
-    Direct execution mode without containers.
+    Direct execution mode without containers
     
     Runs jobs as isolated processes on the host system using:
     - Linux namespaces (PID, mount, network, UTS, IPC)
     - cgroups v2 for resource limits
     - Seccomp for syscall filtering
-    - Network namespace control
-    
-    This is the fallback when Docker is not available.
+    - Network namespace control    
     """
     
     def __init__(self, config: Config):
         """
-        Initialize direct executor.
+        Initialize direct executor
         
         Args:
             config: Application configuration
         """
         self.config = config
         
-        # Initialize components
         try:
             self.cgroup_manager = CgroupManager()
             self.namespace_manager = NamespaceManager()
@@ -83,9 +72,9 @@ class DirectExecutor:
         timeout_seconds: int
     ) -> Tuple[int, str, str]:
         """
-        Run a job phase as a direct process.
+        Run a job phase as a direct process
         
-        Note: image_id is ignored in direct mode as we run Python directly.
+        Note: image_id is ignored in direct mode as we run Python directly, kept for class consistency
         
         Args:
             image_id: Ignored (for API compatibility)
@@ -112,7 +101,6 @@ class DirectExecutor:
             }
         )
         
-        # Create cgroup for resource limits
         cgroup_name = f"sandbox_{job.job_id}_{phase}"
         try:
             await self.cgroup_manager.create_cgroup(
@@ -127,17 +115,14 @@ class DirectExecutor:
             logger.error(f"Failed to create cgroup: {e}")
             raise DirectExecutionError(f"cgroup creation failed: {e}")
         
-        # Prepare environment and command
         env_vars = self._build_environment(job, phase, work_dir)
         command = self._build_command(job, phase, work_dir)
         
-        # Create stdout/stderr capture files
         stdout_file = work_dir / f"{phase}_stdout.log"
         stderr_file = work_dir / f"{phase}_stderr.log"
         
         process = None
         try:
-            # Run process with isolation
             process = await self._run_isolated_process(
                 command=command,
                 env_vars=env_vars,
@@ -149,10 +134,8 @@ class DirectExecutor:
                 timeout_seconds=timeout_seconds
             )
             
-            # Get exit code
             exit_code = process.returncode if process else -1
             
-            # Read stdout and stderr
             stdout = stdout_file.read_text() if stdout_file.exists() else ""
             stderr = stderr_file.read_text() if stderr_file.exists() else ""
             
@@ -184,7 +167,6 @@ class DirectExecutor:
             raise DirectExecutionError(f"Execution failed: {e}")
         
         finally:
-            # Cleanup cgroup
             try:
                 await self.cgroup_manager.remove_cgroup(cgroup_name)
                 logger.debug(f"Removed cgroup: {cgroup_name}")
@@ -193,7 +175,7 @@ class DirectExecutor:
     
     def _build_environment(self, job: Job, phase: str, work_dir: Path) -> Dict:
         """
-        Build environment variables for the process.
+        Build environment variables for the process
         
         Args:
             job: Job object
@@ -205,7 +187,6 @@ class DirectExecutor:
         """
         env_vars = os.environ.copy()
         
-        # Job-specific variables
         env_vars.update({
             'PHASE': phase,
             'JOB_ID': job.job_id,
@@ -215,7 +196,6 @@ class DirectExecutor:
             'OUTPUT_DIR': str(work_dir / 'output'),
         })
         
-        # GPU assignment
         if job.assigned_gpus:
             env_vars['CUDA_VISIBLE_DEVICES'] = ','.join(
                 str(gpu) for gpu in job.assigned_gpus
@@ -223,17 +203,14 @@ class DirectExecutor:
         else:
             env_vars['CUDA_VISIBLE_DEVICES'] = ''
         
-        # Custom environment variables
-        env_vars.update(job.custom_env_vars or {})
-        
-        # Python unbuffered output
+        env_vars.update(job.custom_env_vars or {})        
         env_vars['PYTHONUNBUFFERED'] = '1'
         
         return env_vars
     
     def _build_command(self, job: Job, phase: str, work_dir: Path) -> list:
         """
-        Build command to execute.
+        Build command to execute
         
         Args:
             job: Job object
@@ -243,8 +220,6 @@ class DirectExecutor:
         Returns:
             Command as list of arguments
         """
-        # Assume repository has inference.py in root
-        # In production, this should be validated during repository validation
         inference_script = work_dir / 'repo' / 'inference.py'
         
         command = [
@@ -269,7 +244,7 @@ class DirectExecutor:
         timeout_seconds: int
     ) -> subprocess.CompletedProcess:
         """
-        Run process with isolation (namespaces, cgroups, etc.).
+        Run process with isolation (namespaces, cgroups, etc)
         
         Args:
             command: Command to execute
@@ -287,13 +262,9 @@ class DirectExecutor:
         Raises:
             DirectExecutionError: If execution fails
         """
-        # Open files for stdout/stderr
         with open(stdout_file, 'w') as stdout_f, open(stderr_file, 'w') as stderr_f:
             try:
-                # Use unshare for namespace isolation if available
-                # This creates new PID, mount, network namespaces
                 if self.namespace_manager.is_available():
-                    # Wrap command with unshare for namespace isolation
                     isolated_command = self.namespace_manager.wrap_command(
                         command,
                         isolate_network=not network_enabled,
@@ -304,7 +275,6 @@ class DirectExecutor:
                     isolated_command = command
                     logger.warning("Namespace isolation not available")
                 
-                # Add to cgroup
                 cgexec_command = [
                     'cgexec',
                     '-g', f'cpu,memory,pids:{cgroup_name}',
@@ -313,24 +283,21 @@ class DirectExecutor:
                 
                 logger.debug(f"Executing: {' '.join(cgexec_command)}")
                 
-                # Run process
                 process = await asyncio.create_subprocess_exec(
                     *cgexec_command,
                     stdout=stdout_f,
                     stderr=stderr_f,
                     env=env_vars,
                     cwd=work_dir,
-                    preexec_fn=self._preexec_fn  # Drop privileges
+                    preexec_fn=self._preexec_fn
                 )
                 
-                # Wait for completion with timeout
                 try:
                     await asyncio.wait_for(
                         process.wait(),
                         timeout=timeout_seconds
                     )
                 except asyncio.TimeoutError:
-                    # Kill process on timeout
                     logger.warning(f"Process timeout, sending SIGKILL")
                     process.kill()
                     await process.wait()
@@ -345,16 +312,13 @@ class DirectExecutor:
     @staticmethod
     def _preexec_fn():
         """
-        Function to run in child process before exec.
-        
-        Drops privileges by switching to nobody user.
+        Function to run in child process before exec
+        Drops privileges by switching to nobody user
         """
         try:
-            # Get nobody user UID/GID
-            import pwd
+            
             nobody = pwd.getpwnam('nobody')
             
-            # Drop privileges
             os.setgid(nobody.pw_gid)
             os.setuid(nobody.pw_uid)
             
@@ -363,7 +327,7 @@ class DirectExecutor:
     
     def _kill_process(self, process: subprocess.CompletedProcess):
         """
-        Kill a running process.
+        Kill a running process
         
         Args:
             process: Process object
@@ -382,9 +346,9 @@ class DirectExecutor:
         timeout_seconds: int = 3600
     ) -> str:
         """
-        Prepare repository for direct execution.
+        Prepare repository for direct execution
         
-        In direct mode, we don't build an image, but we can:
+        In direct mode, we:
         1. Install requirements.txt
         2. Validate Python dependencies
         3. Prepare virtual environment
@@ -400,17 +364,13 @@ class DirectExecutor:
         Raises:
             DirectExecutionError: If preparation fails
         """
-        logger.info(f"Preparing repository for direct execution: {job_id}")
-        
-        # Check for requirements.txt
+        logger.info(f"Preparing repository for direct execution: {job_id}")        
         requirements_file = repo_path / 'requirements.txt'
         
         if requirements_file.exists():
             logger.info("Installing Python requirements")
             
             try:
-                # Install requirements in system Python
-                # In production, consider using virtual environment
                 result = await asyncio.create_subprocess_exec(
                     'pip3', 'install', '-r', str(requirements_file),
                     stdout=asyncio.subprocess.PIPE,
@@ -436,7 +396,6 @@ class DirectExecutor:
         else:
             logger.warning("No requirements.txt found")
         
-        # Return job_id as pseudo "image ID"
         return f"direct-{job_id}"
     
     async def build_image_from_requirements(
@@ -446,7 +405,7 @@ class DirectExecutor:
         base_image: str = None
     ) -> str:
         """
-        Build from requirements (same as build_image in direct mode).
+        Build from requirements (same as build_image in direct mode)
         
         Args:
             repo_path: Path to repository directory
@@ -460,7 +419,7 @@ class DirectExecutor:
     
     async def remove_image(self, image_id: str):
         """
-        Remove "image" (no-op in direct mode).
+        Remove "image" (no-op in direct mode)
         
         Args:
             image_id: Pseudo image ID
@@ -469,15 +428,13 @@ class DirectExecutor:
     
     def is_available(self) -> bool:
         """
-        Check if direct execution is available.
-        
-        Direct execution should always be available on Linux.
+        Check if direct execution is available
+        Direct execution should always be available on Linux
         
         Returns:
             True if running on Linux with required tools
         """
         try:
-            # Check for required commands
             required_commands = ['python3', 'cgexec']
             
             for cmd in required_commands:
@@ -490,7 +447,6 @@ class DirectExecutor:
                     logger.warning(f"Required command not found: {cmd}")
                     return False
             
-            # Check if we're on Linux
             if os.name != 'posix':
                 logger.warning("Direct execution only supported on Linux")
                 return False

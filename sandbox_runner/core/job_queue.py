@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 
 class JobStatus(str, Enum):
-    """Job execution status."""
+    """Job execution status"""
     PENDING = "pending"
     CLONING = "cloning"
     BUILDING = "building"
@@ -35,14 +35,14 @@ class JobStatus(str, Enum):
 
 
 class WeightClass(str, Enum):
-    """GPU weight class."""
+    """GPU weight class"""
     ONE_GPU = "1xH200"
     TWO_GPU = "2xH200"
     FOUR_GPU = "4xH200"
     EIGHT_GPU = "8xH200"
     
     def gpu_count(self) -> int:
-        """Return number of GPUs required."""
+        """Return number of GPUs required"""
         return {
             "1xH200": 1,
             "2xH200": 2,
@@ -54,7 +54,7 @@ class WeightClass(str, Enum):
 @dataclass
 class Job:
     """
-    Job data model representing a miner submission.
+    Job data model representing a miner submission
     
     Contains all information needed to execute a job:
     - Repository information
@@ -63,53 +63,42 @@ class Job:
     - Priority and scheduling info
     - Runtime state
     """
-    # Job identification
     job_id: str
     
-    # Repository information
     repo_url: str
     repo_branch: str = "main"
     repo_commit: Optional[str] = None
     repo_path: str = ""
     
-    # Resource requirements
     weight_class: WeightClass = WeightClass.ONE_GPU
     
-    # Data paths
     input_s3_path: str = ""
     output_s3_path: str = ""
     
-    # Scheduling
     priority: int = 0  # 0-10, higher = more important
     
-    # Attribution
     validator_hotkey: Optional[str] = None
     miner_hotkey: str = ""
     
-    # Custom configuration
     custom_env_vars: Dict[str, str] = field(default_factory=dict)
     
-    # Runtime state
     status: JobStatus = JobStatus.PENDING
     assigned_gpus: Optional[List[int]] = None
     
-    # Timestamps
     submitted_at: datetime = field(default_factory=datetime.utcnow)
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     
-    # Error tracking
     error_message: Optional[str] = None
     retry_count: int = 0
     
-    # Progress tracking
     current_phase: Optional[str] = None
     progress_percentage: float = 0.0
 
 
 class JobQueue:
     """
-    Priority-based job queue with weight class awareness.
+    Priority-based job queue with weight class awareness
     
     Features:
     - Jobs are ordered by priority (higher first), then FIFO within priority
@@ -120,30 +109,21 @@ class JobQueue:
     """
     
     def __init__(self):
-        """Initialize empty job queue."""
-        self._lock = asyncio.Lock()
-        
-        # Priority-based queues (priority -> deque of jobs)
-        # Higher priority number = higher priority
+        """Initialize empty job queue"""
+        self._lock = asyncio.Lock()        
         self._queues: Dict[int, deque] = defaultdict(deque)
-        
-        # Job lookup by ID for fast access
         self._jobs: Dict[str, Job] = {}
-        
-        # Track queue position for each job
         self._positions: Dict[str, int] = {}
-        
-        # Weight class statistics
         self._weight_class_counts: Dict[str, int] = defaultdict(int)
         
         logger.info("Job Queue initialized")
     
     async def enqueue(self, job: Job) -> int:
         """
-        Add a job to the queue.
+        Add a job to the queue
         
         Jobs are queued based on priority, with FIFO ordering
-        within the same priority level.
+        within the same priority level
         
         Args:
             job: Job to enqueue
@@ -152,20 +132,12 @@ class JobQueue:
             Queue position (0-indexed)
         """
         async with self._lock:
-            # Validate job
             if job.job_id in self._jobs:
                 raise ValueError(f"Job {job.job_id} already in queue")
             
-            # Add to priority queue
-            self._queues[job.priority].append(job)
-            
-            # Add to lookup table
+            self._queues[job.priority].append(job)            
             self._jobs[job.job_id] = job
-            
-            # Update weight class counts
-            self._weight_class_counts[job.weight_class.value] += 1
-            
-            # Calculate position
+            self._weight_class_counts[job.weight_class.value] += 1            
             position = self._calculate_position(job)
             self._positions[job.job_id] = position
             
@@ -180,27 +152,23 @@ class JobQueue:
     
     async def dequeue(self) -> Optional[Job]:
         """
-        Remove and return the highest priority job from the queue.
+        Remove and return the highest priority job from the queue
         
         Returns:
             Next job to execute, or None if queue is empty
         """
         async with self._lock:
-            # Find highest priority queue with jobs
             for priority in sorted(self._queues.keys(), reverse=True):
                 if self._queues[priority]:
                     job = self._queues[priority].popleft()
                     
-                    # Clean up empty priority queues
                     if not self._queues[priority]:
                         del self._queues[priority]
                     
-                    # Update tracking
                     del self._jobs[job.job_id]
                     del self._positions[job.job_id]
                     self._weight_class_counts[job.weight_class.value] -= 1
                     
-                    # Recalculate all positions
                     self._recalculate_positions()
                     
                     logger.info(
@@ -215,7 +183,7 @@ class JobQueue:
     
     async def peek(self) -> Optional[Job]:
         """
-        Get the next job without removing it from queue.
+        Get the next job without removing it from queue
         
         Returns:
             Next job that would be dequeued, or None if empty
@@ -228,7 +196,7 @@ class JobQueue:
     
     async def get_job(self, job_id: str) -> Optional[Job]:
         """
-        Get a job by ID without removing it from queue.
+        Get a job by ID without removing it from queue
         
         Args:
             job_id: Job identifier
@@ -241,7 +209,7 @@ class JobQueue:
     
     async def cancel_job(self, job_id: str) -> bool:
         """
-        Cancel a pending job and remove it from the queue.
+        Cancel a pending job and remove it from the queue
         
         Args:
             job_id: Job identifier
@@ -255,7 +223,6 @@ class JobQueue:
                 logger.warning(f"Cannot cancel job {job_id}: not found")
                 return False
             
-            # Remove from priority queue
             priority_queue = self._queues[job.priority]
             try:
                 priority_queue.remove(job)
@@ -263,20 +230,16 @@ class JobQueue:
                 logger.warning(f"Job {job_id} not in priority queue")
                 return False
             
-            # Clean up empty priority queues
             if not self._queues[job.priority]:
                 del self._queues[job.priority]
             
-            # Update tracking
             del self._jobs[job_id]
             del self._positions[job_id]
             self._weight_class_counts[job.weight_class.value] -= 1
             
-            # Update job status
             job.status = JobStatus.CANCELLED
             job.completed_at = datetime.utcnow()
             
-            # Recalculate positions
             self._recalculate_positions()
             
             logger.info(f"Cancelled job {job_id}")
@@ -285,7 +248,7 @@ class JobQueue:
     
     async def get_queue_depth(self) -> Dict[str, int]:
         """
-        Get queue depth by weight class.
+        Get queue depth by weight class
         
         Returns:
             Dictionary mapping weight class to count of pending jobs
@@ -295,7 +258,7 @@ class JobQueue:
     
     async def get_total_depth(self) -> int:
         """
-        Get total number of jobs in queue.
+        Get total number of jobs in queue
         
         Returns:
             Total job count
@@ -305,7 +268,7 @@ class JobQueue:
     
     async def get_queue_position(self, job_id: str) -> Optional[int]:
         """
-        Get position of a job in the queue.
+        Get position of a job in the queue
         
         Args:
             job_id: Job identifier
@@ -322,7 +285,7 @@ class JobQueue:
         avg_job_duration_seconds: float = 1800
     ) -> Optional[timedelta]:
         """
-        Estimate how long a job will wait before starting.
+        Estimate how long a job will wait before starting
         
         This is a rough estimate based on:
         - Jobs ahead in queue
@@ -340,15 +303,14 @@ class JobQueue:
         if position is None:
             return None
         
-        # Simple estimation: position * average duration
-        # In reality, this depends on GPU availability and job packing
+        # this depends on GPU availability and job packing
         wait_seconds = position * avg_job_duration_seconds
         
         return timedelta(seconds=wait_seconds)
     
     async def get_jobs_by_priority(self, priority: int) -> List[Job]:
         """
-        Get all jobs at a specific priority level.
+        Get all jobs at a specific priority level
         
         Args:
             priority: Priority level (0-10)
@@ -363,7 +325,7 @@ class JobQueue:
     
     async def get_all_jobs(self) -> List[Job]:
         """
-        Get all jobs in queue, ordered by priority and then FIFO.
+        Get all jobs in queue, ordered by priority and then FIFO
         
         Returns:
             List of all jobs in queue order
@@ -376,7 +338,7 @@ class JobQueue:
     
     async def get_stats(self) -> Dict:
         """
-        Get queue statistics for monitoring.
+        Get queue statistics for monitoring
         
         Returns:
             Dictionary with queue statistics
@@ -394,7 +356,7 @@ class JobQueue:
     
     def _calculate_position(self, job: Job) -> int:
         """
-        Calculate queue position for a job.
+        Calculate queue position for a job
         
         Position is based on:
         1. All jobs with higher priority come first
@@ -408,12 +370,10 @@ class JobQueue:
         """
         position = 0
         
-        # Count all jobs with higher priority
         for priority in sorted(self._queues.keys(), reverse=True):
             if priority > job.priority:
                 position += len(self._queues[priority])
             elif priority == job.priority:
-                # Count jobs in same priority queue that come before this one
                 for queued_job in self._queues[priority]:
                     if queued_job.job_id == job.job_id:
                         break
@@ -424,9 +384,8 @@ class JobQueue:
     
     def _recalculate_positions(self):
         """
-        Recalculate queue positions for all jobs.
-        
-        Called after removing jobs from queue to keep positions accurate.
+        Recalculate queue positions for all jobs
+        Called after removing jobs from queue to keep positions accurate
         """
         position = 0
         for priority in sorted(self._queues.keys(), reverse=True):
@@ -436,7 +395,7 @@ class JobQueue:
     
     def _get_oldest_job_age(self) -> float:
         """
-        Get age of oldest job in queue.
+        Get age of oldest job in queue
         
         Returns:
             Age in seconds, or 0 if queue is empty
@@ -454,10 +413,9 @@ class JobQueue:
     
     async def clear(self):
         """
-        Clear all jobs from the queue.
+        Clear all jobs from the queue
         
         WARNING: This removes all pending jobs without executing them!
-        Use with caution - typically only for testing or shutdown.
         """
         async with self._lock:
             self._queues.clear()

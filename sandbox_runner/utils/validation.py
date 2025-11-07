@@ -11,29 +11,27 @@ Validates miner repositories before execution:
 import logging
 import re
 from pathlib import Path
-from typing import List, Optional, Set
+from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 
 class ValidationError(Exception):
-    """Raised when repository validation fails."""
+    """Raised when repository validation fails"""
     pass
 
 
 class RepositoryValidator:
     """
-    Validates miner repository structure and contents.
+    Validates miner repository structure and contents
     
     Ensures repositories meet minimum requirements and don't contain
     obvious security issues.
     """
     
-    # Packages that are blacklisted due to security concerns
     BLACKLISTED_PACKAGES = {
     }
     
-    # Packages that require review (suspicious but not always malicious)
     SUSPICIOUS_PACKAGES = {
         'eval',
         'exec',
@@ -43,27 +41,24 @@ class RepositoryValidator:
         'os.system',
     }
     
-    # Required files in repository
     REQUIRED_FILES = [
         'inference.py',
         'requirements.txt'
     ]
     
-    # Optional files
     OPTIONAL_FILES = [
         'Dockerfile',
         'README.md',
         '.gitignore'
     ]
     
-    # Maximum file sizes (in bytes)
-    MAX_REQUIREMENTS_SIZE = 1024 * 100  # 100 KB
+    MAX_REQUIREMENTS_SIZE = 1024 * 100  # 100 
     MAX_INFERENCE_SIZE = 1024 * 1024 * 10  # 10 MB
     MAX_DOCKERFILE_SIZE = 1024 * 100  # 100 KB
     
     def __init__(self, allowed_hosts: Optional[List[str]] = None):
         """
-        Initialize repository validator.
+        Initialize repository validator
         
         Args:
             allowed_hosts: List of allowed repository hosts (e.g., github.com)
@@ -72,7 +67,7 @@ class RepositoryValidator:
         
     def validate_structure(self, repo_path: Path) -> bool:
         """
-        Validate repository structure.
+        Validate repository structure
         
         Checks:
         1. Repository directory exists
@@ -94,7 +89,6 @@ class RepositoryValidator:
         if not repo_path.is_dir():
             raise ValidationError(f"Repository path is not a directory: {repo_path}")
         
-        # Check for required files
         for required_file in self.REQUIRED_FILES:
             file_path = repo_path / required_file
             if not file_path.exists():
@@ -108,7 +102,6 @@ class RepositoryValidator:
             if not file_path.is_file():
                 raise ValidationError(f"Required path is not a file: {required_file}")
         
-        # Check file sizes
         self._check_file_size(
             repo_path / 'inference.py',
             self.MAX_INFERENCE_SIZE,
@@ -121,7 +114,6 @@ class RepositoryValidator:
             'requirements.txt'
         )
         
-        # Check Dockerfile if present
         dockerfile_path = repo_path / 'Dockerfile'
         if dockerfile_path.exists():
             self._check_file_size(
@@ -135,7 +127,7 @@ class RepositoryValidator:
     
     def validate_requirements(self, requirements_path: Path) -> bool:
         """
-        Validate requirements.txt for malicious or problematic packages.
+        Validate requirements.txt for malicious or problematic packages
         
         Checks:
         1. File is readable and well-formed
@@ -161,17 +153,14 @@ class RepositoryValidator:
         except Exception as e:
             raise ValidationError(f"Failed to read requirements.txt: {e}")
         
-        # Parse requirements
         packages = self._parse_requirements(content)
         
-        # Check for excessive dependencies
         if len(packages) > 100:
             raise ValidationError(
                 f"Too many dependencies ({len(packages)}). Maximum is 100. "
                 "This may indicate a malicious or poorly configured repository."
             )
         
-        # Check for blacklisted packages
         blacklisted_found = []
         for package in packages:
             package_name = package.split('==')[0].split('>=')[0].split('<=')[0].strip()
@@ -184,7 +173,6 @@ class RepositoryValidator:
                 "These packages pose security risks and are not allowed."
             )
         
-        # Warn about suspicious packages (but don't fail)
         suspicious_found = []
         for package in packages:
             package_name = package.split('==')[0].split('>=')[0].split('<=')[0].strip()
@@ -205,7 +193,7 @@ class RepositoryValidator:
     
     def validate_inference_script(self, inference_path: Path) -> bool:
         """
-        Validate inference.py script.
+        Validate inference.py script
         
         Basic checks:
         1. File is valid Python
@@ -230,13 +218,11 @@ class RepositoryValidator:
         except Exception as e:
             raise ValidationError(f"Failed to read inference.py: {e}")
         
-        # Basic syntax check - try to compile
         try:
             compile(content, str(inference_path), 'exec')
         except SyntaxError as e:
             raise ValidationError(f"Invalid Python syntax in inference.py: {e}")
         
-        # Check for dangerous patterns (basic checks only)
         dangerous_patterns = [
             r'os\.system\(',
             r'subprocess\.call\(',
@@ -257,8 +243,7 @@ class RepositoryValidator:
                 "These will be monitored during execution."
             )
         
-        # Check for required argument parsing (--phase, --input, --output)
-        # This is a soft check - we'll handle it gracefully if missing
+        # TODO: handle it gracefully if missing
         has_phase_arg = '--phase' in content or 'argparse' in content
         if not has_phase_arg:
             logger.warning(
@@ -271,7 +256,7 @@ class RepositoryValidator:
     
     def validate_dockerfile(self, dockerfile_path: Path) -> bool:
         """
-        Validate Dockerfile if present.
+        Validate Dockerfile if present
         
         Basic checks:
         1. File is readable
@@ -288,8 +273,7 @@ class RepositoryValidator:
             ValidationError: If validation fails
         """
         if not dockerfile_path.exists():
-            # Dockerfile is optional
-            return True
+            raise ValidationError(f"Dockerfile doesnt exist!")
         
         try:
             with open(dockerfile_path, 'r') as f:
@@ -297,18 +281,16 @@ class RepositoryValidator:
         except Exception as e:
             raise ValidationError(f"Failed to read Dockerfile: {e}")
         
-        # Check for FROM instruction
         if not re.search(r'^FROM\s+', content, re.MULTILINE):
             raise ValidationError(
                 "Dockerfile must have a FROM instruction"
             )
         
-        # Check for dangerous commands
         dangerous_patterns = [
-            r'rm\s+-rf\s+/',  # Dangerous deletion
-            r'chmod\s+777',  # Overly permissive
-            r'curl.*\|\s*bash',  # Pipe to bash
-            r'wget.*\|\s*sh',  # Pipe to shell
+            r'rm\s+-rf\s+/',
+            r'chmod\s+777',
+            r'curl.*\|\s*bash',
+            r'wget.*\|\s*sh',
         ]
         
         found_dangerous = []
@@ -326,7 +308,7 @@ class RepositoryValidator:
     
     def validate_url(self, repo_url: str) -> bool:
         """
-        Validate repository URL.
+        Validate repository URL
         
         Checks:
         1. URL is from allowed host
@@ -341,7 +323,6 @@ class RepositoryValidator:
         Raises:
             ValidationError: If validation fails
         """
-        # Check if URL is from allowed host
         is_allowed = any(host in repo_url for host in self.allowed_hosts)
         
         if not is_allowed:
@@ -350,7 +331,6 @@ class RepositoryValidator:
                 f"Allowed hosts: {', '.join(self.allowed_hosts)}"
             )
         
-        # Basic URL format check
         if not (repo_url.startswith('https://') or repo_url.startswith('git@')):
             raise ValidationError(
                 f"Invalid repository URL format: {repo_url}. "
@@ -374,27 +354,17 @@ class RepositoryValidator:
         Raises:
             ValidationError: If any validation fails
         """
-        # Validate URL
         self.validate_url(repo_url)
-        
-        # Validate structure
         self.validate_structure(repo_path)
-        
-        # Validate requirements.txt
         self.validate_requirements(repo_path / 'requirements.txt')
-        
-        # Validate inference.py
         self.validate_inference_script(repo_path / 'inference.py')
-        
-        # Validate Dockerfile if present
         self.validate_dockerfile(repo_path / 'Dockerfile')
-        
         logger.info(f"All validation checks passed for {repo_url}")
         return True
     
     def _parse_requirements(self, content: str) -> List[str]:
         """
-        Parse requirements.txt content into list of packages.
+        Parse requirements.txt content into list of packages
         
         Args:
             content: requirements.txt content
@@ -405,12 +375,10 @@ class RepositoryValidator:
         packages = []
         
         for line in content.split('\n'):
-            # Strip whitespace and comments
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
             
-            # Skip pip options
             if line.startswith('-'):
                 continue
             
@@ -420,7 +388,7 @@ class RepositoryValidator:
     
     def _check_file_size(self, file_path: Path, max_size: int, name: str):
         """
-        Check if file size is within limits.
+        Check if file size is within limits
         
         Args:
             file_path: Path to file

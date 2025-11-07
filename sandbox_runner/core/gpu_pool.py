@@ -1,7 +1,7 @@
 """
 GPU Pool Manager Module
 
-Manages the allocation and tracking of GPU resources across multiple jobs.
+Manages the allocation and tracking of GPU resources across multiple jobs
 Handles:
 - Tracking which GPUs are free/allocated
 - Weight class allocation (1x, 2x, 4x, 8x)
@@ -15,21 +15,20 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional, List, Dict, Set
-import psutil
+from typing import Optional, List, Dict
 
 logger = logging.getLogger(__name__)
 
 
 class WeightClass(str, Enum):
-    """GPU weight class for job execution."""
+    """GPU weight class for job execution"""
     ONE_GPU = "1xH200"
     TWO_GPU = "2xH200"
     FOUR_GPU = "4xH200"
     EIGHT_GPU = "8xH200"
     
     def gpu_count(self) -> int:
-        """Return number of GPUs required for this weight class."""
+        """Return number of GPUs required for this weight class"""
         return {
             "1xH200": 1,
             "2xH200": 2,
@@ -39,7 +38,7 @@ class WeightClass(str, Enum):
 
 
 class GPUStatus(str, Enum):
-    """GPU allocation status."""
+    """GPU allocation status"""
     FREE = "free"
     ALLOCATED = "allocated"
     ERROR = "error"
@@ -48,7 +47,7 @@ class GPUStatus(str, Enum):
 
 @dataclass
 class GPUInfo:
-    """Information about a single GPU."""
+    """Information about a single GPU"""
     gpu_id: int
     status: GPUStatus
     allocated_to_job: Optional[str] = None
@@ -61,7 +60,7 @@ class GPUInfo:
 
 class GPUPoolManager:
     """
-    Manages GPU resource allocation across jobs.
+    Manages GPU resource allocation across jobs
     
     Key features:
     - Tracks 8 H200 GPUs (configurable)
@@ -73,7 +72,7 @@ class GPUPoolManager:
     
     def __init__(self, gpu_count: int = 8):
         """
-        Initialize GPU pool manager.
+        Initialize GPU pool manager
         
         Args:
             gpu_count: Total number of GPUs to manage (default: 8)
@@ -81,7 +80,6 @@ class GPUPoolManager:
         self.gpu_count = gpu_count
         self._lock = asyncio.Lock()
         
-        # GPU allocation tracking
         self._gpus: Dict[int, GPUInfo] = {}
         for i in range(gpu_count):
             self._gpus[i] = GPUInfo(
@@ -90,10 +88,7 @@ class GPUPoolManager:
                 memory_total_mb=81920  # H200 = 80GB = 81920MB
             )
         
-        # Job-to-GPU mapping
-        self._job_allocations: Dict[str, List[int]] = {}
-        
-        # Track allocation history for metrics
+        self._job_allocations: Dict[str, List[int]] = {}        
         self._allocation_history: List[Dict] = []
         
         logger.info(f"GPU Pool Manager initialized with {gpu_count} GPUs")
@@ -104,7 +99,7 @@ class GPUPoolManager:
         job_id: str
     ) -> Optional[List[int]]:
         """
-        Allocate GPUs for a job based on weight class.
+        Allocate GPUs for a job based on weight class
         
         Allocation strategy:
         1. Determine number of GPUs needed from weight class
@@ -122,7 +117,6 @@ class GPUPoolManager:
         async with self._lock:
             required_gpus = weight_class.gpu_count()
             
-            # Check if enough GPUs are available
             available_count = sum(
                 1 for gpu in self._gpus.values()
                 if gpu.status == GPUStatus.FREE
@@ -135,10 +129,8 @@ class GPUPoolManager:
                 )
                 return None
             
-            # Try to find contiguous block first (better for multi-GPU performance)
             allocated_gpus = self._find_contiguous_gpus(required_gpus)
             
-            # If contiguous not available, allocate any free GPUs
             if not allocated_gpus:
                 allocated_gpus = self._find_any_free_gpus(required_gpus)
             
@@ -148,16 +140,13 @@ class GPUPoolManager:
                 )
                 return None
             
-            # Mark GPUs as allocated
             for gpu_id in allocated_gpus:
                 self._gpus[gpu_id].status = GPUStatus.ALLOCATED
                 self._gpus[gpu_id].allocated_to_job = job_id
                 self._gpus[gpu_id].last_updated = datetime.utcnow()
             
-            # Track job allocation
             self._job_allocations[job_id] = allocated_gpus
             
-            # Record allocation history
             self._allocation_history.append({
                 "timestamp": datetime.utcnow().isoformat(),
                 "job_id": job_id,
@@ -175,7 +164,7 @@ class GPUPoolManager:
     
     async def release_gpus(self, job_id: str) -> None:
         """
-        Release GPUs allocated to a job.
+        Release GPUs allocated to a job
         
         Args:
             job_id: Job identifier whose GPUs should be released
@@ -187,17 +176,14 @@ class GPUPoolManager:
             
             allocated_gpus = self._job_allocations[job_id]
             
-            # Mark GPUs as free
             for gpu_id in allocated_gpus:
                 if gpu_id in self._gpus:
                     self._gpus[gpu_id].status = GPUStatus.FREE
                     self._gpus[gpu_id].allocated_to_job = None
                     self._gpus[gpu_id].last_updated = datetime.utcnow()
             
-            # Remove job allocation
             del self._job_allocations[job_id]
             
-            # Record release history
             self._allocation_history.append({
                 "timestamp": datetime.utcnow().isoformat(),
                 "job_id": job_id,
@@ -209,7 +195,7 @@ class GPUPoolManager:
     
     async def get_available_gpu_count(self) -> int:
         """
-        Get count of currently available (free) GPUs.
+        Get count of currently available (free) GPUs
         
         Returns:
             Number of free GPUs
@@ -222,13 +208,12 @@ class GPUPoolManager:
     
     async def get_gpu_status(self) -> Dict[int, GPUInfo]:
         """
-        Get status of all GPUs.
+        Get status of all GPUs
         
         Returns:
             Dictionary mapping GPU ID to GPUInfo
         """
         async with self._lock:
-            # Return copy to avoid external mutation
             return {
                 gpu_id: GPUInfo(
                     gpu_id=info.gpu_id,
@@ -245,7 +230,7 @@ class GPUPoolManager:
     
     async def can_allocate(self, weight_class: WeightClass) -> bool:
         """
-        Check if GPUs can be allocated for a weight class.
+        Check if GPUs can be allocated for a weight class
         
         Args:
             weight_class: GPU weight class to check
@@ -259,7 +244,7 @@ class GPUPoolManager:
     
     async def get_job_gpus(self, job_id: str) -> Optional[List[int]]:
         """
-        Get GPU IDs allocated to a specific job.
+        Get GPU IDs allocated to a specific job
         
         Args:
             job_id: Job identifier
@@ -278,7 +263,7 @@ class GPUPoolManager:
         temperature_celsius: float = 0.0
     ):
         """
-        Update real-time GPU utilization metrics.
+        Update real-time GPU utilization metrics
         
         This should be called periodically by a monitoring task
         to keep GPU stats up to date.
@@ -298,7 +283,7 @@ class GPUPoolManager:
     
     async def get_allocation_stats(self) -> Dict:
         """
-        Get allocation statistics for monitoring.
+        Get allocation statistics for monitoring
         
         Returns:
             Dictionary with allocation statistics
@@ -324,7 +309,7 @@ class GPUPoolManager:
     
     def _find_contiguous_gpus(self, count: int) -> Optional[List[int]]:
         """
-        Find a contiguous block of free GPUs.
+        Find a contiguous block of free GPUs
         
         Contiguous allocation is preferred for multi-GPU jobs because:
         1. Better NVLink connectivity between adjacent GPUs
@@ -337,7 +322,6 @@ class GPUPoolManager:
         Returns:
             List of contiguous GPU IDs, or None if not available
         """
-        # Try to find contiguous block
         for start_id in range(self.gpu_count - count + 1):
             gpus = list(range(start_id, start_id + count))
             if all(
@@ -350,7 +334,7 @@ class GPUPoolManager:
     
     def _find_any_free_gpus(self, count: int) -> Optional[List[int]]:
         """
-        Find any available free GPUs (not necessarily contiguous).
+        Find any available free GPUs (not necessarily contiguous)
         
         Args:
             count: Number of GPUs needed
@@ -370,9 +354,9 @@ class GPUPoolManager:
     
     async def get_cuda_visible_devices(self, job_id: str) -> Optional[str]:
         """
-        Get CUDA_VISIBLE_DEVICES environment variable value for a job.
+        Get CUDA_VISIBLE_DEVICES environment variable value for a job
         
-        This is used to restrict a job to only see its allocated GPUs.
+        This is used to restrict a job to only see its allocated GPUs
         
         Args:
             job_id: Job identifier
@@ -387,7 +371,7 @@ class GPUPoolManager:
     
     async def mark_gpu_error(self, gpu_id: int, error_message: str):
         """
-        Mark a GPU as in error state.
+        Mark a GPU as in error state
         
         Args:
             gpu_id: GPU identifier
@@ -401,7 +385,7 @@ class GPUPoolManager:
     
     async def reset_gpu(self, gpu_id: int):
         """
-        Reset a GPU to free state (for error recovery).
+        Reset a GPU to free state (for error recovery)
         
         Args:
             gpu_id: GPU identifier

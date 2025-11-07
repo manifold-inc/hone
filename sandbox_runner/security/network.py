@@ -19,20 +19,20 @@ logger = logging.getLogger(__name__)
 
 
 class NetworkPolicyError(Exception):
-    """Raised when network policy operation fails."""
+    """Raised when network policy operation fails"""
     pass
 
 
 class NetworkPolicy:
     """
-    Manages network access policies for containers.
+    Manages network access policies for containers
     
-    Phase 3 Implementation:
+    TODO:
     - Uses Docker network modes (host, none)
     - Prep phase: host network (full internet access)
     - Inference phase: none network (no network access)
     
-    Future Phase 4 Enhancement:
+    TODO:
     - Add iptables/nftables rules for fine-grained control
     - Whitelist specific domains during prep phase
     - Monitor and log network access attempts
@@ -40,7 +40,7 @@ class NetworkPolicy:
     
     def __init__(self, config: NetworkPolicyConfig):
         """
-        Initialize network policy manager.
+        Initialize network policy manager
         
         Args:
             config: Network policy configuration
@@ -58,7 +58,7 @@ class NetworkPolicy:
     
     def get_network_mode_for_phase(self, phase: str) -> str:
         """
-        Get appropriate Docker network mode for execution phase.
+        Get appropriate Docker network mode for execution phase
         
         Args:
             phase: Execution phase ("prep" or "inference")
@@ -68,18 +68,14 @@ class NetworkPolicy:
         """
         if phase == "prep":
             if self.config.prep_allow_internet:
-                # Allow internet access during prep
                 return "host"
             else:
-                # No internet even during prep
                 return "none"
         
         elif phase == "inference":
             if self.config.inference_block_internet:
-                # Block all internet during inference
                 return "none"
             else:
-                # Allow internet (unusual, but configurable)
                 return "host"
         
         else:
@@ -94,7 +90,7 @@ class NetworkPolicy:
         """
         Enable internet access for a container.
         
-        Phase 3 Implementation:
+        TODO:
         - This is handled at container creation via network_mode parameter
         - This method is a placeholder for future iptables-based control
         
@@ -122,9 +118,9 @@ class NetworkPolicy:
         phase: str = "inference"
     ) -> bool:
         """
-        Block internet access for a container.
+        Block internet access for a container
         
-        Phase 3 Implementation:
+        TODO:
         - This is handled at container creation via network_mode='none'
         - This method is a placeholder for future iptables-based control
         
@@ -148,13 +144,13 @@ class NetworkPolicy:
     
     async def verify_network_isolation(self, container_id: str) -> bool:
         """
-        Verify that a container has no network access.
+        Verify that a container has no network access
         
-        Phase 3 Implementation:
+        TODO:
         - Checks if container was created with network_mode='none'
         - Cannot verify after creation without entering container
         
-        Phase 4 will add:
+        TODO : 
         - Active network monitoring
         - Connection attempt logging
         - Real-time blocking verification
@@ -165,14 +161,13 @@ class NetworkPolicy:
         Returns:
             True if network isolation verified
         """
-        # Phase 3: Trust Docker network mode
-        # Phase 4: Add actual verification via iptables or container inspection
+        # TODO: Add actual verification via iptables or container inspection
         logger.debug(f"Network isolation assumed for container {container_id[:12]}")
         return True
     
     def is_domain_allowed(self, domain: str, phase: str = "prep") -> bool:
         """
-        Check if a domain is allowed for the given phase.
+        Check if a domain is allowed for the given phase
         
         Args:
             domain: Domain name to check
@@ -182,25 +177,19 @@ class NetworkPolicy:
             True if domain is allowed
         """
         if phase != "prep":
-            # Only prep phase has domain allowlist
             return False
         
         if not self.config.prep_allow_internet:
-            # Internet disabled, no domains allowed
             return False
         
-        # Check if domain is in allowlist
         for allowed_domain in self.config.allowed_prep_domains:
             if domain == allowed_domain or domain.endswith('.' + allowed_domain):
                 return True
         
-        # Check if domain is in blocklist
         for blocked_domain in self.config.blocked_domains:
             if domain == blocked_domain or domain.endswith('.' + blocked_domain):
                 return False
         
-        # If not in allowlist and not specifically blocked, allow
-        # (Phase 3 doesn't enforce allowlist, Phase 4 will)
         return True
     
     async def setup_domain_filtering(
@@ -211,16 +200,12 @@ class NetworkPolicy:
         """
         Set up domain-based filtering for a container.
         
-        Phase 3 Implementation:
-        - Placeholder for future implementation
-        - Will use iptables/DNS filtering in Phase 4
+        - TODO: use iptables/DNS filtering in Phase 4
         
         Args:
             container_id: Docker container ID
             phase: Execution phase
         """
-        # Phase 4: Implement iptables rules or DNS filtering
-        # For now, just log the intent
         if phase == "prep" and self.config.allowed_prep_domains:
             logger.debug(
                 f"Domain filtering would be applied to {container_id[:12]}: "
@@ -229,18 +214,17 @@ class NetworkPolicy:
     
     async def cleanup(self, container_id: str):
         """
-        Clean up network rules for a container.
+        Clean up network rules for a container
         
         Args:
             container_id: Docker container ID
         """
-        # Phase 3: Nothing to clean up (Docker handles it)
-        # Phase 4: Remove iptables rules
+        # TODO: Remove iptables rules
         logger.debug(f"Network policy cleanup for container {container_id[:12]}")
     
     def get_policy_summary(self, phase: str) -> dict:
         """
-        Get a summary of network policy for a phase.
+        Get a summary of network policy for a phase
         
         Args:
             phase: Execution phase
@@ -263,20 +247,17 @@ class NetworkPolicy:
         }
 
 
-# Future Phase 4 Enhancement: iptables-based fine-grained control
-# This will be implemented in Phase 4 for production use
-
 class IptablesNetworkPolicy(NetworkPolicy):
     """
     Advanced network policy using iptables/nftables.
     
-    This class will be implemented in Phase 4 to provide:
+    ---
+    TODO: 
     - Fine-grained domain whitelisting
     - Connection monitoring and logging
     - Real-time blocking of unauthorized connections
     - DNS filtering
-    
-    For now, this is a placeholder that inherits basic Docker network mode behavior.
+    ----    
     """
     
     def __init__(self, config: NetworkPolicyConfig):
@@ -285,24 +266,17 @@ class IptablesNetworkPolicy(NetworkPolicy):
     
     async def setup_iptables_rules(self, container_id: str, phase: str):
         """
-        Setup iptables rules for container.
-        
-        To be implemented in Phase 4.
+        Setup iptables rules for container        
         """
-        # Phase 4 implementation:
-        # 1. Get container network namespace
-        # 2. Create iptables chain for container
-        # 3. Add rules to allow/block based on config
-        # 4. Log connection attempts
+        # TODO: Get container network namespace
+        # TODO: Create iptables chain for container
+        # TODO: Add rules to allow/block based on config
+        # TODO: Log connection attempts
         pass
     
     async def remove_iptables_rules(self, container_id: str):
         """
-        Remove iptables rules for container.
-        
-        To be implemented in Phase 4.
+        Remove iptables rules for container     
         """
-        # Phase 4 implementation:
-        # 1. Remove iptables chain
-        # 2. Clean up logging
+        # TODO: Remove iptables chain
         pass

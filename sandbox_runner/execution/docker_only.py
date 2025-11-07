@@ -1,14 +1,9 @@
 import asyncio
 import logging
-import subprocess
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import List, Dict, Tuple
 import time
-import json
 import sys
-import shutil
-from collections import deque
-import re
 
 import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
@@ -20,15 +15,15 @@ logger = logging.getLogger(__name__)
 
 
 class DockerExecutionError(Exception):
-    """Raised when Docker execution fails."""
+    """Raised when Docker execution fails"""
     pass
 
 
 class BuildLogDisplay:
     """
-    Fixed-position scrolling build log box that always shows the latest N lines.
-    When active, normal prints should go through write_below_box().
-    Falls back to plain prints if stdout is not a TTY.
+    Fixed-position scrolling build log box that always shows the latest N lines
+    When active, normal prints should go through write_below_box()
+    Falls back to plain prints if stdout is not a TTY
     """
     def __init__(self, box_lines: int = 10, title: str = "🔨 BUILD LOGS"):
         import shutil, sys, re
@@ -42,7 +37,6 @@ class BuildLogDisplay:
         self.total_lines = 0
         self.is_tty = sys.stdout.isatty()
 
-        # ANSI codes
         self.SAVE = "\033[s"
         self.RESTORE = "\033[u"
         self.CLEAR_LINE = "\033[2K"
@@ -93,18 +87,15 @@ class BuildLogDisplay:
         border = "─" * self.terminal_width
         header = f"{self.title:^{self.terminal_width}}"
 
-        # Header
         sys.stdout.write("\n" + border + "\n")
         sys.stdout.write(header + "\n")
         sys.stdout.write(border + "\n")
 
-        # Content box (empty lines)
         for _ in range(self.box_lines):
             sys.stdout.write(f"│{' ' * (self.terminal_width - 2)}│\n")
 
-        # Footer border and final empty line where normal logs will continue
         sys.stdout.write(border + "\n")
-        sys.stdout.write(self.SAVE)  # Save "anchor_after" (below the box)
+        sys.stdout.write(self.SAVE) 
         sys.stdout.flush()
 
     def update(self, line: str):
@@ -119,21 +110,16 @@ class BuildLogDisplay:
         self.total_lines += 1
 
         if not self.is_tty:
-            # Plain print fallback
             print(cleaned)
             return
 
-        # Restore to "after box", move up into the content area
         sys.stdout.write(self.RESTORE)
         sys.stdout.write(self.MOVE_UP_FMT.format(self._move_up_to_content))
 
-        # Redraw content box
         buf = list(self.log_buffer)
-        # Ensure we always draw exactly box_lines rows (right-aligned to latest)
         start_idx = max(0, len(buf) - self.box_lines)
         view = buf[start_idx:]
 
-        # Draw lines
         for i in range(self.box_lines):
             sys.stdout.write(self.CLEAR_LINE + self.CARRIAGE)
             if i < len(view):
@@ -145,14 +131,13 @@ class BuildLogDisplay:
             else:
                 sys.stdout.write(f"│{' ' * (self.terminal_width - 2)}│\n")
 
-        # Move cursor back down to "after box" and re-save anchor
         sys.stdout.write(self.MOVE_DOWN_FMT.format(self._move_up_to_content))
         sys.stdout.write(self.SAVE)
         sys.stdout.flush()
 
     def write_below_box(self, text: str):
         """
-        Safely print a normal log line below the box while it is active.
+        Safely print a normal log line below the box while it is active
         """
         if not self.box_active or not self.is_tty:
             print(text)
@@ -174,7 +159,6 @@ class BuildLogDisplay:
             print('='*self.terminal_width + "\n")
             return
 
-        # Go to after-box and print completion banner cleanly below it
         sys.stdout.write(self.RESTORE)
         sys.stdout.write(self.CLEAR_LINE + self.CARRIAGE)
         border = "─" * self.terminal_width
@@ -189,7 +173,6 @@ async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
     loop = asyncio.get_event_loop()
     try:
         for entry in build_generator:
-            # Typical keys: 'stream', 'status', 'error', 'id', 'aux'
             if 'error' in entry:
                 display.update(f"ERROR: {entry['error']}")
             elif 'stream' in entry:
@@ -205,31 +188,25 @@ async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
 
 async def _stream_container_logs(container, display: BuildLogDisplay) -> str:
     """
-    Stream container logs in real time into the BuildLogDisplay.
-    Returns the concatenated text (stdout+stderr, Docker doesn't separate by default).
+    Stream container logs in real time into the BuildLogDisplay
     """
     loop = asyncio.get_event_loop()
     collected: List[str] = []
 
     def _read_logs_blocking():
         try:
-            # Using logs(..., stream=True, follow=True) yields bytes chunks until container exits
             for chunk in container.logs(stdout=True, stderr=True, stream=True, follow=True):
                 try:
                     text = chunk.decode("utf-8", errors="replace")
                 except Exception:
                     text = str(chunk)
-                # Split to update the box line-by-line
                 for ln in text.splitlines():
                     display.update(ln)
                     collected.append(ln + "\n")
         except Exception as e:
-            # Stream might be closed if container dies very quickly; show something useful
             display.update(f"[log-stream] ERROR: {e}")
 
-    # Run the blocking generator in a thread
     task = loop.run_in_executor(None, _read_logs_blocking)
-    # Wait for the log stream to finish (it ends when the container stops)
     await task
 
     return "".join(collected)
@@ -237,15 +214,12 @@ async def _stream_container_logs(container, display: BuildLogDisplay) -> str:
 
 class DockerOnlyExecutor:
     """
-    Docker-only container executor.
-    
-    Runs jobs in Docker containers with standard Docker isolation.
-    Falls back to this mode if gVisor is not available.
+    Docker-only container executor    
     """
     
     def __init__(self, config: Config):
         """
-        Initialize Docker-only executor.
+        Initialize Docker-only executor
         
         Args:
             config: Application configuration
@@ -269,7 +243,7 @@ class DockerOnlyExecutor:
         timeout_seconds: int
     ) -> Tuple[int, str, str]:
         """
-        Run a container for a specific job phase.
+        Run a container for a specific job phase
         
         Args:
             image_id: Docker image ID or tag
@@ -297,7 +271,6 @@ class DockerOnlyExecutor:
             }
         )
         
-        # Build config
         container_config = self._build_container_config(
             image_id=image_id,
             job=job,
@@ -308,11 +281,9 @@ class DockerOnlyExecutor:
         )
         
         container = None
-        # Create a scrolling box for execution logs
-        display = BuildLogDisplay(box_lines=10, title=f"🧪 {phase.upper()} LOGS")
+        display = BuildLogDisplay(box_lines=50, title=f"🧪 {phase.upper()} LOGS")
         
         try:
-            # Create container
             container = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.containers.create(**container_config)
             )
@@ -321,7 +292,6 @@ class DockerOnlyExecutor:
                 extra={"container_id": container.id}
             )
             
-            # Optional: inspect (debugging)
             try:
                 container_details = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self.docker_client.api.inspect_container(container.id)
@@ -336,7 +306,6 @@ class DockerOnlyExecutor:
             except Exception as e:
                 logger.warning(f"Failed to inspect container: {e}")
             
-            # Optional: image inspect (debugging)
             try:
                 image_details = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: self.docker_client.api.inspect_image(image_id)
@@ -351,40 +320,31 @@ class DockerOnlyExecutor:
             except Exception as e:
                 logger.error(f"Failed to inspect image {image_id}: {e}")
             
-            # Start the box **before** starting the container, so early logs show up
             display.start()
             
-            # Start container
             await asyncio.get_event_loop().run_in_executor(None, container.start)
             logger.info(f"Docker container started: {container.id[:12]}")
             
-            # Start streaming logs concurrently
             logs_task = asyncio.create_task(_stream_container_logs(container, display))
             
-            # Wait for exit (poll loop) with timeout
             exit_code = await self._wait_for_container(container, timeout_seconds)
             
-            # Ensure log streaming finished
             try:
                 combined_logs = await asyncio.wait_for(logs_task, timeout=5)
             except asyncio.TimeoutError:
-                # If logs stream didn't finish promptly, cancel and fallback to a final fetch
                 logs_task.cancel()
                 try:
                     _ = await logs_task
                 except Exception:
                     pass
-                # Final safety read (non-stream) in case anything is left
                 final = await asyncio.get_event_loop().run_in_executor(
                     None, lambda: container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
                 )
                 combined_logs = final
             
-            # Close the box with a status banner
             status_txt = "✅ EXECUTION COMPLETE" if exit_code == 0 else f"❌ EXECUTION FAILED (code {exit_code})"
             display.end(status_txt)
             
-            # Gather detailed container state
             container_state = container.attrs['State']
             logger.info(
                 f"Docker container finished: {container.id[:12]} (exit_code={exit_code})",
@@ -397,11 +357,10 @@ class DockerOnlyExecutor:
                     "error": container_state.get('Error', ''),
                     "oom_killed": container_state.get('OOMKilled', False),
                     "stdout_lines": len(combined_logs.splitlines()) if combined_logs else 0,
-                    "stderr_lines": 0  # We merged streams; Docker doesn't split by default
+                    "stderr_lines": 0
                 }
             )
             
-            # If non-zero, log previews
             if exit_code != 0:
                 logger.error(
                     f"Container failed with exit code {exit_code}. "
@@ -416,7 +375,6 @@ class DockerOnlyExecutor:
                 if combined_logs:
                     logger.info(f"Container combined logs:\n{combined_logs}")
             
-            # We return combined logs as stdout, keep stderr empty (consistent with current behavior)
             return exit_code, combined_logs or "", ""
             
         except asyncio.TimeoutError:
@@ -450,7 +408,7 @@ class DockerOnlyExecutor:
         container_name: str
     ) -> Dict:
         """
-        Build Docker container configuration.
+        Build Docker container configuration
         
         Args:
             image_id: Docker image ID
@@ -463,7 +421,6 @@ class DockerOnlyExecutor:
         Returns:
             Dictionary with container configuration
         """
-        # Prepare environment variables
         env_vars = {
             'PHASE': phase,
             'JOB_ID': job.job_id,
@@ -471,7 +428,6 @@ class DockerOnlyExecutor:
             'OUTPUT_S3_PATH': job.output_s3_path,
         }
         
-        # Add GPU assignment
         if job.assigned_gpus:
             env_vars['CUDA_VISIBLE_DEVICES'] = ','.join(
                 str(gpu) for gpu in job.assigned_gpus
@@ -479,12 +435,10 @@ class DockerOnlyExecutor:
         else:
             env_vars['CUDA_VISIBLE_DEVICES'] = ''
         
-        # Add custom environment variables
         env_vars.update(job.custom_env_vars or {})
         
-        # Prepare command
         command = [
-            'python3', 'inference.py',  # Changed from 'python' to 'python3'
+            'python3', 'inference.py', 
             '--phase', phase,
             '--input', '/input',
             '--output', '/output'
@@ -497,35 +451,29 @@ class DockerOnlyExecutor:
                 "phase": phase,
                 "working_dir": '/app',
                 "user": 'root',
-                "network_mode": "TBD"  # Will be determined below
+                "network_mode": "TBD"
             }
         )
         
-        # Network mode
         network_mode = 'host' if network_enabled else 'none'
         
-        # For inference, always block network
         if phase == "inference":
             network_mode = 'none'
         
-        # Resource limits
         mem_limit = f"{self.config.execution.memory_limit_gb}g"
         nano_cpus = int(self.config.execution.cpu_limit * 1e9)
         
         model_cache_dir = work_dir / 'models'
         model_cache_dir.mkdir(parents=True, exist_ok=True)
         
-        # Volumes
         volumes = {
             str(work_dir / 'input'): {'bind': '/input', 'mode': 'ro'},
             str(work_dir / 'output'): {'bind': '/output', 'mode': 'rw'},
             str(model_cache_dir): {'bind': '/app/models', 'mode': 'rw'},
         }
         
-        # Security options
         security_opt = ['no-new-privileges']
         
-        # Capabilities to drop
         cap_drop = self.config.security.drop_capabilities or [
             'CAP_SYS_ADMIN',
             'CAP_NET_ADMIN',
@@ -534,7 +482,6 @@ class DockerOnlyExecutor:
             'CAP_SYS_RAWIO',
         ]
         
-        # Build configuration
         config = {
             'image': image_id,
             'name': container_name,
@@ -545,14 +492,13 @@ class DockerOnlyExecutor:
             #'nano_cpus': nano_cpus,
             'volumes': volumes,
             'working_dir': '/app',
-            'user': 'root',  # Run as root (adjust as needed)
+            'user': 'root',
             'detach': True,
-            'auto_remove': False,  # Don't auto-remove, we need logs
+            'auto_remove': False,
             'security_opt': security_opt,
             'cap_drop': cap_drop,
         }
         
-        # Add GPU support if GPUs are assigned
         if job.assigned_gpus:
             config['device_requests'] = [
                 docker.types.DeviceRequest(
@@ -560,16 +506,12 @@ class DockerOnlyExecutor:
                     capabilities=[['gpu', 'compute', 'utility']]
                 )
             ]
-            # Use nvidia runtime for GPU
             config['runtime'] = 'nvidia'
         
-        # PID limit (prevent fork bombs)
         config['pids_limit'] = self.config.execution.max_processes
         
-        # Read-only root filesystem (if enabled)
         if self.config.security.readonly_rootfs:
             config['read_only'] = True
-            # Add tmpfs for directories that need write access
             config['tmpfs'] = {
                 '/tmp': 'rw,noexec,nosuid,size=1g',
                 '/var/tmp': 'rw,noexec,nosuid,size=1g'
@@ -583,7 +525,7 @@ class DockerOnlyExecutor:
         timeout_seconds: int
     ) -> int:
         """
-        Wait for container to finish with timeout.
+        Wait for container to finish with timeout
         
         Args:
             container: Docker container object
@@ -598,7 +540,6 @@ class DockerOnlyExecutor:
         start_time = time.time()
         
         while True:
-            # Check if timeout exceeded
             elapsed = time.time() - start_time
             if elapsed > timeout_seconds:
                 logger.warning(
@@ -607,13 +548,11 @@ class DockerOnlyExecutor:
                 )
                 raise asyncio.TimeoutError()
             
-            # Reload container status
             await asyncio.get_event_loop().run_in_executor(
                 None,
                 container.reload
             )
             
-            # Check if container is still running
             if container.status != 'running':
                 exit_code = container.attrs['State']['ExitCode']
                 logger.debug(
@@ -622,12 +561,11 @@ class DockerOnlyExecutor:
                 )
                 return exit_code
             
-            # Sleep before next check
             await asyncio.sleep(1)
     
     async def _get_container_logs(self, container) -> Tuple[str, str]:
         """
-        Get container stdout and stderr logs.
+        Get container stdout and stderr logs
         
         Args:
             container: Docker container object
@@ -644,8 +582,6 @@ class DockerOnlyExecutor:
                 ).decode('utf-8', errors='replace')
             )
             
-            # Docker doesn't separate stdout/stderr by default
-            # We'll return all logs as stdout for simplicity
             return logs, ""
             
         except Exception as e:
@@ -654,7 +590,7 @@ class DockerOnlyExecutor:
     
     async def _kill_container(self, container):
         """
-        Kill a running container.
+        Kill a running container
         
         Args:
             container: Docker container object
@@ -686,7 +622,7 @@ class DockerOnlyExecutor:
         timeout_seconds: int = 3600
     ) -> str:
         """
-        Build Docker image from repository with real-time log streaming.
+        Build Docker image from repository with real-time log streaming
         
         Args:
             repo_path: Path to repository directory
@@ -703,21 +639,17 @@ class DockerOnlyExecutor:
         
         logger.info(f"Building Docker image: {image_tag}")
         
-        # Initialize build log display with 10 lines
-        display = BuildLogDisplay(box_lines=10)
+        display = BuildLogDisplay(box_lines=50)
         
         try:
-            # Check if Dockerfile exists
             dockerfile_path = repo_path / 'Dockerfile'
             if not dockerfile_path.exists():
                 raise DockerExecutionError("Dockerfile not found")
             
-            # Start the display
             display.start()
             
-            # Build image with streaming logs
             def build_with_logs():
-                """Execute build and return generator."""
+                """Execute build and return generator"""
                 return self.docker_client.api.build(
                     path=str(repo_path),
                     tag=image_tag,
@@ -727,14 +659,12 @@ class DockerOnlyExecutor:
                     timeout=timeout_seconds
                 )
             
-            # Get build generator
             build_generator = await asyncio.get_event_loop().run_in_executor(None, build_with_logs)
             
             await _stream_docker_logs(build_generator, display)
             
             display.end("✅ BUILD COMPLETE")
             
-            # Get the built image
             image = self.docker_client.images.get(image_tag)
             
             logger.info(
@@ -751,110 +681,10 @@ class DockerOnlyExecutor:
             display.end()
             logger.error(f"Unexpected build error: {e}")
             raise DockerExecutionError(f"Build failed: {e}")
-    
-    async def build_image_from_requirements(
-        self,
-        repo_path: Path,
-        job_id: str,
-        base_image: str = "python:3.11-slim"
-    ) -> str:
-        """
-        Build Docker image from requirements.txt (no Dockerfile) with streaming logs.
         
-        Args:
-            repo_path: Path to repository directory
-            job_id: Job identifier for tagging
-            base_image: Base Docker image to use
-            
-        Returns:
-            Docker image ID
-            
-        Raises:
-            DockerExecutionError: If build fails
-        """
-        image_tag = f"sandbox-job-{job_id}"
-        
-        logger.info(f"Building Docker image from requirements: {image_tag}")
-        
-        # Initialize build log display
-        display = BuildLogDisplay(box_lines=10)
-        
-        # Create temporary Dockerfile
-        dockerfile_content = f"""
-FROM {base_image}
-
-# Set working directory
-WORKDIR /app
-
-# Copy repository contents
-COPY . /app/
-
-# Install requirements
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Set user
-USER root
-
-# Entry point
-CMD ["python3", "inference.py"]
-"""
-        
-        temp_dockerfile = repo_path / 'Dockerfile.generated'
-        try:
-            temp_dockerfile.write_text(dockerfile_content)
-            
-            # Start the display
-            display.start()
-            
-            # Build image with streaming logs
-            def build_with_logs():
-                """Execute build and return generator."""
-                return self.docker_client.api.build(
-                    path=str(repo_path),
-                    dockerfile='Dockerfile.generated',
-                    tag=image_tag,
-                    rm=True,
-                    forcerm=True,
-                    decode=True
-                )
-            
-            # Get build generator
-            build_generator = await asyncio.get_event_loop().run_in_executor(
-                None,
-                build_with_logs
-            )
-            
-            # Stream logs to display
-            await _stream_docker_logs(build_generator, display)
-            
-            # End display
-            display.end()
-            
-            # Get the built image
-            image = self.docker_client.images.get(image_tag)
-            
-            logger.info(
-                f"Docker image built from requirements: {image.id[:12]}"
-            )
-            
-            return image.id
-            
-        except DockerException as e:
-            display.end()
-            logger.error(f"Docker build from requirements failed: {e}")
-            raise DockerExecutionError(f"Docker build failed: {e}")
-        except Exception as e:
-            display.end()
-            logger.error(f"Unexpected build error: {e}")
-            raise DockerExecutionError(f"Build failed: {e}")
-        finally:
-            # Clean up temporary Dockerfile
-            if temp_dockerfile.exists():
-                temp_dockerfile.unlink()
-    
     async def remove_image(self, image_id: str):
         """
-        Remove a Docker image.
+        Remove a Docker image
         
         Args:
             image_id: Docker image ID
@@ -874,8 +704,7 @@ CMD ["python3", "inference.py"]
     
     async def inspect_image_for_command(self, image_id: str) -> Dict:
         """
-        Inspect an image to verify the command/entrypoint configuration.
-        Useful for debugging command execution issues.
+        Inspect an image to verify the command/entrypoint configuration
         
         Args:
             image_id: Docker image ID
@@ -924,8 +753,7 @@ CMD ["python3", "inference.py"]
         image_id: str,
     ) -> Dict:
         """
-        Run diagnostic commands in a container to verify the environment.
-        Useful for debugging 'command not found' errors (exit code 127).
+        Run diagnostic commands in a container to verify the environment
         
         Args:
             image_id: Docker image ID
@@ -968,7 +796,7 @@ CMD ["python3", "inference.py"]
     
     def is_available(self) -> bool:
         """
-        Check if Docker is available.
+        Check if Docker is available
         
         Returns:
             True if Docker daemon is accessible

@@ -37,15 +37,11 @@ Secure GPU execution service for Bittensor subnet miners with multi-layer securi
 ### Installation
 
 ```bash
-# Clone repository
 git clone <repository-url>
 cd sandbox_runner
 
-# Run setup script
 bash setup.sh
 
-# Or manual setup:
-make setup-all
 ```
 
 ### Configuration
@@ -93,42 +89,11 @@ storage:
 
 #### Local Development
 ```bash
-# Activate virtual environment
 source venv/bin/activate
-
-# Run with default config
 python3 main.py
-
-# Run with custom config
 python3 main.py --config config.local.yaml --log-level DEBUG
 ```
 
-#### Docker
-```bash
-# Build image
-make docker-build
-
-# Run container
-make docker-run
-
-# Or use docker-compose
-docker-compose up -d
-```
-
-#### System Service
-```bash
-# Install as systemd service
-sudo make install-service
-
-# Start service
-sudo systemctl start sandbox-runner
-
-# Check status
-sudo systemctl status sandbox-runner
-
-# View logs
-sudo journalctl -u sandbox-runner -f
-```
 
 ## Architecture
 
@@ -258,132 +223,3 @@ Available at `http://localhost:9090/metrics`:
 ```bash
 curl https://localhost:8443/health
 ```
-
-## Development
-
-### Running Tests
-
-```bash
-# All tests
-make test
-
-# Integration tests only
-make test-integration
-
-# With coverage
-pytest --cov=. --cov-report=html
-```
-
-### Code Quality
-
-```bash
-# Linting
-make lint
-
-# Formatting
-make format
-
-# Type checking
-mypy .
-```
-
-### Debug Mode
-
-```bash
-# Run with debug logging
-python3 main.py --log-level DEBUG
-
-# Interactive Docker shell
-make docker-run-dev
-```
-
-## Security Considerations
-
-### Production Deployment
-
-1. **SSL Certificates**: Replace self-signed certs with proper CA-signed certificates
-2. **API Keys**: Use secure random keys, rotate regularly
-3. **Epistula**: Configure validator public keys properly
-4. **Network**: Use firewall rules to restrict access
-5. **Monitoring**: Enable Falco for runtime security monitoring
-
-### Attack Surface Reduction
-
-- Containers run as `nobody` user (UID 65534)
-- Capabilities dropped (CAP_SYS_ADMIN, CAP_NET_ADMIN, etc.)
-- Read-only root filesystem where possible
-- Seccomp profiles limit available syscalls
-- Network completely blocked during inference
-
-## Troubleshooting
-
-### Docker Not Available
-
-```bash
-# Check Docker status
-sudo systemctl status docker
-
-# Add user to docker group
-sudo usermod -aG docker $USER
-
-# Restart Docker
-sudo systemctl restart docker
-```
-
-### gVisor Not Working
-
-```bash
-# Check runsc
-runsc --version
-
-# Verify Docker runtime
-docker info | grep -i runtime
-
-# Test gVisor container
-docker run --runtime=runsc hello-world
-```
-
-### GPU Not Detected
-
-```bash
-# Check NVIDIA driver
-nvidia-smi
-
-# Check Docker GPU support
-docker run --gpus all nvidia/cuda:12.0-base nvidia-smi
-
-# Install nvidia-docker2
-sudo apt-get install -y nvidia-docker2
-sudo systemctl restart docker
-```
-
-### cgroups Issues
-
-```bash
-# Check cgroups version
-mount | grep cgroup
-
-# Enable cgroups v2 (if needed)
-sudo grub2-editconfig
-# Add: systemd.unified_cgroup_hierarchy=1
-
-# Reboot
-sudo reboot
-```
-
-## Performance Tuning
-
-### GPU Scheduling
-- Adjust `starvation_threshold_seconds` in scheduler for large job fairness
-- Use priority levels (0-10) to prioritize important jobs
-- Monitor queue depth per weight class
-
-### Resource Limits
-- Tune `cpu_limit` and `memory_limit_gb` per job requirements
-- Adjust `max_processes` to prevent fork bombs
-- Set appropriate timeouts for prep and inference phases
-
-### Network Performance
-- For prep phase, ensure high bandwidth for model downloads
-- Consider caching commonly used models
-- Use S3 transfer acceleration for faster uploads/downloads

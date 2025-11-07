@@ -1,7 +1,6 @@
 """
 Executor Module
 
-Main executor class that coordinates job execution lifecycle:
 1. Repository cloning
 2. Docker image building
 3. Input data download
@@ -10,7 +9,7 @@ Main executor class that coordinates job execution lifecycle:
 6. Output data upload
 7. Cleanup
 
-Supports multiple execution modes with fallback chain:
+multiple execution modes with fallback chain:
 - docker+gvisor (most secure)
 - docker (secure)
 - direct (fallback)
@@ -19,7 +18,6 @@ Supports multiple execution modes with fallback chain:
 import asyncio
 import logging
 import shutil
-import subprocess
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, Dict
@@ -31,9 +29,9 @@ from config import Config
 from utils.s3 import S3Manager, S3TransferError
 from utils.validation import RepositoryValidator, ValidationError
 from security.network import NetworkPolicy
-from execution.docker_gvisor import DockerGVisorExecutor, DockerExecutionError as GVisorError
-from execution.docker_only import DockerOnlyExecutor, DockerExecutionError
-from execution.direct import DirectExecutor, DirectExecutionError
+from execution.docker_gvisor import DockerGVisorExecutor
+from execution.docker_only import DockerOnlyExecutor
+from execution.direct import DirectExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -45,17 +43,15 @@ class ExecutorError(Exception):
 
 class Executor:
     """
-    Main executor that orchestrates job execution.
+    Main executor that orchestrates job execution
     
-    Job Lifecycle:
-    CLONING → BUILDING → PREP → INFERENCE → COMPLETED/FAILED
-    
-    Each phase has specific timeout and resource requirements.
+    lifecycle:
+    CLONING → BUILDING → PREP → INFERENCE → COMPLETED/FAILED    
     """
     
     def __init__(self, config: Config, gpu_pool: GPUPoolManager):
         """
-        Initialize executor with configuration and dependencies.
+        Initialize executor with configuration and dependencies
         
         Args:
             config: Application configuration
@@ -64,18 +60,15 @@ class Executor:
         self.config = config
         self.gpu_pool = gpu_pool
         
-        # Initialize components
         self.s3_manager = S3Manager(config.storage)
         self.validator = RepositoryValidator(config.execution.allowed_repo_hosts)
         self.network_policy = NetworkPolicy(config.security.network_policy)
         
-        # Initialize execution modes with fallback chain
         self.execution_mode = config.execution.mode
         self.fallback_enabled = config.execution.fallback_on_error
         
         self._init_executors()
         
-        # Track active jobs with execution tasks
         self._active_jobs: Dict[str, Job] = {}
         self._job_tasks: Dict[str, asyncio.Task] = {}  # job_id -> execution task
         
@@ -90,10 +83,8 @@ class Executor:
         self.docker_executor = None
         self.direct_executor = None
         
-        # Try to initialize each executor
         if "gvisor" in self.execution_mode:
             try:
-                from execution.docker_gvisor import DockerGVisorExecutor
                 self.docker_gvisor_executor = DockerGVisorExecutor(self.config)
                 if self.docker_gvisor_executor.is_available():
                     logger.info("Docker+gVisor executor available")
@@ -103,7 +94,6 @@ class Executor:
             except Exception as e:
                 logger.warning(f"Failed to initialize gVisor executor: {e}")
         
-        # Always initialize Docker-only executor
         try:
             self.docker_executor = DockerOnlyExecutor(self.config)
             if self.docker_executor.is_available():
@@ -114,7 +104,6 @@ class Executor:
         except Exception as e:
             logger.warning(f"Failed to initialize Docker executor: {e}")
         
-        # Initialize direct executor as last resort
         try:
             self.direct_executor = DirectExecutor(self.config)
             logger.info("Direct executor available")
@@ -136,14 +125,11 @@ class Executor:
         job_id = job.job_id
         logger.info(f"Starting job execution: {job_id}")
         
-        # Track job as active
-        self._active_jobs[job_id] = job
-        
-        # Create temporary work directory
+        self._active_jobs[job_id] = job        
         work_dir = Path(tempfile.mkdtemp(prefix=f"job_{job_id}_"))
         
         try:
-            # Phase 1: Clone repository
+            # Clone repository
             job.status = JobStatus.CLONING
             job.current_phase = "cloning"
             job.progress_percentage = 10.0
@@ -171,18 +157,18 @@ class Executor:
             # Validate repository
             self.validator.validate_all(work_dir_path, job.repo_url)
             
-            # Phase 2: Build Docker image
+            # Build Docker image
             job.status = JobStatus.BUILDING
             job.current_phase = "building"
             job.progress_percentage = 30.0
             image_id = await self._build_docker_image(job, work_dir_path)
             
-            # Phase 3: Download input data
+            # Download input data
             job.current_phase = "downloading_input"
             job.progress_percentage = 45.0
             await self._download_input_data(job, work_dir)
             
-            # Phase 4: Run prep phase
+            # Run prep phase
             job.status = JobStatus.PREP
             job.current_phase = "prep"
             job.progress_percentage = 50.0
@@ -191,7 +177,7 @@ class Executor:
             if not prep_success:
                 raise ExecutorError("Prep phase failed")
             
-            # Phase 5: Run inference phase
+            # Run inference phase
             job.status = JobStatus.INFERENCE
             job.current_phase = "inference"
             job.progress_percentage = 75.0
@@ -200,12 +186,11 @@ class Executor:
             if not inference_success:
                 raise ExecutorError("Inference phase failed")
             
-            # Phase 6: Upload output data
+            # Upload output data
             job.current_phase = "uploading_output"
             job.progress_percentage = 90.0
             await self._upload_output_data(job, work_dir)
             
-            # Job completed successfully
             job.status = JobStatus.COMPLETED
             job.completed_at = datetime.utcnow()
             job.progress_percentage = 100.0
@@ -248,7 +233,7 @@ class Executor:
     
     async def _clone_repository(self, job: Job, work_dir: Path) -> Path:
         """
-        Clone Git repository.
+        Clone Git repository
         
         Args:
             job: Job object with repository information
@@ -264,21 +249,18 @@ class Executor:
         
         logger.info(f"Cloning repository: {job.repo_url}")
         
-        # Build git clone command
         clone_cmd = [
             "git", "clone",
-            "--depth", "1",  # Shallow clone for speed
+            "--depth", "1",
             "--branch", job.repo_branch,
         ]
         
         if job.repo_commit:
-            # If specific commit requested, do full clone then checkout
             clone_cmd = ["git", "clone", job.repo_url, str(repo_path)]
         else:
             clone_cmd.extend([job.repo_url, str(repo_path)])
         
         try:
-            # Run git clone with timeout
             process = await asyncio.create_subprocess_exec(
                 *clone_cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -294,7 +276,6 @@ class Executor:
                 error_msg = stderr.decode() if stderr else "Unknown error"
                 raise ExecutorError(f"Git clone failed: {error_msg}")
             
-            # If specific commit requested, checkout that commit
             if job.repo_commit:
                 checkout_cmd = ["git", "checkout", job.repo_commit]
                 process = await asyncio.create_subprocess_exec(
@@ -326,7 +307,7 @@ class Executor:
     
     async def _build_docker_image(self, job: Job, repo_path: Path) -> str:
         """
-        Build Docker image from repository.
+        Build Docker image from repository
         
         Args:
             job: Job object
@@ -357,7 +338,7 @@ class Executor:
     
     async def _download_input_data(self, job: Job, work_dir: Path):
         """
-        Download input data from S3.
+        Download input data from S3
         
         Args:
             job: Job object with S3 paths
@@ -376,14 +357,12 @@ class Executor:
         logger.info(f"Downloading input data from {job.input_s3_path}")
         
         try:
-            # Try directory download first, fall back to single file
             success = await self.s3_manager.download_directory(
                 s3_prefix=job.input_s3_path,
                 local_dir=input_dir
             )
             
             if not success:
-                # Try as single file
                 success = await self.s3_manager.download_input_data(
                     s3_path=job.input_s3_path,
                     local_path=input_dir / "input_data"
@@ -404,7 +383,7 @@ class Executor:
         work_dir: Path
     ) -> bool:
         """
-        Run prep phase with internet access.
+        Run prep phase with internet access
         
         Args:
             job: Job object
@@ -538,7 +517,7 @@ class Executor:
         image_id: Optional[str] = None
     ):
         """
-        Clean up job resources.
+        Clean up job resources
         
         Args:
             job: Job object
@@ -548,12 +527,10 @@ class Executor:
         logger.info(f"Cleaning up job {job.job_id}")
         
         try:
-            # Remove work directory
             if work_dir.exists():
                 shutil.rmtree(work_dir, ignore_errors=True)
                 logger.debug(f"Removed work directory: {work_dir}")
             
-            # Remove Docker image (if configured)
             if image_id:
                 executor = self._get_executor()
                 await executor.remove_image(image_id)
@@ -563,7 +540,7 @@ class Executor:
     
     def _get_executor(self):
         """
-        Get appropriate executor based on configuration and availability.
+        Get appropriate executor based on configuration and availability
         
         Returns:
             Executor instance
@@ -571,16 +548,13 @@ class Executor:
         Raises:
             ExecutorError: If no executor is available
         """
-        # Try preferred mode first
         if self.execution_mode == "docker+gvisor" and self.docker_gvisor_executor:
             return self.docker_gvisor_executor
         
-        # Fallback to docker-only if enabled
         if self.fallback_enabled and self.docker_executor:
             logger.warning("Falling back to docker-only mode")
             return self.docker_executor
         
-        # Fallback to direct execution if enabled
         if self.fallback_enabled and self.direct_executor:
             logger.warning("Falling back to direct execution mode")
             return self.direct_executor
@@ -589,7 +563,7 @@ class Executor:
     
     async def get_job_status(self, job_id: str) -> Optional[JobStatus]:
         """
-        Get status of an active job.
+        Get status of an active job
         
         Args:
             job_id: Job identifier
@@ -602,7 +576,7 @@ class Executor:
     
     async def get_job(self, job_id: str) -> Optional[Job]:
         """
-        Get active job object.
+        Get active job object
         
         Args:
             job_id: Job identifier
@@ -614,7 +588,7 @@ class Executor:
     
     async def cancel_job(self, job_id: str) -> bool:
         """
-        Cancel an active job.
+        Cancel an active job
         
         Args:
             job_id: Job identifier
@@ -628,12 +602,9 @@ class Executor:
         
         logger.info(f"Cancelling job: {job_id}")
         
-        # Mark as cancelled
         job.status = JobStatus.CANCELLED
         job.completed_at = datetime.utcnow()
         
-        # Cancel execution task if it exists
-        # The task cancellation will propagate to any running containers
         task = self._job_tasks.get(job_id)
         if task and not task.done():
             task.cancel()
@@ -648,7 +619,7 @@ class Executor:
     
     def get_active_jobs(self) -> Dict[str, Job]:
         """
-        Get all active jobs.
+        Get all active jobs
         
         Returns:
             Dictionary of job_id to Job object

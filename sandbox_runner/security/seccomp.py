@@ -25,16 +25,16 @@ logger = logging.getLogger(__name__)
 
 
 class SeccompError(Exception):
-    """Raised when seccomp operation fails."""
+    """Raised when seccomp operation fails"""
     pass
 
 
 class SeccompProfile:
     """
-    Represents a seccomp filter profile.
+    Represents a seccomp filter profile
     
     A profile defines which system calls are allowed/denied
-    and what action to take for denied calls.
+    and what action to take for denied calls
     """
     
     def __init__(
@@ -44,7 +44,7 @@ class SeccompProfile:
         blocked_syscalls: Optional[List[str]] = None
     ):
         """
-        Initialize seccomp profile.
+        Initialize seccomp profile
         
         Args:
             default_action: Default action for syscalls
@@ -57,7 +57,7 @@ class SeccompProfile:
     
     def to_docker_seccomp(self) -> Dict:
         """
-        Convert profile to Docker seccomp format.
+        Convert profile to Docker seccomp format
         
         Returns:
             Dictionary in Docker seccomp JSON format
@@ -72,14 +72,12 @@ class SeccompProfile:
             "syscalls": []
         }
         
-        # Add allowed syscalls
         if self.allowed_syscalls:
             profile["syscalls"].append({
                 "names": self.allowed_syscalls,
                 "action": "SCMP_ACT_ALLOW"
             })
         
-        # Add blocked syscalls
         if self.blocked_syscalls:
             profile["syscalls"].append({
                 "names": self.blocked_syscalls,
@@ -90,7 +88,7 @@ class SeccompProfile:
     
     def save_to_file(self, path: Path):
         """
-        Save profile to JSON file.
+        Save profile to JSON file
         
         Args:
             path: Path to save profile
@@ -105,55 +103,43 @@ class SeccompProfile:
 
 class SeccompManager:
     """
-    Manager for seccomp syscall filtering.
+    Manager for seccomp syscall filtering
     
     Provides high-level interface for creating and managing seccomp profiles
-    for sandboxed execution.
+    for sandboxed execution
     """
     
-    # Common dangerous syscalls to block
     DANGEROUS_SYSCALLS = [
-        # Kernel module operations
         "init_module",
         "finit_module",
         "delete_module",
         
-        # Mount operations
         "mount",
         "umount",
         "umount2",
         "pivot_root",
         
-        # System time
         "settimeofday",
         "clock_settime",
         
-        # Reboot
         "reboot",
         
-        # Raw I/O
         "iopl",
         "ioperm",
         
-        # Kernel keyring (potentially dangerous)
         "add_key",
         "request_key",
         "keyctl",
         
-        # BPF operations
         "bpf",
         
-        # Performance monitoring
         "perf_event_open",
         
-        # User namespace (can be used for privilege escalation)
         "unshare",
         "setns",
     ]
     
-    # Essential syscalls that should always be allowed
     ESSENTIAL_SYSCALLS = [
-        # File operations
         "read",
         "write",
         "open",
@@ -167,21 +153,18 @@ class SeccompManager:
         "readlink",
         "readlinkat",
         
-        # Directory operations
         "getdents",
         "getdents64",
         "mkdir",
         "mkdirat",
         "rmdir",
         
-        # Memory management
         "mmap",
         "munmap",
         "mprotect",
         "brk",
         "mremap",
         
-        # Process management
         "clone",
         "fork",
         "vfork",
@@ -192,19 +175,16 @@ class SeccompManager:
         "wait4",
         "waitid",
         
-        # Signals
         "rt_sigaction",
         "rt_sigprocmask",
         "rt_sigreturn",
         "sigaltstack",
         
-        # Time
         "gettimeofday",
         "clock_gettime",
         "clock_getres",
         "nanosleep",
         
-        # Misc
         "getpid",
         "getuid",
         "getgid",
@@ -223,24 +203,21 @@ class SeccompManager:
     ]
     
     def __init__(self):
-        """Initialize seccomp manager."""
+        """Initialize seccomp manager"""
         self.profiles: Dict[str, SeccompProfile] = {}
         
-        # Create default profiles
         self._create_default_profiles()
         
         logger.info("Seccomp manager initialized")
     
     def _create_default_profiles(self):
-        """Create default seccomp profiles."""
+        """Create default seccomp profiles"""
         
-        # Strict profile: Only essential syscalls allowed
         self.profiles['strict'] = SeccompProfile(
             default_action="SCMP_ACT_ERRNO",
             allowed_syscalls=self.ESSENTIAL_SYSCALLS
         )
         
-        # Moderate profile: Essential + some extras, block dangerous
         moderate_allowed = self.ESSENTIAL_SYSCALLS + [
             "socket",
             "connect",
@@ -276,7 +253,6 @@ class SeccompManager:
             blocked_syscalls=self.DANGEROUS_SYSCALLS
         )
         
-        # Permissive profile: Block only the most dangerous syscalls
         self.profiles['permissive'] = SeccompProfile(
             default_action="SCMP_ACT_ALLOW",
             blocked_syscalls=self.DANGEROUS_SYSCALLS
@@ -286,7 +262,7 @@ class SeccompManager:
     
     def get_profile(self, name: str) -> Optional[SeccompProfile]:
         """
-        Get a seccomp profile by name.
+        Get a seccomp profile by name
         
         Args:
             name: Profile name ('strict', 'moderate', 'permissive')
@@ -304,7 +280,7 @@ class SeccompManager:
         blocked_syscalls: Optional[List[str]] = None
     ) -> SeccompProfile:
         """
-        Create a custom seccomp profile.
+        Create a custom seccomp profile
         
         Args:
             name: Profile name
@@ -329,7 +305,7 @@ class SeccompManager:
     
     def load_profile_from_file(self, path: Path, name: str) -> SeccompProfile:
         """
-        Load seccomp profile from JSON file.
+        Load seccomp profile from JSON file
         
         Args:
             path: Path to JSON profile file
@@ -345,7 +321,6 @@ class SeccompManager:
             with open(path, 'r') as f:
                 profile_dict = json.load(f)
             
-            # Extract syscalls
             allowed_syscalls = []
             blocked_syscalls = []
             
@@ -376,7 +351,7 @@ class SeccompManager:
     
     def save_profile(self, name: str, path: Path):
         """
-        Save a seccomp profile to file.
+        Save a seccomp profile to file
         
         Args:
             name: Profile name
@@ -396,7 +371,7 @@ class SeccompManager:
     
     def get_docker_seccomp_config(self, profile_name: str) -> Optional[Dict]:
         """
-        Get Docker seccomp configuration for a profile.
+        Get Docker seccomp configuration for a profile
         
         Args:
             profile_name: Name of profile to use
@@ -417,7 +392,7 @@ class SeccompManager:
         syscall_name: str
     ) -> bool:
         """
-        Check if a syscall is allowed by a profile.
+        Check if a syscall is allowed by a profile
         
         Args:
             profile_name: Profile name
@@ -430,20 +405,17 @@ class SeccompManager:
         if not profile:
             return False
         
-        # Check explicitly blocked
         if syscall_name in profile.blocked_syscalls:
             return False
         
-        # Check explicitly allowed
         if syscall_name in profile.allowed_syscalls:
             return True
         
-        # Check default action
         return profile.default_action == "SCMP_ACT_ALLOW"
     
     def get_profile_summary(self, profile_name: str) -> Dict:
         """
-        Get a summary of a seccomp profile.
+        Get a summary of a seccomp profile
         
         Args:
             profile_name: Profile name
@@ -460,13 +432,13 @@ class SeccompManager:
             "default_action": profile.default_action,
             "allowed_syscalls_count": len(profile.allowed_syscalls),
             "blocked_syscalls_count": len(profile.blocked_syscalls),
-            "allowed_syscalls": profile.allowed_syscalls[:10],  # First 10
-            "blocked_syscalls": profile.blocked_syscalls[:10],  # First 10
+            "allowed_syscalls": profile.allowed_syscalls[:10],  
+            "blocked_syscalls": profile.blocked_syscalls[:10],
         }
     
     def list_profiles(self) -> List[str]:
         """
-        List available seccomp profiles.
+        List available seccomp profiles
         
         Returns:
             List of profile names
@@ -475,7 +447,7 @@ class SeccompManager:
     
     def validate_syscall_list(self, syscalls: List[str]) -> Dict:
         """
-        Validate a list of syscalls.
+        Validate a list of syscalls
         
         Args:
             syscalls: List of syscall names to validate
@@ -483,8 +455,7 @@ class SeccompManager:
         Returns:
             Dictionary with validation results
         """
-        # This is a simplified validation
-        # In production, we'd check against the actual syscall table
+        # TODO: check against the actual syscall table
         
         valid = []
         unknown = []
@@ -496,7 +467,6 @@ class SeccompManager:
             elif syscall in self.ESSENTIAL_SYSCALLS:
                 valid.append(syscall)
             else:
-                # Could be valid but not in our lists
                 unknown.append(syscall)
         
         return {

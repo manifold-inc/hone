@@ -6,9 +6,6 @@ Provides control over system resources for containers and processes:
 - Memory limits (RAM usage)
 - PID limits (prevent fork bombs)
 - I/O limits (disk bandwidth)
-
-cgroups v2 (unified hierarchy) is used for modern Linux systems.
-Falls back gracefully if cgroups are not available.
 """
 
 import logging
@@ -20,13 +17,13 @@ logger = logging.getLogger(__name__)
 
 
 class CgroupError(Exception):
-    """Raised when cgroup operation fails."""
+    """Raised when cgroup operation fails"""
     pass
 
 
 class CgroupManager:
     """
-    Manager for cgroups v2 resource control.
+    Manager for cgroups v2 resource control
     
     Provides high-level interface for:
     - Creating cgroups for jobs
@@ -40,7 +37,7 @@ class CgroupManager:
     
     def __init__(self):
         """
-        Initialize cgroup manager.
+        Initialize cgroup manager
         
         Raises:
             CgroupError: If cgroups v2 is not available
@@ -48,12 +45,10 @@ class CgroupManager:
         self.cgroup_root = self.CGROUP_ROOT
         self.sandbox_root = self.cgroup_root / self.SANDBOX_PREFIX
         
-        # Check if cgroups v2 is available
         if not self._is_cgroup_v2_available():
             logger.warning("cgroups v2 not available")
             raise CgroupError("cgroups v2 not available")
         
-        # Create sandbox root cgroup if it doesn't exist
         try:
             self._ensure_sandbox_root()
         except Exception as e:
@@ -64,23 +59,20 @@ class CgroupManager:
     
     def _is_cgroup_v2_available(self) -> bool:
         """
-        Check if cgroups v2 (unified hierarchy) is available.
+        Check if cgroups v2 (unified hierarchy) is available
         
         Returns:
             True if cgroups v2 is available
         """
-        # Check if cgroup mount point exists
         if not self.cgroup_root.exists():
             logger.warning(f"cgroup root not found: {self.cgroup_root}")
             return False
         
-        # Check for cgroup.controllers (v2 marker)
         controllers_file = self.cgroup_root / "cgroup.controllers"
         if not controllers_file.exists():
             logger.warning("cgroup.controllers not found (v2 required)")
             return False
         
-        # Check available controllers
         try:
             controllers = controllers_file.read_text().strip().split()
             required = ['cpu', 'memory', 'pids']
@@ -98,7 +90,7 @@ class CgroupManager:
     
     def _ensure_sandbox_root(self):
         """
-        Ensure sandbox root cgroup exists.
+        Ensure sandbox root cgroup exists
         
         Creates /sys/fs/cgroup/sandbox if it doesn't exist.
         """
@@ -109,7 +101,6 @@ class CgroupManager:
             except Exception as e:
                 raise CgroupError(f"Failed to create sandbox root: {e}")
         
-        # Enable required controllers for sandbox subtree
         try:
             subtree_control = self.sandbox_root / "cgroup.subtree_control"
             controllers = "+cpu +memory +pids +io"
@@ -126,7 +117,7 @@ class CgroupManager:
         pid_limit: Optional[int] = None
     ) -> Path:
         """
-        Create a new cgroup with resource limits.
+        Create a new cgroup with resource limits
         
         Args:
             name: Cgroup name (should be unique per job)
@@ -143,7 +134,6 @@ class CgroupManager:
         cgroup_path = self.sandbox_root / name
         
         try:
-            # Create cgroup directory
             if cgroup_path.exists():
                 logger.warning(f"cgroup already exists: {name}, removing it first")
                 await self.remove_cgroup(name)
@@ -151,15 +141,12 @@ class CgroupManager:
             cgroup_path.mkdir(parents=True, exist_ok=True)
             logger.info(f"Created cgroup: {name}")
             
-            # Set CPU limit
             if cpu_limit:
                 await self._set_cpu_limit(cgroup_path, cpu_limit)
             
-            # Set memory limit
             if memory_limit_gb:
                 await self._set_memory_limit(cgroup_path, memory_limit_gb)
             
-            # Set PID limit
             if pid_limit:
                 await self._set_pid_limit(cgroup_path, pid_limit)
             
@@ -176,16 +163,13 @@ class CgroupManager:
     
     async def _set_cpu_limit(self, cgroup_path: Path, cpu_cores: int):
         """
-        Set CPU limit for cgroup.
+        Set CPU limit for cgroup
         
         Args:
             cgroup_path: Path to cgroup
             cpu_cores: Number of CPU cores
         """
         try:
-            # cpu.max: "max period" format
-            # Set quota to (cores * 100000) and period to 100000 (100ms)
-            # This gives effective limit of N cores
             quota = cpu_cores * 100000
             period = 100000
             
@@ -200,21 +184,18 @@ class CgroupManager:
     
     async def _set_memory_limit(self, cgroup_path: Path, memory_gb: int):
         """
-        Set memory limit for cgroup.
+        Set memory limit for cgroup
         
         Args:
             cgroup_path: Path to cgroup
             memory_gb: Memory limit in GB
         """
         try:
-            # Convert GB to bytes
             memory_bytes = memory_gb * 1024 * 1024 * 1024
             
-            # Set memory.max
             memory_max_file = cgroup_path / "memory.max"
             memory_max_file.write_text(f"{memory_bytes}\n")
             
-            # Also set swap limit to 0 (no swap)
             memory_swap_file = cgroup_path / "memory.swap.max"
             if memory_swap_file.exists():
                 memory_swap_file.write_text("0\n")
@@ -227,7 +208,7 @@ class CgroupManager:
     
     async def _set_pid_limit(self, cgroup_path: Path, max_pids: int):
         """
-        Set PID limit for cgroup (prevent fork bombs).
+        Set PID limit for cgroup (prevent fork bombs)
         
         Args:
             cgroup_path: Path to cgroup
@@ -245,7 +226,7 @@ class CgroupManager:
     
     async def add_process_to_cgroup(self, cgroup_name: str, pid: int):
         """
-        Add a process to a cgroup.
+        Add a process to a cgroup
         
         Args:
             cgroup_name: Name of cgroup
@@ -260,7 +241,6 @@ class CgroupManager:
             raise CgroupError(f"cgroup not found: {cgroup_name}")
         
         try:
-            # Add PID to cgroup.procs
             cgroup_procs = cgroup_path / "cgroup.procs"
             cgroup_procs.write_text(f"{pid}\n")
             
@@ -272,7 +252,7 @@ class CgroupManager:
     
     async def get_cgroup_stats(self, cgroup_name: str) -> dict:
         """
-        Get current resource usage statistics for a cgroup.
+        Get current resource usage statistics for a cgroup
         
         Args:
             cgroup_name: Name of cgroup
@@ -288,7 +268,6 @@ class CgroupManager:
         stats = {}
         
         try:
-            # CPU usage
             cpu_stat = cgroup_path / "cpu.stat"
             if cpu_stat.exists():
                 cpu_data = {}
@@ -298,17 +277,14 @@ class CgroupManager:
                         cpu_data[key] = int(value)
                 stats['cpu'] = cpu_data
             
-            # Memory usage
             memory_current = cgroup_path / "memory.current"
             if memory_current.exists():
                 stats['memory_bytes'] = int(memory_current.read_text().strip())
             
-            # PID count
             pids_current = cgroup_path / "pids.current"
             if pids_current.exists():
                 stats['pids'] = int(pids_current.read_text().strip())
             
-            # Get list of PIDs in cgroup
             cgroup_procs = cgroup_path / "cgroup.procs"
             if cgroup_procs.exists():
                 pids = cgroup_procs.read_text().strip().split('\n')
@@ -321,7 +297,7 @@ class CgroupManager:
     
     async def remove_cgroup(self, cgroup_name: str):
         """
-        Remove a cgroup.
+        Remove a cgroup
         
         Args:
             cgroup_name: Name of cgroup to remove
@@ -333,7 +309,6 @@ class CgroupManager:
             return
         
         try:
-            # First, kill all processes in the cgroup
             cgroup_procs = cgroup_path / "cgroup.procs"
             if cgroup_procs.exists():
                 pids = cgroup_procs.read_text().strip().split('\n')
@@ -348,7 +323,6 @@ class CgroupManager:
                         except Exception as e:
                             logger.warning(f"Failed to kill process {pid_str}: {e}")
             
-            # Remove cgroup directory
             cgroup_path.rmdir()
             logger.info(f"Removed cgroup: {cgroup_name}")
             
@@ -358,10 +332,7 @@ class CgroupManager:
     
     async def cleanup_all_sandbox_cgroups(self):
         """
-        Remove all sandbox cgroups.
-        
-        WARNING: This will kill all processes in all sandbox cgroups!
-        Use with caution - typically only for shutdown.
+        Remove all sandbox cgroups        
         """
         if not self.sandbox_root.exists():
             return
@@ -369,7 +340,6 @@ class CgroupManager:
         logger.warning("Cleaning up all sandbox cgroups")
         
         try:
-            # List all cgroups in sandbox root
             for cgroup_dir in self.sandbox_root.iterdir():
                 if cgroup_dir.is_dir():
                     try:
@@ -384,7 +354,7 @@ class CgroupManager:
     
     def is_available(self) -> bool:
         """
-        Check if cgroups v2 is available.
+        Check if cgroups v2 is available
         
         Returns:
             True if cgroups v2 is available

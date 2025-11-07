@@ -1,7 +1,5 @@
 """
-API Routes Module - Updated for Phase 2
-
-Integrates with Meta-Manager for job submission and status queries.
+API Routes Module
 """
 
 from typing import Optional, List
@@ -164,10 +162,6 @@ class RunnerStatus(BaseModel):
     execution_mode: str
 
 
-# ============================================================================
-# Dependency Functions
-# ============================================================================
-
 async def get_auth_manager(request: Request) -> AuthenticationManager:
     """Get authentication manager from app state."""
     return request.app.state.auth_manager
@@ -215,10 +209,6 @@ async def authenticate_request(
     return validator_id, auth_method
 
 
-# ============================================================================
-# Router Creation
-# ============================================================================
-
 def create_router(config: Config) -> APIRouter:
     """Create and configure the API router."""
     router = APIRouter()
@@ -246,7 +236,6 @@ def create_router(config: Config) -> APIRouter:
             }
         )
         
-        # Prepare job submission request
         job_request = {
             "repo_url": str(request.repo_url),
             "repo_branch": request.repo_branch,
@@ -261,7 +250,6 @@ def create_router(config: Config) -> APIRouter:
             "custom_env_vars": request.custom_env_vars
         }
         
-        # Submit to meta-manager
         response = await meta_manager.submit_job(job_request)
         
         return JobSubmitResponse(

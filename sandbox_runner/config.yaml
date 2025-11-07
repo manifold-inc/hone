@@ -1,5 +1,4 @@
-# Hone Subnet Sandbox Runner Configuration
-# This is a sample configuration file with recommended settings
+# Sandbox Runner Configuration
 
 runner:
   id: "runner-1"
@@ -11,13 +10,7 @@ api:
   require_epistula: false
   require_api_key: true
   rate_limit_per_validator: 100  # requests per minute
-  
-  # SSL/TLS certificates (required for HTTPS)
-  # Generate self-signed certs for testing:
-  # openssl req -x509 -newkey rsa:4096 -nodes -keyout runner.key -out runner.crt -days 365
-  #ssl_cert_path: "/etc/ssl/certs/runner.crt"
-  #ssl_key_path: "/etc/ssl/private/runner.key"
-  
+    
   # Header names for authentication
   api_key_header: "X-API-Key"
   epistula_signature_header: "X-Epistula-Signature"
@@ -37,7 +30,6 @@ execution:
   # direct: Process-level isolation with cgroups
   mode: "docker+gvisor"
   
-  # Enable fallback to next mode if current mode fails
   fallback_on_error: true
   
   # Resource limits per job

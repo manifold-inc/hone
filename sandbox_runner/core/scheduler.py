@@ -9,7 +9,6 @@ Optimizes parallel GPU execution by:
 - Weight class compatibility checking
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -24,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SchedulingDecision:
-    """Result of a scheduling decision."""
+    """Result of a scheduling decision"""
     job: Optional[Job]
     reason: str
     alternative_jobs: List[Job] = None
@@ -32,7 +31,7 @@ class SchedulingDecision:
 
 class IntelligentScheduler:
     """
-    Intelligent job scheduler that optimizes GPU utilization.
+    Intelligent job scheduler that optimizes GPU utilization
     
     Scheduling Strategy:
     1. Maximize GPU utilization - pack jobs efficiently
@@ -57,7 +56,7 @@ class IntelligentScheduler:
         starvation_threshold_seconds: int = 3600  # 1 hour
     ):
         """
-        Initialize intelligent scheduler.
+        Initialize intelligent scheduler
         
         Args:
             gpu_pool: GPU pool manager
@@ -68,7 +67,6 @@ class IntelligentScheduler:
         self.job_queue = job_queue
         self.starvation_threshold = timedelta(seconds=starvation_threshold_seconds)
         
-        # Track validator fairness
         self._validator_last_scheduled: Dict[str, datetime] = {}
         self._validator_job_counts: Dict[str, int] = defaultdict(int)
         
@@ -76,7 +74,7 @@ class IntelligentScheduler:
     
     async def schedule_next(self) -> Optional[Job]:
         """
-        Select the best job to run next based on scheduling policy.
+        Select the best job to run next based on scheduling policy
         
         Algorithm:
         1. Get available GPU count
@@ -94,14 +92,12 @@ class IntelligentScheduler:
             logger.debug("No GPUs available for scheduling")
             return None
         
-        # Get all pending jobs in priority order
         jobs = await self.job_queue.get_all_jobs()
         
         if not jobs:
             logger.debug("No jobs in queue")
             return None
         
-        # Check for starving large jobs first
         starving_job = await self._check_for_starvation(jobs, available_gpus)
         if starving_job:
             logger.info(
@@ -110,7 +106,6 @@ class IntelligentScheduler:
             )
             return starving_job
         
-        # Find job with optimal GPU utilization
         best_job = await self._find_optimal_job(jobs, available_gpus)
         
         if best_job:
@@ -125,7 +120,7 @@ class IntelligentScheduler:
     
     async def can_schedule(self, job: Job) -> bool:
         """
-        Check if a job can be scheduled with current GPU availability.
+        Check if a job can be scheduled with current GPU availability
         
         Args:
             job: Job to check
@@ -137,21 +132,18 @@ class IntelligentScheduler:
     
     async def optimize_allocation(self) -> List[Job]:
         """
-        Analyze current allocation and suggest improvements.
+        Analyze current allocation and suggest improvements
         
         This can identify opportunities to:
         - Repack running jobs for better utilization
         - Preempt low-priority jobs for high-priority ones
-        
-        Note: Preemption not implemented in Phase 2
-        
+                
         Returns:
             List of jobs that could be scheduled for better utilization
         """
         available_gpus = await self.gpu_pool.get_available_gpu_count()
         jobs = await self.job_queue.get_all_jobs()
         
-        # Find all jobs that could fit in available GPUs
         schedulable_jobs = []
         for job in jobs:
             if job.weight_class.gpu_count() <= available_gpus:
@@ -161,7 +153,7 @@ class IntelligentScheduler:
     
     async def get_scheduling_stats(self) -> Dict:
         """
-        Get scheduling statistics for monitoring.
+        Get scheduling statistics for monitoring
         
         Returns:
             Dictionary with scheduling metrics
@@ -178,7 +170,7 @@ class IntelligentScheduler:
         available_gpus: int
     ) -> Optional[Job]:
         """
-        Check if any large jobs are starving and should be prioritized.
+        Check if any large jobs are starving and should be prioritized
         
         A job is considered starving if:
         1. It requires many GPUs (4x or 8x)
@@ -195,16 +187,15 @@ class IntelligentScheduler:
         now = datetime.utcnow()
         
         for job in jobs:
-            # Only check large jobs (4x, 8x)
+            # check large jobs (4x, 8x)
             if job.weight_class not in [WeightClass.FOUR_GPU, WeightClass.EIGHT_GPU]:
                 continue
             
-            # Check if waiting too long
             wait_time = now - job.submitted_at
             if wait_time < self.starvation_threshold:
                 continue
             
-            # Check if we have enough GPUs
+            # if we have enough GPUs
             required_gpus = job.weight_class.gpu_count()
             if available_gpus >= required_gpus:
                 logger.warning(
@@ -222,7 +213,7 @@ class IntelligentScheduler:
         available_gpus: int
     ) -> Optional[Job]:
         """
-        Find the job that provides optimal GPU utilization.
+        Find the job that provides optimal GPU utilization
         
         Strategy:
         1. Prefer jobs that maximize GPU usage without waste
@@ -243,11 +234,9 @@ class IntelligentScheduler:
         for job in jobs:
             required_gpus = job.weight_class.gpu_count()
             
-            # Skip if not enough GPUs
             if required_gpus > available_gpus:
                 continue
             
-            # Calculate scheduling score
             score = self._calculate_job_score(
                 job,
                 required_gpus,
@@ -267,10 +256,8 @@ class IntelligentScheduler:
         available_gpus: int
     ) -> float:
         """
-        Calculate a scheduling score for a job.
-        
-        Higher score = better to schedule.
-        
+        Calculate a scheduling score for a job
+                
         Factors:
         - GPU utilization: Higher is better
         - Priority: Higher priority gets bonus
@@ -285,29 +272,21 @@ class IntelligentScheduler:
         Returns:
             Scheduling score (higher is better)
         """
-        # Base score: GPU utilization percentage (0-100)
         utilization_score = (required_gpus / available_gpus) * 100
-        
-        # Priority bonus: 0-10 points
         priority_bonus = job.priority
-        
-        # Wait time bonus: 0-5 points (1 point per hour, max 5)
         wait_hours = (datetime.utcnow() - job.submitted_at).total_seconds() / 3600
-        wait_bonus = min(wait_hours, 5)
-        
-        # Validator fairness bonus: 0-10 points
+        wait_bonus = min(wait_hours, 5)        
         fairness_bonus = self._calculate_fairness_bonus(job.validator_hotkey)
         
-        # Total score
         score = utilization_score + priority_bonus + wait_bonus + fairness_bonus
         
         return score
     
     def _calculate_fairness_bonus(self, validator_hotkey: Optional[str]) -> float:
         """
-        Calculate fairness bonus for a validator.
+        Calculate fairness bonus for a validator
         
-        Validators who haven't had jobs scheduled recently get a bonus.
+        Validators who haven't had jobs scheduled recently get a bonus
         
         Args:
             validator_hotkey: Validator identifier
@@ -318,22 +297,19 @@ class IntelligentScheduler:
         if not validator_hotkey:
             return 0
         
-        # If validator never scheduled, give max bonus
         if validator_hotkey not in self._validator_last_scheduled:
             return 10
         
-        # Calculate time since last job
         last_scheduled = self._validator_last_scheduled[validator_hotkey]
         time_since = (datetime.utcnow() - last_scheduled).total_seconds()
         
-        # 1 point per 10 minutes, max 10 points
         bonus = min(time_since / 600, 10)
         
         return bonus
     
     async def record_scheduled_job(self, job: Job):
         """
-        Record that a job was scheduled for fairness tracking.
+        Record that a job was scheduled for fairness tracking
         
         Args:
             job: Job that was scheduled
@@ -344,7 +320,7 @@ class IntelligentScheduler:
     
     async def get_scheduling_recommendation(self) -> Dict:
         """
-        Get a recommendation for current scheduling state.
+        Get a recommendation for current scheduling state
         
         Returns:
             Dictionary with scheduling recommendations
@@ -364,7 +340,6 @@ class IntelligentScheduler:
                 "message": "No GPUs available"
             }
         
-        # Check what could be scheduled
         next_job = await self.schedule_next()
         
         if next_job:
@@ -375,7 +350,6 @@ class IntelligentScheduler:
                 "message": f"Can schedule job {next_job.job_id}"
             }
         
-        # Find why we can't schedule
         min_gpu_requirement = min(job.weight_class.gpu_count() for job in jobs)
         
         if available_gpus < min_gpu_requirement:

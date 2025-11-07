@@ -1,9 +1,3 @@
-"""
-API Gateway - FastAPI Application (Updated for Phase 2)
-
-Integrates Meta-Manager for job orchestration.
-"""
-
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
@@ -15,6 +9,9 @@ import logging
 from config import Config
 from api.auth import AuthenticationManager, RateLimiter
 from monitoring.metrics import metrics_manager
+from core.meta_manager import MetaManager
+from api.routes import create_router
+from api.dashboard_routes import create_dashboard_router
 
 logger = logging.getLogger("api.gateway")
 
@@ -22,24 +19,12 @@ logger = logging.getLogger("api.gateway")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Application lifespan manager.
-    
-    Startup:
-    - Initialize metrics
-    - Initialize meta-manager
-    - Start background job processor
-    
-    Shutdown:
-    - Stop meta-manager
-    - Clean up resources
+    Application lifespan manager    
     """
     logger.info("Starting Hone Subnet Sandbox Runner API")
     
-    # Initialize metrics
     metrics_manager.initialize()
     
-    # Initialize and start meta-manager
-    from core.meta_manager import MetaManager
     meta_manager = MetaManager(app.state.config)
     app.state.meta_manager = meta_manager
     await meta_manager.start()
@@ -50,7 +35,6 @@ async def lifespan(app: FastAPI):
     
     logger.info("Shutting down Hone Subnet Sandbox Runner API")
     
-    # Stop meta-manager
     await meta_manager.stop()
     
     logger.info("Shutdown complete")
@@ -58,7 +42,7 @@ async def lifespan(app: FastAPI):
 
 def create_app(config: Config) -> FastAPI:
     """
-    Create and configure the FastAPI application.
+    Create and configure the FastAPI application
     
     Args:
         config: Application configuration
@@ -68,37 +52,28 @@ def create_app(config: Config) -> FastAPI:
     """
     app = FastAPI(
         title="Hone Subnet Sandbox Runner API",
-        description="Secure GPU execution service for Bittensor subnet miners",
+        description="Secure GPU execution service",
         version="1.0.0",
         docs_url="/docs",
         redoc_url="/redoc",
         lifespan=lifespan
     )
     
-    # Store config in app state
     app.state.config = config
     
-    # Initialize auth and rate limiting
     app.state.auth_manager = AuthenticationManager(config.api)
     app.state.rate_limiter = RateLimiter(config.api.rate_limit_per_validator)
     
-    # Add middleware
     _add_middleware(app, config)
     
-    # Add exception handlers
     _add_exception_handlers(app)
     
-    # Add routes
-    from api.routes import create_router
     router = create_router(config)
     app.include_router(router, prefix="/v1")
 
-    from api.dashboard_routes import create_dashboard_router
     dashboard_router = create_dashboard_router(config)
     app.include_router(dashboard_router, prefix="/v1")
-
     
-    # Add metrics endpoint
     @app.get("/metrics")
     async def metrics():
         """Prometheus metrics endpoint."""
