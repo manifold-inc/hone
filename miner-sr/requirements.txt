@@ -1,10 +1,10 @@
-# Core dependencies
-vllm
-torch
-transformers
-huggingface-hub
+# Core dependencies - PINNED VERSIONS
+vllm==0.6.3.post1
+torch==2.4.0
+transformers==4.45.2
+huggingface-hub==0.25.2
 
 # Required
-accelerate
-sentencepiece
-protobuf
+accelerate==0.34.2
+sentencepiece==0.2.0
+protobuf==5.28.2
