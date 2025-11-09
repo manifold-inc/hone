@@ -62,9 +62,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print("PREP PHASE - Downloading model")
     print("=" * 60)
     
-    # Load input to see what model we need
-    #input_data = load_input_data(input_dir)
-    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"#input_data.get("model", "unsloth/Meta-Llama-3.1-8B-Instruct")
+    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
     
     print(f"\n[1/3] Model to download: {model_name}")
     
@@ -85,40 +83,34 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
     
     try:
-        # Download all model files
-        from vllm import LLM, SamplingParams
+        # Download model files WITHOUT loading them into memory
+        # This is much faster and doesn't require GPU
+        print("\n[3/3] Downloading model files...")
         
-        llm = LLM(
-            model=model_name,
-            download_dir=str(cache_dir),
-            dtype="half",
-            gpu_memory_utilization=0.8,
-            max_model_len=2048,
-            trust_remote_code=True,
-            tensor_parallel_size=1,
-            tokenizer_mode="auto",
-            load_format="auto",
-        )
-        print(f"✓ Model downloaded successfully to: {cache_dir}")
+        local_dir = cache_dir / model_name.replace("/", "--")
+        local_dir.mkdir(parents=True, exist_ok=True)
         
-        # Also pre-load with transformers to ensure tokenizer is cached
-        print("\n[3/3] Pre-loading model with transformers to cache tokenizer...")
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_name,
+        downloaded_path = snapshot_download(
+            repo_id=model_name,
             cache_dir=str(cache_dir),
-            local_files_only=False,
-            trust_remote_code=True
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],  # Skip unnecessary files
         )
-        print(f"✓ Tokenizer cached (vocab size: {len(tokenizer)})")
         
-        # For vLLM, we don't need to load the full model in prep
-        # Just having the files cached is enough
-        print("✓ Model files ready for vLLM")
+        print(f"✓ Model files downloaded to: {downloaded_path}")
+        
+        # Verify the download by checking for key files
+        config_file = Path(downloaded_path) / "config.json"
+        if not config_file.exists():
+            raise Exception("Model config.json not found after download")
+        
+        print("✓ Model download verified")
+        print(f"✓ Files in model directory: {len(list(Path(downloaded_path).glob('*')))}")
         
         prep_status = "success"
-        prep_message = f"Model {model_name} downloaded and cached"
+        prep_message = f"Model {model_name} downloaded and cached to {downloaded_path}"
         
     except Exception as e:
         print(f"ERROR: Could not download model: {e}")
@@ -150,13 +142,12 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     
     # Load input data
     print("\n[1/5] Loading input data...")
-    #input_data = load_input_data(input_dir)
     
     # Get parameters
-    prompts = "Hello! How are you today"#input_data.get("prompts", ["Hello! How are you today?"])
-    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"#input_data.get("model", "unsloth/Meta-Llama-3.1-8B-Instruct")
-    max_tokens = 50#input_data.get("max_tokens", 50)
-    temperature = 0.7#input_data.get("temperature", 0.7)
+    prompts = ["Hello! How are you today?"]
+    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
+    max_tokens = 50
+    temperature = 0.7
     
     print(f"\nConfiguration:")
     print(f"  Model: {model_name}")
@@ -170,11 +161,27 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
     os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
     
+    # Find the downloaded model directory
+    model_path = cache_dir / model_name.replace("/", "--")
+    
     print(f"\n[2/5] Cache directory: {cache_dir}")
-    if cache_dir.exists():
-        print(f"  Cache exists with {len(list(cache_dir.rglob('*')))} files")
+    print(f"[2/5] Model path: {model_path}")
+    
+    if model_path.exists():
+        file_count = len(list(model_path.glob('*')))
+        print(f"  Model directory exists with {file_count} files")
+        
+        # List some key files
+        key_files = ['config.json', 'tokenizer.json', 'tokenizer_config.json']
+        for key_file in key_files:
+            file_path = model_path / key_file
+            if file_path.exists():
+                print(f"  ✓ Found {key_file}")
+            else:
+                print(f"  ✗ Missing {key_file}")
     else:
-        print("  WARNING: Cache directory not found!")
+        print("  ERROR: Model directory not found!")
+        print(f"  Available directories in cache: {list(cache_dir.glob('*'))}")
     
     # Check GPU
     print(f"\n[3/5] Checking GPU availability...")
@@ -197,19 +204,16 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     try:
         from vllm import LLM, SamplingParams
         
-        # CRITICAL: Use local_files_only=True to prevent internet access
+        # Use the local path directly
         llm = LLM(
-            model=model_name,
-            download_dir=str(cache_dir),
+            model=str(model_path),
             dtype="half" if gpu_available else "float32",
             gpu_memory_utilization=0.8,
             max_model_len=2048,
             trust_remote_code=True,
             tensor_parallel_size=1,
-            # IMPORTANT: Only use cached files, no downloads
-            local_files_only=True,
             tokenizer_mode="auto",
-            load_format="auto",
+            download_dir=str(cache_dir),
         )
         print("✓ Model loaded successfully from cache!")
         
