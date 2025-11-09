@@ -20,7 +20,6 @@ ENV HF_DATASETS_CACHE=/app/models
 ENV PYTHONUNBUFFERED=1
 
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir numpy scipy
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 COPY inference.py .

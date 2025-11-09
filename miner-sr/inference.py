@@ -222,70 +222,96 @@ def run_inference_with_openai_client(prompts: list, port: int = 8000, **kwargs):
 
 
 def run_inference_phase(input_dir: Path, output_dir: Path):
-    """Inference phase: Run inference using vLLM server."""
+    """Inference phase: Use external vLLM API for inference."""
     print("\n" + "=" * 60)
-    print("INFERENCE PHASE - Running inference")
+    print("INFERENCE PHASE - Using vLLM API")
     print("=" * 60)
     
     # Configuration
     prompts = ["Hello! How are you today?"]
     model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
-    model_path = Path("/app/models") / model_name.replace("/", "--")
     max_tokens = 50
     temperature = 0.7
-    port = 8000
+    
+    # Get vLLM API endpoint from environment
+    vllm_api_base = os.getenv('VLLM_API_BASE', 'http://localhost:8000')
     
     print(f"\nConfiguration:")
     print(f"  Model: {model_name}")
-    print(f"  Model path: {model_path}")
+    print(f"  vLLM API: {vllm_api_base}")
     print(f"  Prompts: {len(prompts)}")
     print(f"  Max tokens: {max_tokens}")
     print(f"  Temperature: {temperature}")
     
-    # Verify model exists
-    if not model_path.exists():
-        print(f"\n✗ ERROR: Model not found at {model_path}")
-        print(f"Available paths in /app/models:")
-        for p in Path("/app/models").iterdir():
-            print(f"  - {p}")
-        
-        results = {
-            "phase": "inference",
-            "model": model_name,
-            "status": "failed",
-            "error": f"Model not found at {model_path}"
-        }
-        save_output_data(results, output_dir)
-        return
-    
-    vllm_process = None
-    
     try:
-        # Start vLLM server
-        vllm_process = start_vllm_server(str(model_path), port=port)
+        from openai import OpenAI
         
-        # Run inference
-        outputs = run_inference_with_openai_client(
-            prompts,
-            port=port,
-            max_tokens=max_tokens,
-            temperature=temperature
+        # Create client pointing to vLLM server
+        client = OpenAI(
+            api_key="EMPTY",
+            base_url=f"{vllm_api_base}/v1"
         )
         
-        print(f"\n[4/4] Completed inference")
+        # Test connection
+        print(f"\nTesting connection to vLLM API...")
+        response = requests.get(f"{vllm_api_base}/health", timeout=5)
+        if response.status_code == 200:
+            print("✓ Connected to vLLM API")
+        else:
+            raise RuntimeError(f"vLLM API unhealthy: {response.status_code}")
+        
+        # Run inference
+        outputs = []
+        print(f"\nRunning inference on {len(prompts)} prompts...")
+        
+        for i, prompt in enumerate(prompts, 1):
+            try:
+                print(f"  Processing prompt {i}/{len(prompts)}...")
+                
+                response = client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+                
+                generated_text = response.choices[0].message.content
+                
+                outputs.append({
+                    "prompt": prompt,
+                    "generated_text": generated_text,
+                    "finish_reason": response.choices[0].finish_reason,
+                    "usage": {
+                        "prompt_tokens": response.usage.prompt_tokens,
+                        "completion_tokens": response.usage.completion_tokens,
+                        "total_tokens": response.usage.total_tokens,
+                    }
+                })
+                
+                print(f"    ✓ Generated {response.usage.completion_tokens} tokens")
+                
+            except Exception as e:
+                print(f"    ✗ Error: {e}")
+                outputs.append({
+                    "prompt": prompt,
+                    "error": str(e)
+                })
+        
+        print(f"\nCompleted inference")
         
         # Check GPU usage
         try:
             import torch
             gpu_used = torch.cuda.is_available()
             if gpu_used:
-                print(f"✓ GPU was utilized")
+                print(f"✓ GPU available (used by vLLM server)")
         except:
             gpu_used = False
         
         results = {
             "phase": "inference",
             "model": model_name,
+            "vllm_api": vllm_api_base,
             "gpu_used": gpu_used,
             "num_prompts": len(prompts),
             "status": "success",
@@ -300,22 +326,11 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         results = {
             "phase": "inference",
             "model": model_name,
+            "vllm_api": vllm_api_base,
             "status": "failed",
             "error": str(e),
             "outputs": []
         }
-    
-    finally:
-        # Cleanup: stop vLLM server
-        if vllm_process and vllm_process.poll() is None:
-            print("\nStopping vLLM server...")
-            vllm_process.terminate()
-            try:
-                vllm_process.wait(timeout=5)
-                print("✓ vLLM server stopped")
-            except subprocess.TimeoutExpired:
-                vllm_process.kill()
-                print("✓ vLLM server killed")
     
     save_output_data(results, output_dir)
     

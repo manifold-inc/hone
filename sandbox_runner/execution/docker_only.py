@@ -1,9 +1,10 @@
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Any
 import time
 import sys
+import httpx
 
 import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
@@ -806,3 +807,222 @@ class DockerOnlyExecutor:
             return True
         except Exception:
             return False
+        
+    async def run_job_with_vllm(
+        self,
+        image_id: str,
+        job: Job,
+        work_dir: Path,
+        prep_timeout: int,
+        inference_timeout: int
+    ) -> Tuple[int, str, str]:
+        """
+        Run complete job with vLLM pipeline.
+        
+        1. Run prep phase (download models)
+        2. Start vLLM container
+        3. Run inference phase (use vLLM API)
+        4. Stop vLLM container
+        """
+        vllm_container = None
+        vllm_port = 8000
+        models_dir = work_dir / 'models'
+        
+        try:
+            logger.info("=" * 60)
+            logger.info("PHASE 1: PREP - Downloading models")
+            logger.info("=" * 60)
+            
+            prep_exit_code, prep_stdout, prep_stderr = await self.run_container(
+                image_id=image_id,
+                job=job,
+                phase="prep",
+                network_enabled=True,
+                work_dir=work_dir,
+                timeout_seconds=prep_timeout
+            )
+            
+            if prep_exit_code != 0:
+                logger.error(f"Prep phase failed with exit code {prep_exit_code}")
+                return prep_exit_code, prep_stdout, prep_stderr
+            
+            logger.info("✓ Prep phase completed successfully")
+            
+            logger.info("=" * 60)
+            logger.info("PHASE 2: Starting vLLM server")
+            logger.info("=" * 60)
+            
+            vllm_container, vllm_id = await self.start_vllm_container(
+                job=job,
+                models_dir=models_dir,
+                port=vllm_port
+            )
+            
+            vllm_ready = await self.wait_for_vllm_ready(
+                port=vllm_port,
+                timeout_seconds=300
+            )
+            
+            if not vllm_ready:
+                raise DockerExecutionError("vLLM failed to start")
+            
+            logger.info("=" * 60)
+            logger.info("PHASE 3: INFERENCE - Using vLLM API")
+            logger.info("=" * 60)
+            
+            job.custom_env_vars['VLLM_API_BASE'] = f'http://host.docker.internal:{vllm_port}'
+            
+            inf_exit_code, inf_stdout, inf_stderr = await self.run_container(
+                image_id=image_id,
+                job=job,
+                phase="inference",
+                network_enabled=True,  # Need network to access vLLM API
+                work_dir=work_dir,
+                timeout_seconds=inference_timeout
+            )
+            
+            if inf_exit_code != 0:
+                logger.error(f"Inference phase failed with exit code {inf_exit_code}")
+                return inf_exit_code, inf_stdout, inf_stderr
+            
+            logger.info("✓ Inference phase completed successfully")
+            
+            combined_stdout = f"=== PREP PHASE ===\n{prep_stdout}\n\n=== INFERENCE PHASE ===\n{inf_stdout}"
+            combined_stderr = f"=== PREP PHASE ===\n{prep_stderr}\n\n=== INFERENCE PHASE ===\n{inf_stderr}"
+            
+            return 0, combined_stdout, combined_stderr
+            
+        finally:
+            if vllm_container:
+                await self.stop_vllm_container(vllm_container)
+        
+    # vllm stuff
+    async def start_vllm_container(
+        self,
+        job: Job,
+        models_dir: Path,
+        port: int = 8000
+    ) -> Tuple[Any, str]:
+        """
+        Start vLLM container with models mounted.
+        
+        Returns:
+            Tuple of (container, container_id)
+        """
+        container_name = f"vllm-{job.job_id}"
+        
+        logger.info(f"Starting vLLM container: {container_name}")
+        model_info_path = models_dir.parent / "output" / "model_info.json"
+        if model_info_path.exists():
+            import json
+            with open(model_info_path) as f:
+                model_info = json.load(f)
+                model_name = model_info.get("model_name", "unsloth/Meta-Llama-3.1-8B-Instruct")
+        else:
+            model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
+        
+        model_path = str(models_dir / model_name.replace("/", "--"))
+        
+        config = {
+            'image': 'vllm/vllm-openai:latest',
+            'name': container_name,
+            'command': [
+                '--model', model_path,
+                '--host', '0.0.0.0',
+                '--port', str(port),
+                '--dtype', 'half',
+                '--max-model-len', '2048',
+                '--gpu-memory-utilization', '0.8',
+            ],
+            'ports': {f'{port}/tcp': port},
+            'volumes': {
+                str(models_dir): {'bind': '/app/models', 'mode': 'ro'}
+            },
+            'detach': True,
+            'auto_remove': False,
+            'network_mode': 'host',
+        }
+        
+        # Add GPU support
+        if job.assigned_gpus:
+            config['device_requests'] = [
+                docker.types.DeviceRequest(
+                    device_ids=[str(gpu) for gpu in job.assigned_gpus],
+                    capabilities=[['gpu', 'compute', 'utility']]
+                )
+            ]
+            config['runtime'] = 'nvidia'
+            config['environment'] = {
+                'CUDA_VISIBLE_DEVICES': ','.join(str(gpu) for gpu in job.assigned_gpus)
+            }
+        
+        try:
+            container = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.docker_client.containers.create(**config)
+            )
+            
+            await asyncio.get_event_loop().run_in_executor(None, container.start)
+            
+            logger.info(f"vLLM container started: {container.id[:12]}")
+            
+            return container, container.id
+            
+        except Exception as e:
+            logger.error(f"Failed to start vLLM container: {e}")
+            raise DockerExecutionError(f"vLLM container start failed: {e}")
+
+
+    async def wait_for_vllm_ready(
+        self,
+        port: int = 8000,
+        timeout_seconds: int = 300,
+        check_interval: int = 5
+    ) -> bool:
+        """
+        Wait for vLLM API to be ready.
+        
+        Args:
+            port: vLLM API port
+            timeout_seconds: Maximum wait time
+            check_interval: Seconds between checks
+            
+        Returns:
+            True if vLLM is ready
+        """
+        
+        logger.info(f"Waiting for vLLM API on port {port}...")
+        
+        start_time = time.time()
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            while time.time() - start_time < timeout_seconds:
+                try:
+                    response = await client.get(f"http://localhost:{port}/health")
+                    if response.status_code == 200:
+                        logger.info("✓ vLLM API is ready!")
+                        return True
+                except (httpx.ConnectError, httpx.TimeoutException):
+                    pass
+                
+                elapsed = time.time() - start_time
+                logger.debug(f"Waiting for vLLM... ({elapsed:.0f}s/{timeout_seconds}s)")
+                await asyncio.sleep(check_interval)
+        
+        logger.error(f"vLLM API failed to start within {timeout_seconds}s")
+        return False
+
+
+    async def stop_vllm_container(self, container) -> None:
+        """Stop and remove vLLM container."""
+        try:
+            if container:
+                logger.info(f"Stopping vLLM container: {container.id[:12]}")
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: container.stop(timeout=10)
+                )
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: container.remove(force=True)
+                )
+                logger.info("✓ vLLM container stopped")
+        except Exception as e:
+            logger.warning(f"Failed to stop vLLM container: {e}")

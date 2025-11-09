@@ -123,7 +123,7 @@ class Executor:
             ExecutorError: If job execution fails
         """
         job_id = job.job_id
-        logger.info(f"Starting job execution: {job_id}")
+        logger.info(f"Starting job execution with vLLM: {job_id}")
         
         self._active_jobs[job_id] = job        
         work_dir = Path(tempfile.mkdtemp(prefix=f"job_{job_id}_"))
@@ -148,11 +148,9 @@ class Executor:
                 work_dir_path = repo_path
                 logger.info(f"Using repo root: {work_dir_path}")
 
-
             work_dir_path = repo_path / job.repo_path if job.repo_path else repo_path
             if job.repo_path and not work_dir_path.exists():
                 raise ExecutorError(f"Specified repo path does not exist: {job.repo_path}")
-
 
             # Validate repository
             self.validator.validate_all(work_dir_path, job.repo_url)
@@ -168,23 +166,38 @@ class Executor:
             job.progress_percentage = 45.0
             await self._download_input_data(job, work_dir)
             
-            # Run prep phase
+            # Run complete vLLM pipeline (prep -> vllm -> inference)
             job.status = JobStatus.PREP
-            job.current_phase = "prep"
+            job.current_phase = "vllm_pipeline"
             job.progress_percentage = 50.0
-            prep_success = await self._run_prep_phase(job, image_id, work_dir)
             
-            if not prep_success:
-                raise ExecutorError("Prep phase failed")
+            executor = self._get_executor()
             
-            # Run inference phase
-            job.status = JobStatus.INFERENCE
-            job.current_phase = "inference"
-            job.progress_percentage = 75.0
-            inference_success = await self._run_inference_phase(job, image_id, work_dir)
-            
-            if not inference_success:
-                raise ExecutorError("Inference phase failed")
+            # Check if executor supports vLLM pipeline
+            if hasattr(executor, 'run_job_with_vllm'):
+                exit_code, stdout, stderr = await executor.run_job_with_vllm(
+                    image_id=image_id,
+                    job=job,
+                    work_dir=work_dir,
+                    prep_timeout=self.config.execution.prep_timeout_seconds,
+                    inference_timeout=self.config.execution.inference_timeout_seconds
+                )
+                
+                if exit_code != 0:
+                    raise ExecutorError(f"vLLM pipeline failed with exit code {exit_code}")
+            else:
+                # Fallback to old method
+                logger.warning("Executor doesn't support vLLM pipeline, using legacy method")
+                
+                job.status = JobStatus.PREP
+                prep_success = await self._run_prep_phase(job, image_id, work_dir)
+                if not prep_success:
+                    raise ExecutorError("Prep phase failed")
+                
+                job.status = JobStatus.INFERENCE
+                inference_success = await self._run_inference_phase(job, image_id, work_dir)
+                if not inference_success:
+                    raise ExecutorError("Inference phase failed")
             
             # Upload output data
             job.current_phase = "uploading_output"
