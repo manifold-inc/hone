@@ -859,6 +859,7 @@ class DockerOnlyExecutor:
             )
             
             vllm_ready = await self.wait_for_vllm_ready(
+                container=vllm_container,
                 port=vllm_port,
                 timeout_seconds=300
             )
@@ -901,8 +902,7 @@ class DockerOnlyExecutor:
         self,
         job: Job,
         models_dir: Path,
-        port: int = 8000,
-        vllm_image: str = "vllm/vllm-openai:latest"
+        port: int = 8000
     ) -> Tuple[Any, str]:
         """
         Start vLLM container with models mounted.
@@ -910,7 +910,12 @@ class DockerOnlyExecutor:
         Returns:
             Tuple of (container, container_id)
         """
-
+        container_name = f"vllm-{job.job_id}"
+        vllm_image = "vllm/vllm-openai:latest"
+        
+        logger.info(f"Starting vLLM container: {container_name}")
+        
+        # Check if image exists, pull if not
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.images.get(vllm_image)
@@ -926,10 +931,7 @@ class DockerOnlyExecutor:
             except Exception as e:
                 logger.error(f"Failed to pull vLLM image: {e}")
                 raise DockerExecutionError(f"Failed to pull vLLM image: {e}")
-
-        container_name = f"vllm-{job.job_id}"
         
-        logger.info(f"Starting vLLM container: {container_name}")
         model_info_path = models_dir.parent / "output" / "model_info.json"
         if model_info_path.exists():
             import json
@@ -952,13 +954,12 @@ class DockerOnlyExecutor:
                 '--max-model-len', '2048',
                 '--gpu-memory-utilization', '0.8',
             ],
-            # Remove ports when using host network mode
             'volumes': {
                 str(models_dir): {'bind': '/app/models', 'mode': 'ro'}
             },
             'detach': True,
             'auto_remove': False,
-            'network_mode': 'host',  # Use host network, no port mapping needed
+            'network_mode': 'host',
         }
         
         # Add GPU support
@@ -992,14 +993,16 @@ class DockerOnlyExecutor:
 
     async def wait_for_vllm_ready(
         self,
+        container,
         port: int = 8000,
         timeout_seconds: int = 300,
-        check_interval: int = 5
+        check_interval: int = 2
     ) -> bool:
         """
-        Wait for vLLM API to be ready.
+        Wait for vLLM API to be ready while streaming logs.
         
         Args:
+            container: Docker container object
             port: vLLM API port
             timeout_seconds: Maximum wait time
             check_interval: Seconds between checks
@@ -1007,27 +1010,90 @@ class DockerOnlyExecutor:
         Returns:
             True if vLLM is ready
         """
-        
         logger.info(f"Waiting for vLLM API on port {port}...")
+        
+        display = BuildLogDisplay(box_lines=30, title="🚀 vLLM STARTUP LOGS")
+        display.start()
         
         start_time = time.time()
         
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            while time.time() - start_time < timeout_seconds:
-                try:
-                    response = await client.get(f"http://localhost:{port}/health")
-                    if response.status_code == 200:
-                        logger.info("✓ vLLM API is ready!")
-                        return True
-                except (httpx.ConnectError, httpx.TimeoutException):
-                    pass
-                
-                elapsed = time.time() - start_time
-                logger.debug(f"Waiting for vLLM... ({elapsed:.0f}s/{timeout_seconds}s)")
-                await asyncio.sleep(check_interval)
+        # Start log streaming task
+        async def stream_logs():
+            try:
+                for chunk in container.logs(stdout=True, stderr=True, stream=True, follow=True):
+                    try:
+                        text = chunk.decode("utf-8", errors="replace")
+                    except Exception:
+                        text = str(chunk)
+                    for ln in text.splitlines():
+                        display.update(ln)
+                    await asyncio.sleep(0.01)
+            except Exception as e:
+                display.update(f"[log-stream] ERROR: {e}")
         
-        logger.error(f"vLLM API failed to start within {timeout_seconds}s")
-        return False
+        log_task = asyncio.create_task(stream_logs())
+        
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                while time.time() - start_time < timeout_seconds:
+                    try:
+                        response = await client.get(f"http://localhost:{port}/health")
+                        if response.status_code == 200:
+                            log_task.cancel()
+                            try:
+                                await log_task
+                            except asyncio.CancelledError:
+                                pass
+                            
+                            display.end("✅ vLLM API READY")
+                            logger.info("✓ vLLM API is ready!")
+                            return True
+                    except (httpx.ConnectError, httpx.TimeoutException):
+                        pass
+                    
+                    # Check if container died
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, container.reload
+                    )
+                    if container.status not in ['running', 'created']:
+                        log_task.cancel()
+                        try:
+                            await log_task
+                        except asyncio.CancelledError:
+                            pass
+                        
+                        display.end(f"❌ vLLM CONTAINER DIED (status: {container.status})")
+                        logger.error(f"vLLM container died with status: {container.status}")
+                        return False
+                    
+                    elapsed = time.time() - start_time
+                    if int(elapsed) % 10 == 0:  # Log every 10 seconds
+                        display.write_below_box(
+                            f"⏳ Waiting for vLLM... ({elapsed:.0f}s/{timeout_seconds}s)"
+                        )
+                    
+                    await asyncio.sleep(check_interval)
+            
+            log_task.cancel()
+            try:
+                await log_task
+            except asyncio.CancelledError:
+                pass
+            
+            display.end(f"⏱️ vLLM STARTUP TIMEOUT ({timeout_seconds}s)")
+            logger.error(f"vLLM API failed to start within {timeout_seconds}s")
+            return False
+            
+        except Exception as e:
+            log_task.cancel()
+            try:
+                await log_task
+            except asyncio.CancelledError:
+                pass
+            
+            display.end("❌ vLLM STARTUP ERROR")
+            logger.error(f"Error waiting for vLLM: {e}")
+            raise
 
 
     async def stop_vllm_container(self, container) -> None:
