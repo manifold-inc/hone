@@ -901,7 +901,8 @@ class DockerOnlyExecutor:
         self,
         job: Job,
         models_dir: Path,
-        port: int = 8000
+        port: int = 8000,
+        vllm_image: str = "vllm/vllm-openai:latest"
     ) -> Tuple[Any, str]:
         """
         Start vLLM container with models mounted.
@@ -909,6 +910,23 @@ class DockerOnlyExecutor:
         Returns:
             Tuple of (container, container_id)
         """
+
+        try:
+            await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self.docker_client.images.get(vllm_image)
+            )
+            logger.info(f"vLLM image already available: {vllm_image}")
+        except ImageNotFound:
+            logger.info(f"Pulling vLLM image: {vllm_image}...")
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.docker_client.images.pull(vllm_image)
+                )
+                logger.info(f"✓ vLLM image pulled successfully")
+            except Exception as e:
+                logger.error(f"Failed to pull vLLM image: {e}")
+                raise DockerExecutionError(f"Failed to pull vLLM image: {e}")
+
         container_name = f"vllm-{job.job_id}"
         
         logger.info(f"Starting vLLM container: {container_name}")
@@ -924,7 +942,7 @@ class DockerOnlyExecutor:
         model_path = str(models_dir / model_name.replace("/", "--"))
         
         config = {
-            'image': 'vllm/vllm-openai:latest',
+            'image': vllm_image,
             'name': container_name,
             'command': [
                 '--model', model_path,
