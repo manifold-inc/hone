@@ -72,6 +72,9 @@ class MetaManager:
         self._total_jobs_submitted = 0
         self._total_jobs_completed = 0
         self._total_jobs_failed = 0
+
+        self._job_history: Dict[str, Job] = {}
+        self._max_history_size = 1000
         
         logger.info("Meta-Manager initialized with executor")
     
@@ -194,6 +197,8 @@ class MetaManager:
         Returns:
             Job status dictionary, or None if not found
         """
+        job = None
+        
         if job_id in self._running_jobs:
             job = self._running_jobs[job_id]
             return self._job_to_response(job)
@@ -204,6 +209,10 @@ class MetaManager:
         
         job = await self.job_queue.get_job(job_id)
         if job:
+            return self._job_to_response(job)
+        
+        if job_id in self._job_history:
+            job = self._job_history[job_id]
             return self._job_to_response(job)
         
         return None
@@ -360,6 +369,8 @@ class MetaManager:
             
             await self.gpu_pool.release_gpus(job_id)
             
+            self._store_job_in_history(job)
+            
             if job.status == JobStatus.COMPLETED:
                 self._total_jobs_completed += 1
                 logger.info(f"Job completed: {job_id}")
@@ -369,6 +380,27 @@ class MetaManager:
             
             if job_id in self._running_jobs:
                 del self._running_jobs[job_id]
+
+    def _store_job_in_history(self, job: Job):
+        """
+        Store completed job in history for later retrieval
+        
+        Args:
+            job: Completed job to store
+        """
+        self._job_history[job.job_id] = job
+        
+        if len(self._job_history) > self._max_history_size:
+            sorted_jobs = sorted(
+                self._job_history.items(),
+                key=lambda x: x[1].completed_at or x[1].submitted_at
+            )
+            
+            jobs_to_remove = sorted_jobs[:-self._max_history_size]
+            for job_id, _ in jobs_to_remove:
+                del self._job_history[job_id]
+            
+            logger.debug(f"Trimmed job history: removed {len(jobs_to_remove)} old jobs")
     
     async def _schedule_next_job(self) -> bool:
         """
@@ -482,7 +514,7 @@ class MetaManager:
         Returns:
             Dictionary with job information
         """
-        return {
+        response = {
             "job_id": job.job_id,
             "status": job.status.value,
             "weight_class": job.weight_class.value,
@@ -499,6 +531,14 @@ class MetaManager:
             "miner_hotkey": job.miner_hotkey,
             "priority": job.priority
         }
+        
+        if hasattr(job, 'metrics') and job.metrics:
+            response["has_metrics"] = True
+            response["metrics_summary"] = job.metrics.get("aggregate", {})
+        else:
+            response["has_metrics"] = False
+        
+        return response
     
     async def get_gpu_status(self) -> Dict[int, Dict]:
         """Get detailed status of all GPUs."""
@@ -643,3 +683,56 @@ class MetaManager:
             ])
         
         return logs
+    
+    async def get_job_metrics(self, job_id: str) -> Optional[Dict]:
+        """
+        Get calculated metrics for a completed job
+        
+        Args:
+            job_id: Job identifier
+            
+        Returns:
+            Metrics dictionary or None if not available
+        """        
+        job = None
+        
+        job = await self.executor.get_job(job_id)
+        
+        if not job and job_id in self._running_jobs:
+            job = self._running_jobs[job_id]
+        
+        if not job and job_id in self._job_history:
+            job = self._job_history[job_id]
+        
+        if not job:
+            logger.warning(f"Job not found: {job_id}")
+            return None
+        
+        if job.status.value not in ["completed", "failed", "timeout"]:
+            logger.warning(
+                f"Attempted to get metrics for non-completed job: {job_id} "
+                f"(status: {job.status.value})"
+            )
+            return None
+        
+        if hasattr(job, 'metrics') and job.metrics:
+            logger.info(f"Retrieved metrics for job: {job_id}")
+            return job.metrics
+        
+        if job.status.value == "completed":
+            logger.warning(
+                f"Job {job_id} is completed but has no metrics. "
+                "This may be a prep-only job or metrics calculation failed."
+            )
+            return {
+                "status": "no_metrics",
+                "message": "Job completed but no metrics available",
+                "job_status": job.status.value
+            }
+        else:
+            return {
+                "status": "job_failed",
+                "message": f"Job did not complete successfully: {job.status.value}",
+                "job_status": job.status.value,
+                "error_message": job.error_message
+            }

@@ -16,6 +16,7 @@ multiple execution modes with fallback chain:
 """
 
 import asyncio
+import json
 import logging
 import shutil
 from pathlib import Path
@@ -28,6 +29,8 @@ from core.gpu_pool import GPUPoolManager
 from config import Config
 from utils.s3 import S3Manager, S3TransferError
 from utils.validation import RepositoryValidator, ValidationError
+from utils.metrics import calculate_detailed_metrics
+
 from security.network import NetworkPolicy
 from execution.docker_gvisor import DockerGVisorExecutor
 from execution.docker_only import DockerOnlyExecutor
@@ -199,11 +202,25 @@ class Executor:
                 if not inference_success:
                     raise ExecutorError("Inference phase failed")
             
-            # Upload output data
-            job.current_phase = "uploading_output"
+            job.current_phase = "calculating_metrics"
             job.progress_percentage = 90.0
-            await self._upload_output_data(job, work_dir)
-            
+            if job.current_phase in ["inference", "vllm_pipeline"]:
+                try:
+                    logger.info(f"Calculating metrics for job {job_id}")
+                    metrics = await self._calculate_job_metrics(job, work_dir)
+                    
+                    job.metrics = metrics
+                    
+                    metrics_path = work_dir / "output" / "metrics.json"
+                    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(metrics_path, 'w') as f:
+                        json.dump(metrics, f, indent=2)
+                    
+                    logger.info(f"Metrics calculated: {metrics['aggregate']}")
+                    
+                except Exception as e:
+                    logger.warning(f"Failed to calculate metrics for job {job_id}: {e}")
+
             job.status = JobStatus.COMPLETED
             job.completed_at = datetime.utcnow()
             job.progress_percentage = 100.0
@@ -598,6 +615,7 @@ class Executor:
             Job object or None if not found
         """
         return self._active_jobs.get(job_id)
+        
     
     async def cancel_job(self, job_id: str) -> bool:
         """
@@ -638,3 +656,38 @@ class Executor:
             Dictionary of job_id to Job object
         """
         return self._active_jobs.copy()
+    
+    async def _calculate_job_metrics(self, job: Job, work_dir: Path) -> Dict:
+        """
+        Calculate metrics for a completed inference job
+        
+        Args:
+            job: Job object
+            work_dir: Working directory with results
+            
+        Returns:
+            Dictionary with calculated metrics
+        """
+        results_file = work_dir / "output" / "results.json"
+        
+        if not results_file.exists():
+            logger.warning(f"Results file not found: {results_file}")
+            return {"error": "Results file not found"}
+        
+        try:
+            with open(results_file, 'r') as f:
+                results_data = json.load(f)
+            
+            if results_data.get("phase") != "inference":
+                return {"error": "Not an inference job"}
+            
+            if results_data.get("status") != "success":
+                return {"error": f"Inference failed: {results_data.get('error')}"}
+            
+            metrics = calculate_detailed_metrics(results_data)
+            
+            return metrics
+            
+        except Exception as e:
+            logger.error(f"Failed to calculate metrics: {e}")
+            return {"error": str(e)}

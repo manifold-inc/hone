@@ -95,6 +95,8 @@ class Job:
     current_phase: Optional[str] = None
     progress_percentage: float = 0.0
 
+    metrics: Optional[Dict] = None
+
 
 class JobQueue:
     """

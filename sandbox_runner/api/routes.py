@@ -2,7 +2,7 @@
 API Routes Module
 """
 
-from typing import Optional, List
+from typing import Optional, List, Dict
 from datetime import datetime
 from enum import Enum
 
@@ -300,6 +300,50 @@ def create_router(config: Config) -> APIRouter:
             priority=job_data["priority"]
         )
     
+    @router.get(
+        "/jobs/{job_id}/metrics",
+        response_model=Dict,
+        summary="Get job metrics"
+    )
+    async def get_job_metrics(
+        job_id: str,
+        auth: tuple = Depends(authenticate_request),
+        meta_manager = Depends(get_meta_manager)
+    ):
+        """Get calculated metrics for a completed job."""
+        validator_id, _ = auth
+        
+        logger.info(f"Job metrics query: {job_id} from {validator_id}")
+        
+        job_data = await meta_manager.get_job_status(job_id)
+        
+        if not job_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job not found: {job_id}"
+            )
+        
+        metrics_data = await meta_manager.get_job_metrics(job_id)
+        
+        if not metrics_data:
+            if job_data["status"] != "completed":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Job metrics not available. Job status: {job_data['status']}"
+                )
+            else:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Metrics not found for job: {job_id}"
+                )
+        
+        return {
+            "job_id": job_id,
+            "status": job_data["status"],
+            "metrics": metrics_data,
+            "completed_at": job_data.get("completed_at")
+        }
+
     @router.delete(
         "/jobs/{job_id}",
         summary="Cancel a job"
