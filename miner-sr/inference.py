@@ -162,7 +162,8 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     os.environ['HF_HUB_CACHE'] = str(cache_dir)
     os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
     os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
-    os.environ['HF_HUB_OFFLINE'] = '1'  # Force offline mode
+    os.environ['TRANSFORMERS_OFFLINE'] = '1'  # Force offline mode
+    os.environ['HF_DATASETS_OFFLINE'] = '1'
     
     # vLLM expects model name, not path - it will find it in the cache
     print(f"\n[2/5] Cache directory: {cache_dir}")
@@ -195,9 +196,11 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     try:
         from vllm import LLM, SamplingParams
         
-        # Use model name - vLLM will find it in HF_HOME cache
+        # Point directly to the downloaded model directory
+        model_path = cache_dir / "unsloth--Meta-Llama-3.1-8B-Instruct"
+        
         llm = LLM(
-            model=model_name,
+            model=str(model_path),
             dtype="half" if gpu_available else "float32",
             gpu_memory_utilization=0.8,
             max_model_len=2048,
