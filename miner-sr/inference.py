@@ -63,8 +63,8 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print("=" * 60)
     
     # Load input to see what model we need
-    input_data = load_input_data(input_dir)
-    model_name = input_data.get("model", "Qwen/Qwen3-0.6B")
+    #input_data = load_input_data(input_dir)
+    model_name = "Qwen/Qwen3-0.6B"#input_data.get("model", "Qwen/Qwen3-0.6B")
     
     print(f"\n[1/3] Model to download: {model_name}")
     
@@ -99,7 +99,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
             tokenizer_mode="auto",
             load_format="auto",
         )
-        print(f"✓ Model downloaded successfully to: {local_model_path}")
+        print(f"✓ Model downloaded successfully to: {cache_dir}")
         
         # Also pre-load with transformers to ensure tokenizer is cached
         print("\n[3/3] Pre-loading model with transformers to cache tokenizer...")

@@ -1,8 +1,1 @@
 vllm
-torch
-transformers
-huggingface-hub
-
-accelerate
-sentencepiece
-protobuf
