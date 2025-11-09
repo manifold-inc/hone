@@ -150,13 +150,13 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     
     # Load input data
     print("\n[1/5] Loading input data...")
-    input_data = load_input_data(input_dir)
+    #input_data = load_input_data(input_dir)
     
     # Get parameters
-    prompts = input_data.get("prompts", ["Hello! How are you today?"])
-    model_name = input_data.get("model", "Qwen/Qwen3-0.6B")
-    max_tokens = input_data.get("max_tokens", 50)
-    temperature = input_data.get("temperature", 0.7)
+    prompts = "Hello! How are you today"#input_data.get("prompts", ["Hello! How are you today?"])
+    model_name = "Qwen/Qwen3-0.6B"#input_data.get("model", "Qwen/Qwen3-0.6B")
+    max_tokens = 50#input_data.get("max_tokens", 50)
+    temperature = 0.7#input_data.get("temperature", 0.7)
     
     print(f"\nConfiguration:")
     print(f"  Model: {model_name}")
