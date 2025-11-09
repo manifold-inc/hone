@@ -161,27 +161,15 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
     os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
     
-    # Find the downloaded model directory
-    model_path = cache_dir / model_name.replace("/", "--")
-    
+    # vLLM expects model name, not path - it will find it in the cache
     print(f"\n[2/5] Cache directory: {cache_dir}")
-    print(f"[2/5] Model path: {model_path}")
     
-    if model_path.exists():
-        file_count = len(list(model_path.glob('*')))
-        print(f"  Model directory exists with {file_count} files")
-        
-        # List some key files
-        key_files = ['config.json', 'tokenizer.json', 'tokenizer_config.json']
-        for key_file in key_files:
-            file_path = model_path / key_file
-            if file_path.exists():
-                print(f"  ✓ Found {key_file}")
-            else:
-                print(f"  ✗ Missing {key_file}")
+    if cache_dir.exists():
+        file_count = len(list(cache_dir.glob('*')))
+        print(f"  Cache exists with {file_count} items")
     else:
-        print("  ERROR: Model directory not found!")
-        print(f"  Available directories in cache: {list(cache_dir.glob('*'))}")
+        print("  ERROR: Cache directory not found!")
+        print(f"  Available directories: {list(Path('/app').glob('*'))}")
     
     # Check GPU
     print(f"\n[3/5] Checking GPU availability...")
@@ -204,16 +192,15 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     try:
         from vllm import LLM, SamplingParams
         
-        # Use the local path directly
+        # Use model name - vLLM will find it in HF_HOME cache
         llm = LLM(
-            model=str(model_path),
+            model=model_name,
             dtype="half" if gpu_available else "float32",
             gpu_memory_utilization=0.8,
             max_model_len=2048,
             trust_remote_code=True,
             tensor_parallel_size=1,
             tokenizer_mode="auto",
-            download_dir=str(cache_dir),
         )
         print("✓ Model loaded successfully from cache!")
         
