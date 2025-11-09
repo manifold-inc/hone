@@ -117,7 +117,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     temperature = 0.7
     
     # Get vLLM API endpoint from environment
-    vllm_api_base = os.getenv('VLLM_API_BASE', 'http://localhost:6919')
+    vllm_api_base = os.getenv('VLLM_API_BASE', 'http://localhost:8000')
     
     print(f"\nConfiguration:")
     print(f"  Model: {model_name}")
@@ -141,6 +141,25 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         else:
             raise RuntimeError(f"vLLM API unhealthy: {response.status_code}")
         
+
+        print(f"\n🔍 Checking available models...")
+        try:
+            models_response = client.models.list()
+            print(f"Available models:")
+            for model in models_response.data:
+                print(f"  - {model.id}")
+            
+            # Try to use the first available model if our target doesn't exist
+            if models_response.data:
+                available_model_id = models_response.data[0].id
+                print(f"\n💡 Will use model: {available_model_id}")
+                model_name = available_model_id
+            else:
+                print("⚠ No models found!")
+        except Exception as e:
+            print(f"⚠ Could not list models: {e}")
+            print(f"Will try with original model name: {model_name}")
+
         # Run inference
         outputs = []
         print(f"\nRunning inference on {len(prompts)} prompts...")

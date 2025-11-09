@@ -1037,6 +1037,7 @@ class DockerOnlyExecutor:
         """Stop and remove vLLM container."""
         try:
             if container:
+                
                 logger.info(f"Stopping vLLM container: {container.id[:12]}")
                 await asyncio.get_event_loop().run_in_executor(
                     None, lambda: container.stop(timeout=10)
