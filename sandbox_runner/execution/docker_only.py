@@ -960,7 +960,6 @@ class DockerOnlyExecutor:
             },
             'detach': True,
             'auto_remove': False,
-            'network_mode': 'host',
             'ports': {'{port}/tcp': port}
         }
         
