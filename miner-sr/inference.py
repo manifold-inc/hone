@@ -79,6 +79,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     
     # Set HF_HOME to ensure models go to the right place
     os.environ['HF_HOME'] = str(cache_dir)
+    os.environ['HF_HUB_CACHE'] = str(cache_dir)
     os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
     os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
     
@@ -158,8 +159,10 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     # Set cache directories (MUST match prep phase)
     cache_dir = Path("/app/models")
     os.environ['HF_HOME'] = str(cache_dir)
+    os.environ['HF_HUB_CACHE'] = str(cache_dir)
     os.environ['TRANSFORMERS_CACHE'] = str(cache_dir)
     os.environ['HF_DATASETS_CACHE'] = str(cache_dir)
+    os.environ['HF_HUB_OFFLINE'] = '1'  # Force offline mode
     
     # vLLM expects model name, not path - it will find it in the cache
     print(f"\n[2/5] Cache directory: {cache_dir}")
