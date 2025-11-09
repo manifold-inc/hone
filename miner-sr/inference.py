@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
-LLM Miner using vLLM OpenAI-compatible server
+LLM Miner using vLLM docker container
 """
 
 import argparse
 import json
 import os
 import sys
-import subprocess
-import time
 import requests
 from pathlib import Path
 from typing import Dict, Any
@@ -17,19 +15,6 @@ print("Starting inference script...")
 print(f"Python version: {sys.version}")
 print(f"Current directory: {os.getcwd()}")
 print(f"Arguments: {sys.argv}")
-
-
-def load_input_data(input_dir: Path) -> Dict[str, Any]:
-    """Load input data from mounted directory."""
-    input_path = input_dir / "input.json"
-    
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-    
-    with open(input_path, 'r') as f:
-        data = json.load(f)
-    
-    return data
 
 
 def save_output_data(results: Dict[str, Any], output_dir: Path):
@@ -49,6 +34,8 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print("PREP PHASE - Downloading model")
     print("=" * 60)
     
+    from huggingface_hub import snapshot_download
+    
     model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
     cache_dir = Path("/app/models")
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -56,8 +43,6 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print(f"\n[1/3] Model to download: {model_name}")
     print(f"[2/3] Downloading model to {cache_dir}...")
     print("(This requires internet access)")
-    
-    from huggingface_hub import snapshot_download
     
     try:
         print("\n[3/3] Downloading model files...")
@@ -78,12 +63,25 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
         print("✓ Model download verified")
         print(f"✓ Files in model directory: {len(list(Path(downloaded_path).glob('*')))}")
         
+        # Save model info for vLLM to use
+        model_info = {
+            "model_name": model_name,
+            "model_path": str(local_dir),
+            "downloaded_path": downloaded_path
+        }
+        
+        # Save model info to output directory
+        model_info_path = output_dir / "model_info.json"
+        with open(model_info_path, 'w') as f:
+            json.dump(model_info, f, indent=2)
+        
         prep_results = {
             "phase": "prep",
             "model": model_name,
             "status": "success",
             "message": f"Model downloaded to {downloaded_path}",
-            "cache_dir": str(cache_dir)
+            "cache_dir": str(cache_dir),
+            "model_info": model_info
         }
         
     except Exception as e:
@@ -104,128 +102,13 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print("=" * 60)
 
 
-def start_vllm_server(model_path: str, port: int = 8000) -> subprocess.Popen:
-    """Start vLLM OpenAI-compatible server."""
-    print(f"\n[1/4] Starting vLLM server on port {port}...")
-    
-    cmd = [
-        "python3", "-m", "vllm.entrypoints.openai.api_server",
-        "--model", model_path,
-        "--host", "0.0.0.0",
-        "--port", str(port),
-        "--dtype", "half",
-        "--max-model-len", "2048",
-        "--gpu-memory-utilization", "0.8",
-    ]
-    
-    # Check GPU availability
-    try:
-        import torch
-        if torch.cuda.is_available():
-            gpu_count = torch.cuda.device_count()
-            print(f"✓ GPU Available: {torch.cuda.get_device_name(0)} (count: {gpu_count})")
-            if gpu_count > 1:
-                cmd.extend(["--tensor-parallel-size", str(gpu_count)])
-        else:
-            print("⚠ No GPU detected, server may be slow")
-    except Exception as e:
-        print(f"⚠ Could not check GPU: {e}")
-    
-    print(f"Command: {' '.join(cmd)}")
-    
-    # Start server as subprocess
-    process = subprocess.Popen(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        universal_newlines=True,
-        bufsize=1
-    )
-    
-    # Wait for server to be ready
-    print("\n[2/4] Waiting for vLLM server to be ready...")
-    max_wait = 120  # 2 minutes
-    start_time = time.time()
-    
-    while time.time() - start_time < max_wait:
-        try:
-            response = requests.get(f"http://localhost:{port}/health", timeout=1)
-            if response.status_code == 200:
-                print("✓ vLLM server is ready!")
-                return process
-        except requests.exceptions.RequestException:
-            pass
-        
-        # Check if process died
-        if process.poll() is not None:
-            output, _ = process.communicate()
-            print(f"ERROR: vLLM server process died!")
-            print(f"Output: {output}")
-            raise RuntimeError("vLLM server failed to start")
-        
-        time.sleep(2)
-        print(".", end="", flush=True)
-    
-    raise TimeoutError("vLLM server failed to start within timeout")
-
-
-def run_inference_with_openai_client(prompts: list, port: int = 8000, **kwargs):
-    """Run inference using OpenAI-compatible API."""
-    from openai import OpenAI
-    
-    # Create client pointing to local vLLM server
-    client = OpenAI(
-        api_key="EMPTY",  # vLLM doesn't require API key
-        base_url=f"http://localhost:{port}/v1"
-    )
-    
-    results = []
-    
-    print(f"\n[3/4] Running inference on {len(prompts)} prompts...")
-    
-    for i, prompt in enumerate(prompts, 1):
-        try:
-            print(f"  Processing prompt {i}/{len(prompts)}...")
-            
-            response = client.chat.completions.create(
-                model="unsloth/Meta-Llama-3.1-8B-Instruct",  # Model name doesn't matter for vLLM
-                messages=[
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=kwargs.get("max_tokens", 50),
-                temperature=kwargs.get("temperature", 0.7),
-            )
-            
-            generated_text = response.choices[0].message.content
-            
-            results.append({
-                "prompt": prompt,
-                "generated_text": generated_text,
-                "finish_reason": response.choices[0].finish_reason,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens,
-                }
-            })
-            
-            print(f"    ✓ Generated {response.usage.completion_tokens} tokens")
-            
-        except Exception as e:
-            print(f"    ✗ Error: {e}")
-            results.append({
-                "prompt": prompt,
-                "error": str(e)
-            })
-    
-    return results
-
-
 def run_inference_phase(input_dir: Path, output_dir: Path):
     """Inference phase: Use external vLLM API for inference."""
     print("\n" + "=" * 60)
     print("INFERENCE PHASE - Using vLLM API")
     print("=" * 60)
+    
+    from openai import OpenAI
     
     # Configuration
     prompts = ["Hello! How are you today?"]
@@ -244,8 +127,6 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     print(f"  Temperature: {temperature}")
     
     try:
-        from openai import OpenAI
-        
         # Create client pointing to vLLM server
         client = OpenAI(
             api_key="EMPTY",
@@ -299,20 +180,10 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         
         print(f"\nCompleted inference")
         
-        # Check GPU usage
-        try:
-            import torch
-            gpu_used = torch.cuda.is_available()
-            if gpu_used:
-                print(f"✓ GPU available (used by vLLM server)")
-        except:
-            gpu_used = False
-        
         results = {
             "phase": "inference",
             "model": model_name,
             "vllm_api": vllm_api_base,
-            "gpu_used": gpu_used,
             "num_prompts": len(prompts),
             "status": "success",
             "outputs": outputs

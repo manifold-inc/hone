@@ -870,7 +870,7 @@ class DockerOnlyExecutor:
             logger.info("PHASE 3: INFERENCE - Using vLLM API")
             logger.info("=" * 60)
             
-            job.custom_env_vars['VLLM_API_BASE'] = f'http://host.docker.internal:{vllm_port}'
+            job.custom_env_vars['VLLM_API_BASE'] = f'http://localhost:{vllm_port}'
             
             inf_exit_code, inf_stdout, inf_stderr = await self.run_container(
                 image_id=image_id,
@@ -934,13 +934,13 @@ class DockerOnlyExecutor:
                 '--max-model-len', '2048',
                 '--gpu-memory-utilization', '0.8',
             ],
-            'ports': {f'{port}/tcp': port},
+            # Remove ports when using host network mode
             'volumes': {
                 str(models_dir): {'bind': '/app/models', 'mode': 'ro'}
             },
             'detach': True,
             'auto_remove': False,
-            'network_mode': 'host',
+            'network_mode': 'host',  # Use host network, no port mapping needed
         }
         
         # Add GPU support
