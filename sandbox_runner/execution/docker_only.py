@@ -941,13 +941,14 @@ class DockerOnlyExecutor:
         else:
             model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
         
-        model_path = str(models_dir / model_name.replace("/", "--"))
+        model_dir_name = model_name.replace("/", "--")
+        model_path_in_container = f"/app/models/{model_dir_name}"
         
         config = {
             'image': vllm_image,
             'name': container_name,
             'command': [
-                '--model', model_path,
+                '--model', model_path_in_container,
                 '--host', '0.0.0.0',
                 '--port', str(port),
                 '--dtype', 'half',
