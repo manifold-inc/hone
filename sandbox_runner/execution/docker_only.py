@@ -960,7 +960,7 @@ class DockerOnlyExecutor:
             },
             'detach': True,
             'auto_remove': False,
-            'ports': {'{port}/tcp': port}
+            'ports': {f'{port}/tcp': port}
         }
         
         # Add GPU support
