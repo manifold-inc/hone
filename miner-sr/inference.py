@@ -64,7 +64,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     
     # Load input to see what model we need
     #input_data = load_input_data(input_dir)
-    model_name = "meta-llama/Llama-3.1-8B-Instruct"#input_data.get("model", "meta-llama/Llama-3.1-8B-Instruct")
+    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"#input_data.get("model", "unsloth/Meta-Llama-3.1-8B-Instruct")
     
     print(f"\n[1/3] Model to download: {model_name}")
     
@@ -154,7 +154,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     
     # Get parameters
     prompts = "Hello! How are you today"#input_data.get("prompts", ["Hello! How are you today?"])
-    model_name = "meta-llama/Llama-3.1-8B-Instruct"#input_data.get("model", "meta-llama/Llama-3.1-8B-Instruct")
+    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"#input_data.get("model", "unsloth/Meta-Llama-3.1-8B-Instruct")
     max_tokens = 50#input_data.get("max_tokens", 50)
     temperature = 0.7#input_data.get("temperature", 0.7)
     
