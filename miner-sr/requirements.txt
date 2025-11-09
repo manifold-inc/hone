@@ -1,2 +1,8 @@
-vllm==0.10.2
+vllm
+torch
+transformers
 huggingface-hub
+
+accelerate
+sentencepiece
+protobuf
