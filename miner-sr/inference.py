@@ -117,7 +117,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
     temperature = 0.7
     
     # Get vLLM API endpoint from environment
-    vllm_api_base = os.getenv('VLLM_API_BASE', 'http://localhost:8000')
+    vllm_api_base = os.getenv('VLLM_API_BASE', 'http://localhost:6919')
     
     print(f"\nConfiguration:")
     print(f"  Model: {model_name}")

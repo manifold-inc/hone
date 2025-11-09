@@ -902,7 +902,7 @@ class DockerOnlyExecutor:
         self,
         job: Job,
         models_dir: Path,
-        port: int = 8000
+        port: int = 6919
     ) -> Tuple[Any, str]:
         """
         Start vLLM container with models mounted.
@@ -961,6 +961,7 @@ class DockerOnlyExecutor:
             'detach': True,
             'auto_remove': False,
             'network_mode': 'host',
+            'ports': {'{port}/tcp': port}
         }
         
         # Add GPU support
