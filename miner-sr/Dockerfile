@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
+# CRITICAL FIX: Upgrade pip to avoid the AssertionError bug in Ubuntu's packaged pip
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
 # Create model cache directory with proper permissions
 # This directory will persist between prep and inference phases
 RUN mkdir -p /app/models && \
