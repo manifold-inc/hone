@@ -794,17 +794,29 @@ class DockerOnlyExecutor:
                 logger.warning(f"Failed to remove network {network_name}: {e}")
     
     async def _create_network(self, network_name: str):
-        """Create a Docker network for job isolation."""
+        """Create an isolated Docker network without internet access."""
         try:
+            ipam_pool = docker.types.IPAMPool(
+                subnet='172.28.0.0/16',
+                gateway='172.28.0.1'  # Gateway for internal routing only
+            )
+            ipam_config = docker.types.IPAMConfig(
+                pool_configs=[ipam_pool]
+            )
+            
             network = await asyncio.get_event_loop().run_in_executor(
                 None,
                 lambda: self.docker_client.networks.create(
                     network_name,
                     driver="bridge",
-                    check_duplicate=True
+                    check_duplicate=True,
+                    ipam=ipam_config,
+                    options={
+                        "com.docker.network.bridge.enable_ip_masquerade": "false"  # Disable NAT
+                    }
                 )
             )
-            logger.info(f"Created Docker network: {network_name}")
+            logger.info(f"Created isolated Docker network: {network_name}")
             return network
         except Exception as e:
             logger.error(f"Failed to create network {network_name}: {e}")

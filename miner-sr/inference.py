@@ -28,6 +28,7 @@ class ARCSolver:
         self.use_vllm = use_vllm
         self.vllm_available = False
         self.vllm_client = None
+        self.vllm_model_name = None  # Store actual model name from vLLM
         
         print("🔧 ARCSolver initialized")
         
@@ -44,7 +45,7 @@ class ARCSolver:
         ]
     
     def _init_vllm_client(self):
-        """Initialize vLLM client"""
+        """Initialize vLLM client and discover actual model name"""
         try:
             from openai import OpenAI
             
@@ -57,22 +58,35 @@ class ARCSolver:
                 api_key="dummy"  # vLLM doesn't require real API key
             )
             
-            # Test connection
+            # Test connection and get actual model name
             try:
                 models = self.vllm_client.models.list()
                 self.vllm_available = True
-                print(f"✓ vLLM connection successful! Available models: {[m.id for m in models.data]}")
+                model_ids = [m.id for m in models.data]
+                print(f"✓ vLLM connection successful! Available models: {model_ids}")
+                
+                # Store the actual model name to use for completions
+                if model_ids:
+                    self.vllm_model_name = model_ids[0]
+                    print(f"✓ Using model name: {self.vllm_model_name}")
+                else:
+                    print("⚠ No models available from vLLM")
+                    self.vllm_available = False
+                    self.vllm_model_name = None
             except Exception as e:
                 print(f"⚠ vLLM connection test failed: {e}")
                 print("  Will fall back to rule-based methods")
                 self.vllm_available = False
+                self.vllm_model_name = None
                 
         except ImportError:
             print("⚠ OpenAI client not available, using rule-based methods only")
             self.vllm_available = False
+            self.vllm_model_name = None
         except Exception as e:
             print(f"⚠ Failed to initialize vLLM client: {e}")
             self.vllm_available = False
+            self.vllm_model_name = None
     
     def solve(self, train_examples: List[Dict], test_input: List[List[int]]) -> List[List[int]]:
         """
@@ -83,7 +97,7 @@ class ARCSolver:
             test_input: The test input grid to solve
         """
         # Try vLLM first if available
-        if self.vllm_available and self.vllm_client:
+        if self.vllm_available and self.vllm_client and self.vllm_model_name:
             try:
                 result = self._solve_with_vllm(train_examples, test_input)
                 if result and self._is_valid_output(result):
@@ -120,9 +134,9 @@ class ARCSolver:
         prompt = self._create_arc_prompt(train_examples, test_input)
         
         try:
-            # Call vLLM API
+            # Call vLLM API with the actual model name
             response = self.vllm_client.chat.completions.create(
-                model="unsloth/Meta-Llama-3.1-8B-Instruct",
+                model=self.vllm_model_name,  # Use discovered model name
                 messages=[
                     {
                         "role": "system",
