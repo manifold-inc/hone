@@ -844,7 +844,6 @@ class DockerOnlyExecutor:
         
         logger.info(f"Starting vLLM container: {container_name} on network {network_name}")
         
-        # Check if image exists, pull if not
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.images.get(vllm_image)
@@ -881,7 +880,6 @@ class DockerOnlyExecutor:
                 '--host', '0.0.0.0',
                 '--port', str(port),
                 '--dtype', 'half',
-                '--max-model-len', '2048',
                 '--gpu-memory-utilization', '0.8',
             ],
             'volumes': {
@@ -889,11 +887,9 @@ class DockerOnlyExecutor:
             },
             'detach': True,
             'auto_remove': False,
-            'network': network_name,  # NEW: Attach to shared network
-            # No port mapping needed - containers communicate via network
+            'network': network_name,  
         }
         
-        # Add GPU support
         if job.assigned_gpus:
             config['device_requests'] = [
                 docker.types.DeviceRequest(
