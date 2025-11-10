@@ -671,11 +671,7 @@ class DockerOnlyExecutor:
             return True
         except Exception:
             return False
-    
-    # =========================================================================
-    # NEW METHODS: vLLM Pipeline with Shared Network
-    # =========================================================================
-        
+            
     async def run_job_with_vllm(
         self,
         image_id: str,
@@ -686,13 +682,6 @@ class DockerOnlyExecutor:
     ) -> Tuple[int, str, str]:
         """
         Run complete job with vLLM pipeline using shared Docker network.
-        
-        1. Create shared Docker network
-        2. Run prep phase (download models)
-        3. Start vLLM container on shared network
-        4. Run inference phase (use vLLM API) on shared network
-        5. Stop vLLM container
-        6. Clean up network
         """
         network_name = f"sandbox-job-{job.job_id}"
         vllm_container = None
@@ -700,7 +689,6 @@ class DockerOnlyExecutor:
         models_dir = work_dir / 'models'
         
         try:
-            # Step 1: Create shared Docker network
             logger.info("=" * 60)
             logger.info(f"STEP 0: Creating shared network {network_name}")
             logger.info("=" * 60)
@@ -708,7 +696,6 @@ class DockerOnlyExecutor:
             network = await self._create_network(network_name)
             logger.info(f"✓ Created network: {network_name}")
             
-            # Step 2: Run prep phase
             logger.info("=" * 60)
             logger.info("STEP 1: PREP - Downloading models")
             logger.info("=" * 60)
@@ -720,7 +707,7 @@ class DockerOnlyExecutor:
                 network_enabled=True,
                 work_dir=work_dir,
                 timeout_seconds=prep_timeout,
-                network_name=network_name  # NEW: use shared network
+                network_name=None
             )
             
             if prep_exit_code != 0:
@@ -729,7 +716,6 @@ class DockerOnlyExecutor:
             
             logger.info("✓ Prep phase completed successfully")
             
-            # Step 3: Start vLLM container
             logger.info("=" * 60)
             logger.info("STEP 2: Starting vLLM server")
             logger.info("=" * 60)
@@ -737,11 +723,10 @@ class DockerOnlyExecutor:
             vllm_container, vllm_id = await self.start_vllm_container(
                 job=job,
                 models_dir=models_dir,
-                network_name=network_name,  # NEW: use shared network
+                network_name=network_name,
                 port=vllm_port
             )
             
-            # Step 4: Wait for vLLM to be ready (check logs for "application startup complete.")
             vllm_ready = await self.wait_for_vllm_ready_from_logs(
                 container=vllm_container,
                 timeout_seconds=300
@@ -750,12 +735,10 @@ class DockerOnlyExecutor:
             if not vllm_ready:
                 raise DockerExecutionError("vLLM failed to start")
             
-            # Step 5: Run inference phase
             logger.info("=" * 60)
             logger.info("STEP 3: INFERENCE - Using vLLM API")
             logger.info("=" * 60)
             
-            # NEW: Update vLLM API base to use container name on shared network
             vllm_container_name = f"vllm-{job.job_id}"
             job.custom_env_vars['VLLM_API_BASE'] = f'http://{vllm_container_name}:{vllm_port}'
             
@@ -765,10 +748,10 @@ class DockerOnlyExecutor:
                 image_id=image_id,
                 job=job,
                 phase="inference",
-                network_enabled=False,  # Block internet, but keep network for vLLM
+                network_enabled=False,
                 work_dir=work_dir,
                 timeout_seconds=inference_timeout,
-                network_name=network_name  # NEW: use shared network to reach vLLM
+                network_name=network_name
             )
             
             if inf_exit_code != 0:
