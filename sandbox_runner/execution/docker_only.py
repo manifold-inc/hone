@@ -242,7 +242,7 @@ class DockerOnlyExecutor:
         network_enabled: bool,
         work_dir: Path,
         timeout_seconds: int,
-        network_name: str = None  # NEW: optional network name
+        network_name: str = None
     ) -> Tuple[int, str, str]:
         """
         Run a container for a specific job phase
@@ -282,7 +282,7 @@ class DockerOnlyExecutor:
             network_enabled=network_enabled,
             work_dir=work_dir,
             container_name=container_name,
-            network_name=network_name  # NEW: pass network name
+            network_name=network_name 
         )
         
         container = None
@@ -380,7 +380,7 @@ class DockerOnlyExecutor:
         network_enabled: bool,
         work_dir: Path,
         container_name: str,
-        network_name: str = None  # NEW: optional network name
+        network_name: str = None
     ) -> Dict:
         """
         Build Docker container configuration
@@ -431,7 +431,6 @@ class DockerOnlyExecutor:
             }
         )
         
-        # NEW: Use custom network if provided, otherwise fall back to old logic
         if network_name:
             network_mode = network_name
         else:
@@ -475,7 +474,6 @@ class DockerOnlyExecutor:
             'cap_drop': cap_drop,
         }
         
-        # NEW: Set network based on whether custom network is provided
         if network_name:
             config['network'] = network_name
         else:
@@ -941,7 +939,6 @@ class DockerOnlyExecutor:
         
         start_time = time.time()
         
-        # Start log streaming task
         found_startup_complete = asyncio.Event()
         
         async def stream_logs():
@@ -955,7 +952,6 @@ class DockerOnlyExecutor:
                     for ln in text.splitlines():
                         display.update(ln)
                         
-                        # NEW: Check for "application startup complete." (case-insensitive)
                         if "application startup complete" in ln.lower():
                             found_startup_complete.set()
                             return
@@ -968,7 +964,6 @@ class DockerOnlyExecutor:
         
         try:
             while time.time() - start_time < timeout_seconds:
-                # Check if we found the startup message
                 if found_startup_complete.is_set():
                     log_task.cancel()
                     try:
@@ -977,10 +972,8 @@ class DockerOnlyExecutor:
                         pass
                     
                     display.end("✅ vLLM API READY")
-                    logger.info("✓ vLLM API is ready! (found 'application startup complete.')")
                     return True
                 
-                # Check if container died
                 await asyncio.get_event_loop().run_in_executor(
                     None, container.reload
                 )
@@ -996,7 +989,7 @@ class DockerOnlyExecutor:
                     return False
                 
                 elapsed = time.time() - start_time
-                if int(elapsed) % 10 == 0:  # Log every 10 seconds
+                if int(elapsed) % 10 == 0:
                     display.write_below_box(
                         f"⏳ Waiting for vLLM startup... ({elapsed:.0f}s/{timeout_seconds}s)"
                     )
