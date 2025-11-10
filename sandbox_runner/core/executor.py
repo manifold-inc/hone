@@ -204,22 +204,21 @@ class Executor:
             
             job.current_phase = "calculating_metrics"
             job.progress_percentage = 90.0
-            if job.current_phase in ["inference", "vllm_pipeline"]:
-                try:
-                    logger.info(f"Calculating metrics for job {job_id}")
-                    metrics = await self._calculate_job_metrics(job, work_dir)
-                    
-                    job.metrics = metrics
-                    
-                    metrics_path = work_dir / "output" / "metrics.json"
-                    metrics_path.parent.mkdir(parents=True, exist_ok=True)
-                    with open(metrics_path, 'w') as f:
-                        json.dump(metrics, f, indent=2)
-                    
-                    logger.info(f"Metrics calculated: {metrics['aggregate']}")
-                    
-                except Exception as e:
-                    logger.warning(f"Failed to calculate metrics for job {job_id}: {e}")
+            try:
+                logger.info(f"Calculating metrics for job {job_id}")
+                metrics = await self._calculate_job_metrics(job, work_dir)
+                
+                job.metrics = metrics
+                
+                metrics_path = work_dir / "output" / "metrics.json"
+                metrics_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(metrics_path, 'w') as f:
+                    json.dump(metrics, f, indent=2)
+                
+                logger.info(f"Metrics calculated: {metrics['aggregate']}")
+                
+            except Exception as e:
+                logger.warning(f"Failed to calculate metrics for job {job_id}: {e}")
 
             job.status = JobStatus.COMPLETED
             job.completed_at = datetime.utcnow()
