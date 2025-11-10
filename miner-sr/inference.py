@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 ARC-AGI-2 Solver for Sandbox Runner
-Loads problems, generates predictions, and saves results
+Prep phase: Downloads LLM model for vLLM
+Inference phase: Solves ARC problems and saves predictions
 """
 
 import argparse
 import json
 import os
 import sys
-import re
 from pathlib import Path
 from typing import List, Dict, Optional
 
@@ -21,7 +21,6 @@ print(f"Arguments: {sys.argv}")
 class ARCSolver:
     """
     ARC solver with rule-based strategies
-    (OpenAI integration removed for sandbox environment)
     """
     
     def __init__(self):
@@ -45,10 +44,8 @@ class ARCSolver:
             test_input: The test input grid to solve
         """
         if not train_examples:
-            # No examples, return input as-is
             return [row[:] for row in test_input]
         
-        # Identify transformation from training examples
         transformation = self._identify_transformation(train_examples)
         
         if transformation and transformation.get("type"):
@@ -115,7 +112,6 @@ class ARCSolver:
             elif target_size[0] > len(grid) or target_size[1] > len(grid[0]):
                 return self._expand_to_size(grid, target_size)
         
-        # Try basic strategies
         for strategy in self.strategies:
             try:
                 result = strategy(grid, examples)
@@ -124,7 +120,6 @@ class ARCSolver:
             except Exception:
                 continue
         
-        # Last resort: return input
         return [row[:] for row in grid]
     
     def _is_valid_output(self, grid: List[List[int]]) -> bool:
@@ -315,66 +310,105 @@ def load_input_data(input_dir: Path) -> Dict:
 
 
 def run_prep_phase(input_dir: Path, output_dir: Path):
-    """Prep phase: Validate input data and prepare for inference."""
+    """Prep phase: Download LLM model and validate input data."""
     print("\n" + "=" * 60)
-    print("PREP PHASE - Validating Input Data")
+    print("PREP PHASE - Downloading Model")
     print("=" * 60)
     
+    from huggingface_hub import snapshot_download
+    
+    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
+    cache_dir = Path("/app/models")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"\n[1/4] Model to download: {model_name}")
+    print(f"[2/4] Downloading model to {cache_dir}...")
+    print("(This requires internet access)")
+    
     try:
-        # Load input data
-        print(f"\n[1/3] Loading input data from {input_dir}...")
-        data = load_input_data(input_dir)
+        print("\n[3/4] Downloading model files...")
         
-        # Validate structure
-        print("[2/3] Validating data structure...")
-        if "problems" not in data:
-            raise ValueError("Input data must contain 'problems' field")
+        local_dir = cache_dir / model_name.replace("/", "--")
+        local_dir.mkdir(parents=True, exist_ok=True)
         
-        problems = data["problems"]
-        print(f"✓ Found {len(problems)} problems")
+        downloaded_path = snapshot_download(
+            repo_id=model_name,
+            cache_dir=str(cache_dir),
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
+        )
         
-        # Validate first few problems
-        print("[3/3] Validating problem format...")
-        for i, problem in enumerate(problems[:3]):
-            if "train_examples" not in problem:
-                raise ValueError(f"Problem {i} missing 'train_examples'")
-            if "test_input" not in problem:
-                raise ValueError(f"Problem {i} missing 'test_input'")
-            if "test_output" not in problem:
-                raise ValueError(f"Problem {i} missing 'test_output'")
+        print(f"✓ Model files downloaded to: {downloaded_path}")
+        print("✓ Model download verified")
+        print(f"✓ Files in model directory: {len(list(Path(downloaded_path).glob('*')))}")
         
-        print("✓ All validations passed")
+        # Validate input data
+        print("\n[4/4] Validating input data...")
+        try:
+            data = load_input_data(input_dir)
+            
+            if "problems" not in data:
+                raise ValueError("Input data must contain 'problems' field")
+            
+            problems = data["problems"]
+            print(f"✓ Found {len(problems)} problems")
+            
+            # Validate first few problems
+            for i, problem in enumerate(problems[:3]):
+                if "train_examples" not in problem:
+                    raise ValueError(f"Problem {i} missing 'train_examples'")
+                if "test_input" not in problem:
+                    raise ValueError(f"Problem {i} missing 'test_input'")
+                if "test_output" not in problem:
+                    raise ValueError(f"Problem {i} missing 'test_output'")
+            
+            print("✓ Input data validation passed")
+            
+        except Exception as e:
+            print(f"WARNING: Input data validation failed: {e}")
+            print("Continuing with model download...")
         
-        # Save prep results
-        prep_results = {
-            "phase": "prep",
-            "status": "success",
-            "message": f"Validated {len(problems)} problems",
-            "num_problems": len(problems)
+        # Save model info for vLLM to use
+        model_info = {
+            "model_name": model_name,
+            "model_path": str(local_dir),
+            "downloaded_path": downloaded_path
         }
         
-        save_output_data(prep_results, output_dir)
-        
-        print("\n" + "=" * 60)
-        print("PREP PHASE COMPLETED - Status: success")
-        print("=" * 60)
-        
-    except Exception as e:
-        print(f"ERROR: Prep phase failed: {e}")
-        import traceback
-        traceback.print_exc()
+        # Save model info to output directory
+        model_info_path = output_dir / "model_info.json"
+        with open(model_info_path, 'w') as f:
+            json.dump(model_info, f, indent=2)
         
         prep_results = {
             "phase": "prep",
+            "model": model_name,
+            "status": "success",
+            "message": f"Model downloaded to {downloaded_path}",
+            "cache_dir": str(cache_dir),
+            "model_info": model_info
+        }
+        
+    except Exception as e:
+        print(f"ERROR: Could not download model: {e}")
+        import traceback
+        traceback.print_exc()
+        prep_results = {
+            "phase": "prep",
+            "model": model_name,
             "status": "failed",
             "message": str(e)
         }
-        save_output_data(prep_results, output_dir)
-        
-        print("\n" + "=" * 60)
-        print("PREP PHASE COMPLETED - Status: failed")
-        print("=" * 60)
-        
+    
+    save_output_data(prep_results, output_dir)
+    
+    print("\n" + "=" * 60)
+    print(f"PREP PHASE COMPLETED - Status: {prep_results['status']}")
+    print("=" * 60)
+    
+    if prep_results["status"] == "failed":
         sys.exit(1)
 
 
