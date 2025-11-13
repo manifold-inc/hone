@@ -669,13 +669,13 @@ class MetaManager:
             except Exception as e:
                 logger.error(f"Failed to read log file: {e}")
         
-        # in case of an error
-        logs = ""
+        # Fallback: return empty logs (FIXED - define logs as a list)
+        logs = []
                 
         return {
             "logs": logs,
             "total_lines": len(logs),
-            "has_more": end_idx < len(logs)
+            "has_more": False  # FIXED - changed from end_idx < len(logs) to False
         }
     
     def _calculate_job_progress(self, job) -> float:
