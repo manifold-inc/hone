@@ -626,56 +626,56 @@ class MetaManager:
         if not job:
             return None
         
-        # Try to read actual logs from work directory
-        log_file = Path(f"/tmp/sandbox-jobs/job_{job_id}/execution.log")
-        
-        if log_file.exists():
+        # Try to get logs from executor (for running jobs)
+        executor_job = await self.executor.get_job(job_id)
+        if executor_job:
+            # For running jobs, try to get container logs
             try:
-                with open(log_file, 'r') as f:
-                    all_lines = f.readlines()
+                import docker
+                client = docker.from_env()
                 
-                # Parse logs into structured format
-                logs = []
-                for line in all_lines:
-                    # Try to parse timestamp and level
-                    parts = line.split('] ', 1)
-                    if len(parts) == 2:
-                        timestamp_level = parts[0].strip('[')
-                        message = parts[1].strip()
+                # Try to find container by name pattern
+                container_name = f"sandbox-{job_id}"
+                try:
+                    containers = client.containers.list(
+                        filters={"name": container_name}
+                    )
+                    
+                    if containers:
+                        container = containers[0]
+                        log_output = container.logs(
+                            stdout=True,
+                            stderr=True,
+                            tail=lines
+                        ).decode('utf-8', errors='replace')
                         
-                        timestamp_parts = timestamp_level.split(' ', 1)
-                        if len(timestamp_parts) == 2:
-                            logs.append({
-                                "timestamp": timestamp_parts[0],
-                                "level": timestamp_parts[1] if len(timestamp_parts) > 1 else "INFO",
-                                "message": message
-                            })
-                        else:
-                            logs.append({
-                                "timestamp": datetime.utcnow().isoformat(),
-                                "level": "INFO",
-                                "message": line.strip()
-                            })
-                
-                start_idx = offset
-                end_idx = offset + lines
-                paginated_logs = logs[start_idx:end_idx]
-                
-                return {
-                    "logs": paginated_logs,
-                    "total_lines": len(logs),
-                    "has_more": end_idx < len(logs)
-                }
+                        # Parse into structured format
+                        log_lines = log_output.split('\n')
+                        logs = []
+                        for line in log_lines:
+                            if line.strip():
+                                logs.append({
+                                    "timestamp": datetime.utcnow().isoformat(),
+                                    "level": "INFO",
+                                    "message": line.strip()
+                                })
+                        
+                        return {
+                            "logs": logs[offset:offset+lines],
+                            "total_lines": len(logs),
+                            "has_more": (offset + lines) < len(logs)
+                        }
+                except Exception as e:
+                    logger.debug(f"Could not fetch container logs: {e}")
             except Exception as e:
-                logger.error(f"Failed to read log file: {e}")
+                logger.debug(f"Docker not available for log fetching: {e}")
         
-        # Fallback: return empty logs (FIXED - define logs as a list)
         logs = []
-                
+        
         return {
-            "logs": logs,
+            "logs": logs[offset:offset+lines],
             "total_lines": len(logs),
-            "has_more": False  # FIXED - changed from end_idx < len(logs) to False
+            "has_more": (offset + lines) < len(logs)
         }
     
     def _calculate_job_progress(self, job) -> float:
