@@ -488,7 +488,7 @@ class DockerOnlyExecutor:
             ]
             config['runtime'] = 'nvidia'
         
-        config['pids_limit'] = self.config.execution.max_processes
+        #config['pids_limit'] = self.config.execution.max_processes
         
         if self.config.security.readonly_rootfs:
             config['read_only'] = True
