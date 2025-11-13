@@ -116,7 +116,18 @@ def create_dashboard_router(config: Config) -> APIRouter:
         
         runner_status = await meta_manager.get_runner_status()        
         gpu_stats = runner_status.get("gpu_stats", {})        
-        queue_stats = runner_status.get("queue_stats", {})        
+        queue_stats = runner_status.get("queue_stats", {})
+        
+        gpu_status = await meta_manager.get_gpu_status()
+        avg_utilization = 0.0
+        avg_temperature = 0.0
+        
+        if gpu_status:
+            total_util = sum(gpu.get("utilization_percent", 0.0) for gpu in gpu_status.values())
+            total_temp = sum(gpu.get("temperature_celsius", 0.0) for gpu in gpu_status.values())
+            avg_utilization = total_util / len(gpu_status)
+            avg_temperature = total_temp / len(gpu_status)
+        
         total_finished = (
             runner_status.get("total_completed", 0) + 
             runner_status.get("total_failed", 0)
@@ -142,8 +153,8 @@ def create_dashboard_router(config: Config) -> APIRouter:
             total_gpus=gpu_stats.get("total_gpus", 0),
             free_gpus=gpu_stats.get("free_gpus", 0),
             allocated_gpus=gpu_stats.get("allocated_gpus", 0),
-            avg_gpu_utilization=0.0,  # TODO: Calculate from GPU pool
-            avg_gpu_temperature=0.0,  # TODO: Calculate from GPU pool
+            avg_gpu_utilization=round(avg_utilization, 2),
+            avg_gpu_temperature=round(avg_temperature, 2),
             active_jobs=runner_status.get("active_jobs", 0),
             queued_jobs=queued_jobs,
             total_submitted=runner_status.get("total_submitted", 0),
@@ -163,7 +174,7 @@ def create_dashboard_router(config: Config) -> APIRouter:
         auth: tuple = Depends(authenticate_request),
         meta_manager = Depends(get_meta_manager)
     ):
-        """Get detailed status of all GPUs."""
+        """Get detailed status of all GPUs with real metrics"""
         logger.info("GPU details requested")
         
         gpu_status = await meta_manager.get_gpu_status()

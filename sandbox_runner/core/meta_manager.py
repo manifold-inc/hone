@@ -75,6 +75,9 @@ class MetaManager:
 
         self._job_history: Dict[str, Job] = {}
         self._max_history_size = 1000
+
+        self._lock = asyncio.Lock()
+        self.active_jobs = self._running_jobs
         
         logger.info("Meta-Manager initialized with executor")
     
@@ -591,47 +594,85 @@ class MetaManager:
         """Get list of active jobs"""
         active_jobs = []
         
-        async with self._lock:
-            for job_id, job in self.active_jobs.items():
-                progress = self._calculate_job_progress(job)
-                
-                active_jobs.append({
-                    "job_id": job.job_id,
-                    "status": job.status.value,
-                    "weight_class": job.weight_class.value,
-                    "miner_hotkey": job.miner_hotkey,
-                    "validator_hotkey": job.validator_hotkey,
-                    "priority": job.priority,
-                    "progress_percentage": progress,
-                    "current_phase": job.current_phase,
-                    "assigned_gpus": job.assigned_gpus or [],
-                    "started_at": job.started_at.isoformat() if job.started_at else None
-                })
-        
+        for job_id, job in self._running_jobs.items():
+            progress = self._calculate_job_progress(job)
+            
+            active_jobs.append({
+                "job_id": job.job_id,
+                "status": job.status.value,
+                "weight_class": job.weight_class.value,
+                "miner_hotkey": job.miner_hotkey,
+                "validator_hotkey": job.validator_hotkey,
+                "priority": job.priority,
+                "progress_percentage": progress,
+                "current_phase": job.current_phase,
+                "assigned_gpus": job.assigned_gpus or [],
+                "started_at": job.started_at.isoformat() if job.started_at else None
+            })
+
         return active_jobs
     
     async def get_job_logs(self, job_id: str, lines: int = 100, offset: int = 0) -> Optional[Dict]:
         """Get job logs"""
         job = None
         
-        async with self._lock:
-            if job_id in self.active_jobs:
-                job = self.active_jobs[job_id]
-            elif hasattr(self, 'job_history') and job_id in self.job_history:
-                job = self.job_history[job_id]
+        # Check active jobs first
+        if job_id in self._running_jobs:
+            job = self._running_jobs[job_id]
+        elif job_id in self._job_history:
+            job = self._job_history[job_id]
         
         if not job:
             return None
         
-        # TODO: add real job logs
-        logs = self._get_mock_logs(job)
+        # Try to read actual logs from work directory
+        log_file = Path(f"/tmp/sandbox-jobs/job_{job_id}/execution.log")
         
-        start_idx = offset
-        end_idx = offset + lines
-        paginated_logs = logs[start_idx:end_idx]
+        if log_file.exists():
+            try:
+                with open(log_file, 'r') as f:
+                    all_lines = f.readlines()
+                
+                # Parse logs into structured format
+                logs = []
+                for line in all_lines:
+                    # Try to parse timestamp and level
+                    parts = line.split('] ', 1)
+                    if len(parts) == 2:
+                        timestamp_level = parts[0].strip('[')
+                        message = parts[1].strip()
+                        
+                        timestamp_parts = timestamp_level.split(' ', 1)
+                        if len(timestamp_parts) == 2:
+                            logs.append({
+                                "timestamp": timestamp_parts[0],
+                                "level": timestamp_parts[1] if len(timestamp_parts) > 1 else "INFO",
+                                "message": message
+                            })
+                        else:
+                            logs.append({
+                                "timestamp": datetime.utcnow().isoformat(),
+                                "level": "INFO",
+                                "message": line.strip()
+                            })
+                
+                start_idx = offset
+                end_idx = offset + lines
+                paginated_logs = logs[start_idx:end_idx]
+                
+                return {
+                    "logs": paginated_logs,
+                    "total_lines": len(logs),
+                    "has_more": end_idx < len(logs)
+                }
+            except Exception as e:
+                logger.error(f"Failed to read log file: {e}")
         
+        # in case of an error
+        logs = ""
+                
         return {
-            "logs": paginated_logs,
+            "logs": logs,
             "total_lines": len(logs),
             "has_more": end_idx < len(logs)
         }

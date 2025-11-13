@@ -198,7 +198,7 @@ class RepositoryValidator:
         Basic checks:
         1. File is valid Python
         2. No obvious shell command execution
-        3. Has required argument parsing
+        3. Has required argument parsing (with graceful warning if missing)
         
         Args:
             inference_path: Path to inference.py
@@ -243,13 +243,34 @@ class RepositoryValidator:
                 "These will be monitored during execution."
             )
         
-        # TODO: handle it gracefully if missing
-        has_phase_arg = '--phase' in content or 'argparse' in content
-        if not has_phase_arg:
+        # argument parsing (gracefully handle if missing)
+        has_argparse = 'argparse' in content or 'ArgumentParser' in content
+        has_phase_arg = '--phase' in content or 'phase' in content.lower()
+        has_input_arg = '--input' in content or 'input' in content.lower()
+        has_output_arg = '--output' in content or 'output' in content.lower()
+        
+        if not has_argparse:
             logger.warning(
-                "inference.py may not have proper argument parsing for --phase. "
-                "Ensure the script accepts: --phase prep|inference --input PATH --output PATH"
+                "inference.py does not appear to use argparse. "
+                "The script may not handle command-line arguments correctly."
             )
+        
+        if not (has_phase_arg and has_input_arg and has_output_arg):
+            missing = []
+            if not has_phase_arg:
+                missing.append("--phase")
+            if not has_input_arg:
+                missing.append("--input")
+            if not has_output_arg:
+                missing.append("--output")
+            
+            logger.warning(
+                f"inference.py may be missing required arguments: {', '.join(missing)}. "
+                "Expected arguments: --phase prep|inference --input PATH --output PATH. "
+                "Execution will continue but may fail if these arguments are not handled."
+            )
+        else:
+            logger.info("inference.py appears to have proper argument parsing")
         
         logger.info("Inference script validation passed")
         return True
