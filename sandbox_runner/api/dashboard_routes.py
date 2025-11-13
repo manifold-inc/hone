@@ -29,7 +29,7 @@ class GPUStatusDetail(BaseModel):
     memory_used_mb: int = 0
     memory_total_mb: int = 81920  # H200 = 80GB
     temperature_celsius: float = 0.0
-    last_updated: datetime
+    last_updated: datetime | None = None
     
 
 class QueueBreakdown(BaseModel):
