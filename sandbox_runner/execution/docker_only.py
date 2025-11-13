@@ -778,29 +778,71 @@ class DockerOnlyExecutor:
     async def _create_network(self, network_name: str):
         """Create an isolated Docker network without internet access."""
         try:
-            ipam_pool = docker.types.IPAMPool(
-                subnet='172.28.0.0/16',
-                gateway='172.28.0.1'  # Gateway for internal routing only
-            )
-            ipam_config = docker.types.IPAMConfig(
-                pool_configs=[ipam_pool]
-            )
-            
-            network = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.docker_client.networks.create(
-                    network_name,
-                    driver="bridge",
-                    check_duplicate=True,
-                    ipam=ipam_config,
-                    options={
-                        "com.docker.network.bridge.enable_ip_masquerade": "false"  # Disable NAT
-                    }
+            # remove any existing network with the same name
+            try:
+                existing_network = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.docker_client.networks.get(network_name)
                 )
-            )
-            logger.info(f"Created isolated Docker network: {network_name}")
-            return network
-        except Exception as e:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    existing_network.remove
+                )
+                logger.info(f"Removed existing network: {network_name}")
+            except Exception:
+                pass
+            
+            # multiple subnet ranges to avoid conflicts
+            subnet_options = [
+                '172.28.0.0/16',
+                '172.29.0.0/16',
+                '172.30.0.0/16',
+                '172.31.0.0/16',
+                '10.100.0.0/16',
+                '10.101.0.0/16',
+            ]
+            
+            last_error = None
+            for subnet in subnet_options:
+                try:
+                    gateway = subnet.replace('0.0/16', '0.1')
+                    
+                    ipam_pool = docker.types.IPAMPool(
+                        subnet=subnet,
+                        gateway=gateway
+                    )
+                    ipam_config = docker.types.IPAMConfig(
+                        pool_configs=[ipam_pool]
+                    )
+                    
+                    network = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.docker_client.networks.create(
+                            network_name,
+                            driver="bridge",
+                            check_duplicate=True,
+                            ipam=ipam_config,
+                            options={
+                                "com.docker.network.bridge.enable_ip_masquerade": "false"
+                            }
+                        )
+                    )
+                    logger.info(f"Created isolated Docker network: {network_name} (subnet: {subnet})")
+                    return network
+                    
+                except docker.errors.APIError as e:
+                    last_error = e
+                    if "overlaps" in str(e).lower():
+                        logger.debug(f"Subnet {subnet} overlaps, trying next option...")
+                        continue
+                    else:
+                        raise
+            
+            if last_error:
+                logger.error(f"Failed to create network after trying all subnet options")
+                raise DockerExecutionError(f"Network creation failed: {last_error}")
+                
+        except docker.errors.APIError as e:
             logger.error(f"Failed to create network {network_name}: {e}")
             raise DockerExecutionError(f"Network creation failed: {e}")
     
