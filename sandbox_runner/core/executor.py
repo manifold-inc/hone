@@ -30,8 +30,7 @@ from config import Config
 from utils.s3 import S3Manager, S3TransferError
 from utils.validation import RepositoryValidator, ValidationError
 from utils.metrics import calculate_detailed_metrics
-
-from security.network import NetworkPolicy
+from security.network import NetworkPolicy, IptablesNetworkPolicy
 from execution.docker_gvisor import DockerGVisorExecutor
 from execution.docker_only import DockerOnlyExecutor
 from execution.direct import DirectExecutor
@@ -74,6 +73,14 @@ class Executor:
         
         self._active_jobs: Dict[str, Job] = {}
         self._job_tasks: Dict[str, asyncio.Task] = {}  # job_id -> execution task
+
+        if config.security.network_policy and self._check_iptables():
+            self.network_policy = IptablesNetworkPolicy(config.security.network_policy)
+            logger.info("Using IptablesNetworkPolicy for enhanced network control")
+        else:
+            self.network_policy = NetworkPolicy(config.security.network_policy)
+            logger.info("Using basic NetworkPolicy (Docker network modes only)")
+
         
         logger.info(
             f"Executor initialized (mode={self.execution_mode}, "
@@ -112,6 +119,19 @@ class Executor:
             logger.info("Direct executor available")
         except Exception as e:
             logger.warning(f"Failed to initialize direct executor: {e}")
+
+    def _check_iptables(self) -> bool:
+        """Check if iptables is available"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['which', 'iptables'],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
     
     async def execute_job(self, job: Job) -> None:
         """
@@ -163,6 +183,12 @@ class Executor:
             job.current_phase = "building"
             job.progress_percentage = 30.0
             image_id = await self._build_docker_image(job, work_dir_path)
+
+            if isinstance(self.network_policy, IptablesNetworkPolicy):
+                # start monitoring in background
+                monitor_task = asyncio.create_task(
+                    self.network_policy.monitor_connections(job.job_id, 60)
+                )
             
             # Download input data
             job.current_phase = "downloading_input"
@@ -201,6 +227,16 @@ class Executor:
                 inference_success = await self._run_inference_phase(job, image_id, work_dir)
                 if not inference_success:
                     raise ExecutorError("Inference phase failed")
+                
+            if isinstance(self.network_policy, IptablesNetworkPolicy):
+                try:
+                    connections = await asyncio.wait_for(monitor_task, timeout=5)
+                    if connections:
+                        logger.info(f"Detected {len(connections)} connection attempts during job execution")
+                        # optionally save to job metadata
+                        job.network_activity = connections
+                except asyncio.TimeoutError:
+                    monitor_task.cancel()
             
             job.current_phase = "calculating_metrics"
             job.progress_percentage = 90.0

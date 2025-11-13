@@ -488,6 +488,7 @@ class DockerOnlyExecutor:
             ]
             config['runtime'] = 'nvidia'
         
+        # this causes issues with docker / hf parallel download - need to adjust dynamically
         #config['pids_limit'] = self.config.execution.max_processes
         
         if self.config.security.readonly_rootfs:
