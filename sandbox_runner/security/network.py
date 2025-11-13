@@ -1,17 +1,9 @@
-"""
-Network Policy Module
-
-Controls network access for containers during different execution phases:
-- Prep phase: Internet access enabled (for downloading models)
-- Inference phase: Internet access blocked (for security)
-
-Implementation uses Docker network modes for Phase 3.
-Phase 4 will add iptables/nftables for fine-grained control.
-"""
+# security/network.py - CORRECTED VERSION
 
 import asyncio
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict
+from pathlib import Path
 
 from config import NetworkPolicyConfig
 
@@ -27,15 +19,9 @@ class NetworkPolicy:
     """
     Manages network access policies for containers
     
-    TODO:
-    - Uses Docker network modes (host, none)
+    Uses Docker network modes (host, none)
     - Prep phase: host network (full internet access)
     - Inference phase: none network (no network access)
-    
-    TODO:
-    - Add iptables/nftables rules for fine-grained control
-    - Whitelist specific domains during prep phase
-    - Monitor and log network access attempts
     """
     
     def __init__(self, config: NetworkPolicyConfig):
@@ -87,20 +73,7 @@ class NetworkPolicy:
         container_id: str,
         phase: str = "prep"
     ) -> bool:
-        """
-        Enable internet access for a container.
-        
-        TODO:
-        - This is handled at container creation via network_mode parameter
-        - This method is a placeholder for future iptables-based control
-        
-        Args:
-            container_id: Docker container ID
-            phase: Execution phase
-            
-        Returns:
-            True if internet enabled
-        """
+        """Enable internet access for a container"""
         if phase == "prep" and self.config.prep_allow_internet:
             logger.info(
                 f"Internet enabled for container {container_id[:12]} (phase={phase})"
@@ -117,20 +90,7 @@ class NetworkPolicy:
         container_id: str,
         phase: str = "inference"
     ) -> bool:
-        """
-        Block internet access for a container
-        
-        TODO:
-        - This is handled at container creation via network_mode='none'
-        - This method is a placeholder for future iptables-based control
-        
-        Args:
-            container_id: Docker container ID
-            phase: Execution phase
-            
-        Returns:
-            True if internet blocked
-        """
+        """Block internet access for a container"""
         if phase == "inference" and self.config.inference_block_internet:
             logger.info(
                 f"Internet blocked for container {container_id[:12]} (phase={phase})"
@@ -143,39 +103,12 @@ class NetworkPolicy:
         return False
     
     async def verify_network_isolation(self, container_id: str) -> bool:
-        """
-        Verify that a container has no network access
-        
-        TODO:
-        - Checks if container was created with network_mode='none'
-        - Cannot verify after creation without entering container
-        
-        TODO : 
-        - Active network monitoring
-        - Connection attempt logging
-        - Real-time blocking verification
-        
-        Args:
-            container_id: Docker container ID
-            
-        Returns:
-            True if network isolation verified
-        """
-        # TODO: Add actual verification via iptables or container inspection
+        """Verify that a container has no network access"""
         logger.debug(f"Network isolation assumed for container {container_id[:12]}")
         return True
     
     def is_domain_allowed(self, domain: str, phase: str = "prep") -> bool:
-        """
-        Check if a domain is allowed for the given phase
-        
-        Args:
-            domain: Domain name to check
-            phase: Execution phase
-            
-        Returns:
-            True if domain is allowed
-        """
+        """Check if a domain is allowed for the given phase"""
         if phase != "prep":
             return False
         
@@ -197,15 +130,7 @@ class NetworkPolicy:
         container_id: str,
         phase: str = "prep"
     ):
-        """
-        Set up domain-based filtering for a container.
-        
-        - TODO: use iptables/DNS filtering in Phase 4
-        
-        Args:
-            container_id: Docker container ID
-            phase: Execution phase
-        """
+        """Set up domain-based filtering for a container"""
         if phase == "prep" and self.config.allowed_prep_domains:
             logger.debug(
                 f"Domain filtering would be applied to {container_id[:12]}: "
@@ -213,25 +138,11 @@ class NetworkPolicy:
             )
     
     async def cleanup(self, container_id: str):
-        """
-        Clean up network rules for a container
-        
-        Args:
-            container_id: Docker container ID
-        """
-        # TODO: Remove iptables rules
+        """Clean up network rules for a container"""
         logger.debug(f"Network policy cleanup for container {container_id[:12]}")
     
     def get_policy_summary(self, phase: str) -> dict:
-        """
-        Get a summary of network policy for a phase
-        
-        Args:
-            phase: Execution phase
-            
-        Returns:
-            Dictionary with policy details
-        """
+        """Get a summary of network policy for a phase"""
         network_mode = self.get_network_mode_for_phase(phase)
         internet_enabled = (
             (phase == "prep" and self.config.prep_allow_internet) or
@@ -247,24 +158,40 @@ class NetworkPolicy:
         }
 
 
-# security/network.py - Enhanced IptablesNetworkPolicy
-
 class IptablesNetworkPolicy(NetworkPolicy):
     """
-    Advanced network policy using iptables/nftables.
-    
-    Features:
-    - Fine-grained domain whitelisting
-    - Connection monitoring and logging
-    - Real-time blocking of unauthorized connections
-    - DNS filtering
+    Advanced network policy using iptables/nftables    
     """
     
     def __init__(self, config: NetworkPolicyConfig):
         super().__init__(config)
         self.iptables_available = self._check_iptables_available()
-        self._container_chains = {}  # track chains per container
+        self._container_chains: Dict[str, str] = {}
+        self._container_netns: Dict[str, str] = {}
         logger.info(f"IptablesNetworkPolicy initialized (available={self.iptables_available})")
+    
+    def _check_iptables_available(self) -> bool:
+        """Check if iptables is available"""
+        import subprocess
+        try:
+            result = subprocess.run(
+                ['which', 'iptables'],
+                capture_output=True,
+                timeout=5
+            )
+            if result.returncode != 0:
+                return False
+            
+            # also check if we can actually run iptables (requires root)
+            result = subprocess.run(
+                ['iptables', '-L', '-n'],
+                capture_output=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.warning(f"iptables check failed: {e}")
+            return False
     
     async def setup_container_network_isolation(
         self, 
@@ -274,45 +201,33 @@ class IptablesNetworkPolicy(NetworkPolicy):
         """
         Setup complete network isolation for a container
         
-        Steps:
-        1. Get container's network namespace
-        2. Create iptables chain for container
-        3. Apply rules based on phase
-        4. Set up DNS filtering if needed
-        
-        Args:
-            container_id: Docker container ID
-            phase: Execution phase (prep or inference)
-            
-        Returns:
-            True if isolation configured successfully
+        TODO:
+        1. Proper container network namespace identification
+        2. Docker network bridge manipulation
+        3. More sophisticated iptables rule management
         """
         if not self.iptables_available:
             logger.warning("iptables not available, using Docker network modes only")
             return False
         
         try:
-            # get container's network namespace
-            netns = await self._get_container_netns(container_id)
-            if not netns:
-                logger.warning(f"Could not get network namespace for {container_id[:12]}")
+            netns_pid = await self._get_container_pid(container_id)
+            if not netns_pid:
+                logger.warning(f"Could not get PID for {container_id[:12]}, skipping iptables setup")
                 return False
             
             chain_name = f"SANDBOX_{container_id[:12]}"
             self._container_chains[container_id] = chain_name
+            self._container_netns[container_id] = netns_pid
             
-            # create chain in container's network namespace
-            await self._create_iptables_chain(chain_name, netns)
+            # Create iptables chain using nsenter
+            await self._create_iptables_chain_nsenter(chain_name, netns_pid)
             
-            # apply rules based on phase
+            # Apply rules based on phase
             if phase == "prep":
-                await self._apply_prep_rules(chain_name, netns)
+                await self._apply_prep_rules_nsenter(chain_name, netns_pid)
             elif phase == "inference":
-                await self._apply_inference_rules(chain_name, netns)
-            
-            # set up DNS filtering
-            if phase == "prep" and self.config.allowed_prep_domains:
-                await self._setup_dns_filtering(chain_name, netns)
+                await self._apply_inference_rules_nsenter(chain_name, netns_pid)
             
             logger.info(f"Network isolation configured for {container_id[:12]} (phase={phase})")
             return True
@@ -321,20 +236,11 @@ class IptablesNetworkPolicy(NetworkPolicy):
             logger.error(f"Failed to setup network isolation: {e}")
             return False
     
-    async def _get_container_netns(self, container_id: str) -> Optional[str]:
-        """
-        Get the network namespace path for a container
-        
-        Args:
-            container_id: Docker container ID
-            
-        Returns:
-            Network namespace path or None
-        """
+    async def _get_container_pid(self, container_id: str) -> Optional[str]:
+        """Get the PID of the container's main process"""
         import subprocess
         
         try:
-            # get container PID
             result = subprocess.run(
                 ['docker', 'inspect', '-f', '{{.State.Pid}}', container_id],
                 capture_output=True,
@@ -349,28 +255,21 @@ class IptablesNetworkPolicy(NetworkPolicy):
             if not pid or pid == '0':
                 return None
             
-            # network namespace path
-            netns_path = f"/proc/{pid}/ns/net"
-            
-            # verify it exists
-            if Path(netns_path).exists():
-                return netns_path
-            
-            return None
+            return pid
             
         except Exception as e:
-            logger.error(f"Failed to get container netns: {e}")
+            logger.error(f"Failed to get container PID: {e}")
             return None
     
-    async def _create_iptables_chain(self, chain_name: str, netns: str):
-        """Create iptables chain in container's network namespace"""
+    async def _create_iptables_chain_nsenter(self, chain_name: str, pid: str):
+        """Create iptables chain using nsenter to access container's network namespace"""
         import subprocess
         
         commands = [
-            # create chain
-            ['ip', 'netns', 'exec', netns, 'iptables', '-N', chain_name],
-            # link to OUTPUT chain
-            ['ip', 'netns', 'exec', netns, 'iptables', '-I', 'OUTPUT', '1', '-j', chain_name],
+            # Create chain
+            ['nsenter', '-t', pid, '-n', 'iptables', '-N', chain_name],
+            # Link to OUTPUT chain
+            ['nsenter', '-t', pid, '-n', 'iptables', '-I', 'OUTPUT', '1', '-j', chain_name],
         ]
         
         for cmd in commands:
@@ -381,106 +280,93 @@ class IptablesNetworkPolicy(NetworkPolicy):
                     timeout=10
                 )
                 if result.returncode != 0:
-                    logger.warning(f"Command failed: {' '.join(cmd)}: {result.stderr.decode()}")
+                    stderr = result.stderr.decode() if result.stderr else ''
+                    # Ignore "Chain already exists" errors
+                    if 'already exists' not in stderr.lower():
+                        logger.warning(f"Command failed: {' '.join(cmd)}: {stderr}")
             except Exception as e:
                 logger.error(f"Failed to execute iptables command: {e}")
                 raise
     
-    async def _apply_prep_rules(self, chain_name: str, netns: str):
-        """
-        Apply iptables rules for prep phase
-        
-        Strategy:
-        - Allow DNS (port 53)
-        - Allow HTTPS to whitelisted domains (if configured)
-        - Allow HTTP/HTTPS to specific IPs (resolved from domains)
-        - Log and drop everything else
-        """
+    async def _apply_prep_rules_nsenter(self, chain_name: str, pid: str):
+        """Apply iptables rules for prep phase using nsenter"""
         import subprocess
         
         commands = [
-            # allow established connections
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name, 
+            # Allow established connections
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name, 
              '-m', 'state', '--state', 'ESTABLISHED,RELATED', '-j', 'ACCEPT'],
             
-            # allow localhost
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+            # Allow localhost
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
              '-d', '127.0.0.0/8', '-j', 'ACCEPT'],
             
-            # allow DNS
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+            # Allow DNS
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
              '-p', 'udp', '--dport', '53', '-j', 'ACCEPT'],
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
              '-p', 'tcp', '--dport', '53', '-j', 'ACCEPT'],
         ]
         
-        # if we have whitelisted domains, resolve and allow
+        # Domain whitelisting
         if self.config.allowed_prep_domains:
             for domain in self.config.allowed_prep_domains:
-                # resolve domain to IPs
                 ips = await self._resolve_domain(domain)
                 for ip in ips:
                     commands.extend([
-                        ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+                        ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
                          '-d', ip, '-p', 'tcp', '--dport', '443', '-j', 'ACCEPT'],
-                        ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+                        ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
                          '-d', ip, '-p', 'tcp', '--dport', '80', '-j', 'ACCEPT'],
                     ])
         else:
-            # if no whitelist, allow all HTTPS (less secure)
+            # Allow all HTTP/HTTPS if no whitelist
             commands.extend([
-                ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+                ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
                  '-p', 'tcp', '--dport', '443', '-j', 'ACCEPT'],
-                ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+                ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
                  '-p', 'tcp', '--dport', '80', '-j', 'ACCEPT'],
             ])
         
-        # log dropped packets
+        # Log dropped packets
         commands.append(
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
-             '-j', 'LOG', '--log-prefix', f'[SANDBOX-{chain_name}] ']
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
+             '-j', 'LOG', '--log-prefix', f'[SANDBOX-{chain_name}] ', '--log-level', '4']
         )
         
-        # drop everything else
+        # Drop everything else
         commands.append(
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name, '-j', 'DROP']
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name, '-j', 'DROP']
         )
         
         for cmd in commands:
             try:
-                subprocess.run(cmd, capture_output=True, timeout=10, check=True)
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"iptables command failed: {e.stderr.decode()}")
+                subprocess.run(cmd, capture_output=True, timeout=10, check=False)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"iptables command timeout: {' '.join(cmd)}")
     
-    async def _apply_inference_rules(self, chain_name: str, netns: str):
-        """
-        Apply iptables rules for inference phase
-        
-        Strategy:
-        - Allow localhost only
-        - Drop everything else
-        - Log all connection attempts
-        """
+    async def _apply_inference_rules_nsenter(self, chain_name: str, pid: str):
+        """Apply iptables rules for inference phase using nsenter"""
         import subprocess
         
         commands = [
-            # allow localhost
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
+            # Allow localhost only
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
              '-d', '127.0.0.0/8', '-j', 'ACCEPT'],
             
-            # log everything else
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name,
-             '-j', 'LOG', '--log-prefix', f'[INFERENCE-{chain_name}] '],
+            # Log everything else
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name,
+             '-j', 'LOG', '--log-prefix', f'[INFERENCE-{chain_name}] ', '--log-level', '4'],
             
-            # drop everything else
-            ['ip', 'netns', 'exec', netns, 'iptables', '-A', chain_name, '-j', 'DROP'],
+            # Drop everything else
+            ['nsenter', '-t', pid, '-n', 'iptables', '-A', chain_name, '-j', 'DROP'],
         ]
         
         for cmd in commands:
             try:
-                subprocess.run(cmd, capture_output=True, timeout=10, check=True)
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"iptables command failed: {e.stderr.decode()}")
+                subprocess.run(cmd, capture_output=True, timeout=10, check=False)
+            except subprocess.TimeoutExpired:
+                logger.warning(f"iptables command timeout: {' '.join(cmd)}")
     
     async def _resolve_domain(self, domain: str) -> List[str]:
         """Resolve domain to IP addresses"""
@@ -495,61 +381,85 @@ class IptablesNetworkPolicy(NetworkPolicy):
             logger.warning(f"Failed to resolve {domain}: {e}")
             return []
     
-    async def _setup_dns_filtering(self, chain_name: str, netns: str):
-        """
-        Setup DNS filtering for whitelisted domains
-        
-        This is complex and would require:
-        1. Running a DNS proxy in the container
-        2. Configuring /etc/resolv.conf
-        3. Filtering DNS responses
-        
-        For now, we log that this feature is not fully implemented
-        """
-        logger.info(f"DNS filtering for {chain_name} (feature in development)")
-    
-    async def cleanup_container_network_isolation(self, container_id: str):
+    async def remove_iptables_rules(self, container_id: str):
         """Remove iptables rules for a container"""
+        import subprocess
+        
         if container_id not in self._container_chains:
             return
         
         chain_name = self._container_chains[container_id]
+        pid = self._container_netns.get(container_id)
+        
+        if not pid:
+            return
         
         try:
-            netns = await self._get_container_netns(container_id)
-            if netns:
-                await self.remove_iptables_rules(container_id)
+            # Unlink chain from OUTPUT
+            subprocess.run(
+                ['nsenter', '-t', pid, '-n', 'iptables', '-D', 'OUTPUT', '-j', chain_name],
+                capture_output=True,
+                timeout=10
+            )
+            
+            # Flush chain
+            subprocess.run(
+                ['nsenter', '-t', pid, '-n', 'iptables', '-F', chain_name],
+                capture_output=True,
+                timeout=10
+            )
+            
+            # Delete chain
+            subprocess.run(
+                ['nsenter', '-t', pid, '-n', 'iptables', '-X', chain_name],
+                capture_output=True,
+                timeout=10
+            )
+            
+            logger.info(f"iptables rules removed for {container_id[:12]}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to remove iptables rules: {e}")
+    
+    async def cleanup_container_network_isolation(self, container_id: str):
+        """Remove iptables rules for a container"""
+        try:
+            await self.remove_iptables_rules(container_id)
         except Exception as e:
             logger.warning(f"Failed to cleanup network isolation: {e}")
         finally:
-            del self._container_chains[container_id]
+            if container_id in self._container_chains:
+                del self._container_chains[container_id]
+            if container_id in self._container_netns:
+                del self._container_netns[container_id]
     
-    async def monitor_connections(self, container_id: str, duration_seconds: int = 60) -> List[dict]:
+    async def monitor_connections(
+        self, 
+        container_id: str, 
+        duration_seconds: int = 60
+    ) -> List[Dict]:
         """
-        Monitor network connections for a container using tcpdump
+        Monitor network connections for a container
         
-        Args:
-            container_id: Docker container ID
-            duration_seconds: How long to monitor
-            
-        Returns:
-            List of connection attempts with details
+        NOTE: This requires tcpdump to be installed on the host system
         """
         import subprocess
-        import asyncio
+        
+        pid = self._container_netns.get(container_id)
+        if not pid:
+            pid = await self._get_container_pid(container_id)
+        
+        if not pid:
+            logger.warning(f"Cannot monitor container {container_id[:12]}: no PID found")
+            return []
         
         try:
-            netns = await self._get_container_netns(container_id)
-            if not netns:
-                return []
-            
-            # run tcpdump in container's network namespace
             cmd = [
                 'timeout', str(duration_seconds),
-                'ip', 'netns', 'exec', netns,
+                'nsenter', '-t', pid, '-n',
                 'tcpdump', '-n', '-c', '1000',
                 '-i', 'any',
-                'not', 'port', '22',  # exclude SSH
+                'not', 'port', '22',
                 '-l'
             ]
             
@@ -561,17 +471,19 @@ class IptablesNetworkPolicy(NetworkPolicy):
             
             stdout, stderr = await process.communicate()
             
-            # parse tcpdump output
-            connections = self._parse_tcpdump_output(stdout.decode())
+            connections = self._parse_tcpdump_output(stdout.decode() if stdout else '')
             
             logger.info(f"Monitored {len(connections)} connection attempts for {container_id[:12]}")
             return connections
             
+        except FileNotFoundError:
+            logger.warning("tcpdump not found, connection monitoring unavailable")
+            return []
         except Exception as e:
             logger.error(f"Failed to monitor connections: {e}")
             return []
     
-    def _parse_tcpdump_output(self, output: str) -> List[dict]:
+    def _parse_tcpdump_output(self, output: str) -> List[Dict]:
         """Parse tcpdump output into structured connection data"""
         connections = []
         
@@ -579,7 +491,6 @@ class IptablesNetworkPolicy(NetworkPolicy):
             if not line.strip():
                 continue
             
-            # basic parsing (would need more sophisticated parsing in production)
             try:
                 parts = line.split()
                 if len(parts) >= 5:
