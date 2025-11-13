@@ -524,7 +524,7 @@ class IptablesNetworkPolicy(NetworkPolicy):
         finally:
             del self._container_chains[container_id]
     
-    async def monitor_connections(self, container_id: str, duration_seconds: int = 60) -> List[Dict]:
+    async def monitor_connections(self, container_id: str, duration_seconds: int = 60) -> List[dict]:
         """
         Monitor network connections for a container using tcpdump
         
@@ -571,7 +571,7 @@ class IptablesNetworkPolicy(NetworkPolicy):
             logger.error(f"Failed to monitor connections: {e}")
             return []
     
-    def _parse_tcpdump_output(self, output: str) -> List[Dict]:
+    def _parse_tcpdump_output(self, output: str) -> List[dict]:
         """Parse tcpdump output into structured connection data"""
         connections = []
         
