@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime
 from typing import Optional, Dict, List
 from dataclasses import asdict
+from pathlib import Path
 
 from core.job_queue import Job, JobQueue, JobStatus, WeightClass
 from core.gpu_pool import GPUPoolManager
