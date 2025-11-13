@@ -24,13 +24,13 @@ class GPUStatusDetail(BaseModel):
     """Detailed GPU status for dashboard."""
     gpu_id: int
     status: str  # free, allocated, error, offline
-    allocated_to_job: str = None
+    allocated_to_job: str | None = None
     utilization_percent: float = 0.0
     memory_used_mb: int = 0
     memory_total_mb: int = 81920  # H200 = 80GB
     temperature_celsius: float = 0.0
     last_updated: datetime
-
+    
 
 class QueueBreakdown(BaseModel):
     """Queue breakdown by weight class."""
