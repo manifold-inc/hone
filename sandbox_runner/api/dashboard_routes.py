@@ -45,13 +45,13 @@ class ActiveJobDetail(BaseModel):
     status: str
     weight_class: str
     miner_hotkey: str
-    validator_hotkey: str = None
+    validator_hotkey: str | None = None
     priority: int
     progress_percentage: float = 0.0
-    current_phase: str = None
+    current_phase: str | None = None
     assigned_gpus: List[int] = []
     started_at: datetime
-    estimated_completion: datetime = None
+    estimated_completion: datetime | None = None
 
 
 class JobLogs(BaseModel):
