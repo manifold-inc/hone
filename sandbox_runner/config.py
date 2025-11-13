@@ -280,38 +280,31 @@ def generate_default_config(output_path: Path):
         },
         'api': {
             'port': 8443,
-            'require_epistula': True,
+            'require_epistula': False, # testing phase
             'require_api_key': True,
-            'rate_limit_per_validator': 100,
+            'rate_limit_per_validator': 3,
             'ssl_cert_path': '/etc/ssl/certs/runner.crt',
             'ssl_key_path': '/etc/ssl/private/runner.key'
         },
         'hardware': {
-            'gpu_count': 8,
+            'gpu_count': 1, # testing phase
             'gpu_type': 'H200',
-            'cpu_cores': 96,
-            'memory_gb': 1024
+            'cpu_cores': 15,
+            'memory_gb': 175
         },
         'execution': {
-            'mode': 'docker+gvisor',
+            'mode': 'docker',
             'fallback_on_error': True,
-            'cpu_limit': 32,
-            'memory_limit_gb': 256,
-            'prep_timeout_seconds': 7200,
+            'cpu_limit': 5, # testing phase
+            'memory_limit_gb': 100,
+            'prep_timeout_seconds': 3600,
             'inference_timeout_seconds': 3600,
             'disk_quota_gb': 100,
-            'max_processes': 128,
+            'max_processes': 32,
             'repo_clone_timeout_seconds': 600,
-            'repo_build_timeout_seconds': 3600
+            'repo_build_timeout_seconds': 1800
         },
         'security': {
-            'gvisor': {
-                'enabled': True,
-                'platform': 'ptrace',
-                'network_mode': 'none',
-                'file_access': 'exclusive',
-                'overlay': True
-            },
             'seccomp': {
                 'enabled': True,
                 'default_action': 'SCMP_ACT_ERRNO'
