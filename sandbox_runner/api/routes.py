@@ -138,8 +138,6 @@ class JobStatusResponse(BaseModel):
     progress_percentage: Optional[float] = Field(None, ge=0, le=100)
     assigned_gpus: Optional[List[int]] = None
     error_message: Optional[str] = None
-    input_data_s3_path: str
-    output_data_s3_path: str
     validator_hotkey: Optional[str] = None
     miner_hotkey: str
     priority: int
@@ -240,8 +238,6 @@ def create_router(config: Config) -> APIRouter:
             "repo_commit": request.repo_commit,
             "repo_path": request.repo_path,
             "weight_class": request.weight_class.value,
-            "input_data_s3_path": request.input_data_s3_path,
-            "output_data_s3_path": request.output_data_s3_path,
             "priority": request.priority,
             "validator_hotkey": request.validator_hotkey or validator_id,
             "miner_hotkey": request.miner_hotkey,
@@ -291,8 +287,6 @@ def create_router(config: Config) -> APIRouter:
             progress_percentage=job_data.get("progress_percentage"),
             assigned_gpus=job_data.get("assigned_gpus"),
             error_message=job_data.get("error_message"),
-            input_data_s3_path=job_data["input_s3_path"],
-            output_data_s3_path=job_data["output_s3_path"],
             validator_hotkey=job_data.get("validator_hotkey"),
             miner_hotkey=job_data["miner_hotkey"],
             priority=job_data["priority"]

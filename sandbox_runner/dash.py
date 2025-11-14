@@ -178,8 +178,6 @@ class APIClient:
                 "repo_branch": "main",
                 "repo_path": "miner-sr",
                 "weight_class": "1xH200",
-                "input_data_s3_path": "s3://test-bucket/input/test.json",
-                "output_data_s3_path": "s3://test-bucket/output/",
                 "miner_hotkey": "test_miner_hotkey",
                 "priority": 5
             }

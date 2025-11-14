@@ -183,8 +183,6 @@ curl -X POST https://localhost:8443/v1/jobs/submit \
     "repo_url": "https://github.com/user/miner-repo",
     "repo_branch": "main",
     "weight_class": "1xH200",
-    "input_data_s3_path": "s3://bucket/inputs/data.json",
-    "output_data_s3_path": "s3://bucket/outputs/results.json",
     "miner_hotkey": "5Abc...xyz",
     "priority": 5
   }'
