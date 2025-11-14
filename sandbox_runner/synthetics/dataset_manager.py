@@ -13,6 +13,8 @@ from storage.dataset_storage import DatasetStorage
 logger = logging.getLogger(__name__)
 
 
+# In synthetics/dataset_manager.py
+
 class DatasetManager:
     """
     Manages daily dataset generation
@@ -20,15 +22,17 @@ class DatasetManager:
     Strategy:
     1. Load unsolved tasks from yesterday
     2. Generate new synthetic tasks (never seen before)
-    3. Combine into today's dataset
-    4. Block submissions during generation
+    3. Ensure minimum of 100 total tasks
+    4. Combine into today's dataset
+    5. Block submissions during generation
     """
     
     def __init__(
         self,
         storage_dir: Path,
-        num_unsolved_to_keep: int = 50,
-        num_new_tasks: int = 50,
+        num_unsolved_to_keep: int = 80,
+        num_new_tasks: int = 20,
+        min_total_tasks: int = 100,  # NEW: Minimum total tasks required
         generation_time: str = "00:00"  # UTC time
     ):
         self.storage = DatasetStorage(storage_dir)
@@ -36,32 +40,13 @@ class DatasetManager:
         
         self.num_unsolved_to_keep = num_unsolved_to_keep
         self.num_new_tasks = num_new_tasks
+        self.min_total_tasks = min_total_tasks  # NEW
         self.generation_time = generation_time
         
         self.is_generating = False
         self.last_generation: datetime = None
         
-        logger.info("Dataset Manager initialized")
-    
-    async def should_generate_today(self) -> bool:
-        """Check if we need to generate dataset today"""
-        if self.is_generating:
-            return False
-        
-        if not self.last_generation:
-            return True
-        
-        now = datetime.utcnow()
-        last_gen_date = self.last_generation.date()
-        
-        if now.date() > last_gen_date:
-            hour, minute = map(int, self.generation_time.split(":"))
-            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            
-            if now >= target_time:
-                return True
-        
-        return False
+        logger.info(f"Dataset Manager initialized (min tasks: {self.min_total_tasks})")
     
     async def generate_daily_dataset(self) -> bool:
         """
@@ -79,11 +64,14 @@ class DatasetManager:
         try:
             logger.info("=" * 60)
             logger.info("STARTING DAILY DATASET GENERATION")
+            logger.info(f"Target: Minimum {self.min_total_tasks} total tasks")
             logger.info("=" * 60)
             
+            # Get unsolved tasks from yesterday
             unsolved = self.storage.get_unsolved_tasks()
             logger.info(f"Found {len(unsolved)} unsolved tasks from yesterday")
             
+            # Sort and keep the hardest unsolved tasks
             unsolved_sorted = sorted(
                 self.storage.unsolved_tasks,
                 key=lambda x: x.get("attempts", 0),
@@ -95,20 +83,39 @@ class DatasetManager:
             
             logger.info(f"Keeping {len(tasks_to_keep)} hardest unsolved tasks")
             
+            # Calculate how many new tasks we need
+            num_unsolved_kept = len(tasks_to_keep)
+            num_needed = max(
+                self.min_total_tasks - num_unsolved_kept,
+                self.num_new_tasks  # Always generate at least the configured minimum
+            )
+            
+            logger.info(f"Need to generate {num_needed} new tasks to reach {self.min_total_tasks} total")
+            
+            # Generate new tasks
             new_tasks = []
             attempts = 0
-            max_attempts = self.num_new_tasks * 3 
+            max_attempts = num_needed * 3  # Allow 3x attempts for uniqueness checks
             
-            logger.info(f"Generating {self.num_new_tasks} new synthetic tasks...")
+            logger.info(f"Generating {num_needed} new synthetic tasks...")
             
-            while len(new_tasks) < self.num_new_tasks and attempts < max_attempts:
+            generation_batch_size = 10  # Log progress every 10 tasks
+            
+            while len(new_tasks) < num_needed and attempts < max_attempts:
                 attempts += 1
                 
                 try:
+                    import random
+                    difficulty_roll = random.random()
+                    if difficulty_roll < 0.3:
+                        chain_length = random.randint(3, 5)
+                    else:
+                        chain_length = random.randint(5, 7)
+                    
                     problem = self.generator.generate_problem_set(
                         num_train=3,
                         num_test=1,
-                        chain_length=3,
+                        chain_length=chain_length,
                         preserves_size_only=False
                     )
                     
@@ -121,22 +128,73 @@ class DatasetManager:
                             "task": task_for_miners,
                             "task_hash": task_hash,
                             "test_output": problem["test_output"],  # Store separately
-                            "metadata": problem.get("metadata", {})
+                            "metadata": {
+                                **problem.get("metadata", {}),
+                                "difficulty": self._classify_difficulty(chain_length)
+                            }
                         })
                         
                         self.storage.mark_task_seen(task_hash)
                         
-                        if len(new_tasks) % 10 == 0:
-                            logger.info(f"Generated {len(new_tasks)}/{self.num_new_tasks} new tasks")
+                        # Log progress
+                        if len(new_tasks) % generation_batch_size == 0:
+                            logger.info(f"Generated {len(new_tasks)}/{num_needed} new tasks")
                 
                 except Exception as e:
-                    logger.warning(f"Failed to generate task: {e}")
+                    logger.warning(f"Failed to generate task (attempt {attempts}): {e}")
                     continue
+            
+            # Final check - if we still don't have enough, generate more with relaxed constraints
+            if len(new_tasks) < num_needed:
+                logger.warning(
+                    f"Only generated {len(new_tasks)}/{num_needed} unique tasks. "
+                    "Generating additional tasks with relaxed constraints..."
+                )
+                
+                while len(new_tasks) < num_needed:
+                    try:
+                        # Use simpler tasks to ensure we reach minimum
+                        problem = self.generator.generate_problem_set(
+                            num_train=3,
+                            num_test=1,
+                            chain_length=random.randint(1, 3),  # Simpler tasks
+                            preserves_size_only=True  # Size-preserving only
+                        )
+                        
+                        task_hash = self.storage.hash_task(problem)
+                        
+                        # Accept even if seen before (mark as duplicate)
+                        task_for_miners = self._prepare_task_for_miners(problem)
+                        
+                        new_tasks.append({
+                            "task": task_for_miners,
+                            "task_hash": task_hash,
+                            "test_output": problem["test_output"],
+                            "metadata": {
+                                **problem.get("metadata", {}),
+                                "duplicate": self.storage.is_task_seen(task_hash),
+                                "difficulty": "easy"
+                            }
+                        })
+                        
+                        if not self.storage.is_task_seen(task_hash):
+                            self.storage.mark_task_seen(task_hash)
+                        
+                    except Exception as e:
+                        logger.error(f"Critical: Failed to generate fallback task: {e}")
+                        # As last resort, duplicate an existing task with modification
+                        if new_tasks:
+                            base_task = new_tasks[0].copy()
+                            base_task["task_hash"] = f"{base_task['task_hash']}_dup_{len(new_tasks)}"
+                            base_task["metadata"]["duplicate"] = True
+                            new_tasks.append(base_task)
             
             logger.info(f"Successfully generated {len(new_tasks)} new tasks")
             
+            # Combine all tasks for today's dataset
             todays_dataset = []
             
+            # Add unsolved tasks
             for task in tasks_to_keep:
                 task_hash = self.storage.hash_task(task)
                 todays_dataset.append({
@@ -147,21 +205,39 @@ class DatasetManager:
                     "source": "unsolved"
                 })
             
+            # Add new tasks
             for item in new_tasks:
                 todays_dataset.append({
                     **item,
                     "source": "synthetic"
                 })
             
+            # Final validation
+            total_tasks = len(todays_dataset)
+            if total_tasks < self.min_total_tasks:
+                logger.error(
+                    f"Failed to generate minimum required tasks! "
+                    f"Have {total_tasks}, need {self.min_total_tasks}"
+                )
+                # Don't save incomplete dataset
+                return False
+            
+            # Save the dataset
             self.storage.save_current_dataset(todays_dataset)
             
             self.last_generation = datetime.utcnow()
             
+            # Log statistics
+            difficulty_stats = self._calculate_difficulty_distribution(todays_dataset)
+            
             logger.info("=" * 60)
             logger.info(f"DATASET GENERATION COMPLETE")
-            logger.info(f"Total tasks: {len(todays_dataset)}")
-            logger.info(f"  - Unsolved: {len(tasks_to_keep)}")
-            logger.info(f"  - New: {len(new_tasks)}")
+            logger.info(f"Total tasks: {total_tasks}")
+            logger.info(f"  - Unsolved (carried over): {len(tasks_to_keep)}")
+            logger.info(f"  - New synthetic: {len(new_tasks)}")
+            logger.info(f"Difficulty distribution:")
+            for difficulty, count in difficulty_stats.items():
+                logger.info(f"  - {difficulty}: {count} tasks ({count*100/total_tasks:.1f}%)")
             logger.info("=" * 60)
             
             return True
@@ -172,6 +248,28 @@ class DatasetManager:
         
         finally:
             self.is_generating = False
+    
+    def _classify_difficulty(self, chain_length: int) -> str:
+        """Classify task difficulty based on chain length."""
+        if chain_length <= 2:
+            return "easy"
+        elif chain_length <= 4:
+            return "medium"
+        else:
+            return "hard"
+    
+    def _calculate_difficulty_distribution(self, dataset: List[Dict]) -> Dict[str, int]:
+        """Calculate distribution of task difficulties."""
+        distribution = {"easy": 0, "medium": 0, "hard": 0, "unknown": 0}
+        
+        for task in dataset:
+            difficulty = task.get("metadata", {}).get("difficulty", "unknown")
+            if difficulty in distribution:
+                distribution[difficulty] += 1
+            else:
+                distribution["unknown"] += 1
+        
+        return distribution
     
     def _prepare_task_for_miners(self, problem: Dict) -> Dict:
         """
@@ -185,63 +283,3 @@ class DatasetManager:
             "train_examples": problem.get("train_examples", []),
             "test_input": problem.get("test_input"),
         }
-    
-    def get_current_dataset(self) -> List[Dict]:
-        """Get current active dataset for miners"""
-        dataset = self.storage.load_current_dataset()
-        
-        return [
-            {
-                "task_hash": item["task_hash"],
-                "task": item["task"],
-                "metadata": item.get("metadata", {})
-            }
-            for item in dataset
-        ]
-    
-    def validate_miner_predictions(
-        self,
-        predictions: List[Dict]
-    ) -> List[Dict]:
-        """
-        Validate miner predictions against test outputs
-        
-        Args:
-            predictions: List of {task_hash, predicted_output}
-        
-        Returns:
-            List of {task_hash, solved, metrics}
-        """
-        dataset = self.storage.load_current_dataset()
-        
-        # Build lookup
-        task_map = {item["task_hash"]: item for item in dataset}
-        
-        results = []
-        
-        for pred in predictions:
-            task_hash = pred.get("task_hash")
-            predicted = pred.get("predicted_output")
-            
-            if task_hash not in task_map:
-                logger.warning(f"Unknown task hash: {task_hash}")
-                continue
-            
-            task_data = task_map[task_hash]
-            expected = task_data.get("test_output")
-            
-            # Check if solved
-            solved = (predicted == expected)
-            
-            # Calculate metrics
-            from utils.metrics import calculate_metrics_for_prediction
-            metrics = calculate_metrics_for_prediction(predicted, expected)
-            
-            results.append({
-                "task_hash": task_hash,
-                "solved": solved,
-                "metrics": metrics,
-                "attempts": 1
-            })
-        
-        return results

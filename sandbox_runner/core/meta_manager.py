@@ -87,6 +87,7 @@ class MetaManager:
             storage_dir=dataset_storage_dir,
             num_unsolved_to_keep=80,
             num_new_tasks=20,
+            min_total_tasks=100,
             generation_time="00:00"  # UTC
         )
         
