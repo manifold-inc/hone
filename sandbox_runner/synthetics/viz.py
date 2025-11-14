@@ -4,8 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib import colors
 import numpy as np
 
-import validator.synthetics.arcgen.arc_agi2_utils as utils
-from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator  # type: ignore
+import synthetics.arc_agi2_utils as utils
+from synthetics.arc_agi2_generator import ARC2Generator  # type: ignore
 
 
 # ARC palette (0..9)

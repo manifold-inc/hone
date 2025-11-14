@@ -16,7 +16,7 @@
 
 import sys
 
-from validator.synthetics.arcgen import common
+from synthetics import common
 
 
 def generate(width=None, height=None, rows=None, cols=None, idxs=None,

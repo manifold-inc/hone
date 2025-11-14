@@ -14,7 +14,7 @@
 
 """Generator."""
 
-from validator.synthetics.arcgen import common
+from synthetics import common
 
 
 def generate(rows=None, cols=None, brow=None, bcol=None, wide=None, tall=None,

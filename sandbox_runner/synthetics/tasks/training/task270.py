@@ -16,7 +16,7 @@
 
 from typing import cast
 
-from validator.synthetics.arcgen import common
+from synthetics import common
 
 
 def generate(rows=None, cols=None, deltas=None, size=15, b=0, dr=(-1, 0, 1, 0),

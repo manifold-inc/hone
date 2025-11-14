@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import List, Dict, Any, Tuple, Optional
 import random
 
-import validator.synthetics.arcgen.arc_agi2_utils as utils
-import validator.synthetics.arcgen.task_list as task_list
+import synthetics.arc_agi2_utils as utils
+import synthetics.task_list as task_list
 
 
 def _count_non_black(grid: List[List[int]]) -> int:
