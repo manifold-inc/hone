@@ -445,47 +445,7 @@ class Executor:
             
         except Exception as e:
             raise ExecutorError(f"Failed to build Docker image: {e}")
-    
-    async def _download_input_data(self, job: Job, work_dir: Path):
-        """
-        Download input data from S3
         
-        Args:
-            job: Job object with S3 paths
-            work_dir: Working directory
-            
-        Raises:
-            ExecutorError: If download fails
-        """
-        if not job.input_s3_path:
-            logger.debug("No input data path specified, skipping download")
-            return
-        
-        input_dir = work_dir / "input"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        
-        logger.info(f"Downloading input data from {job.input_s3_path}")
-        
-        try:
-            success = await self.s3_manager.download_directory(
-                s3_prefix=job.input_s3_path,
-                local_dir=input_dir
-            )
-            
-            if not success:
-                success = await self.s3_manager.download_input_data(
-                    s3_path=job.input_s3_path,
-                    local_path=input_dir / "input_data"
-                )
-            
-            if not success:
-                raise ExecutorError("Failed to download input data")
-            
-            logger.info("Input data downloaded successfully")
-            
-        except S3TransferError as e:
-            raise ExecutorError(f"S3 download failed: {e}")
-    
     async def _run_prep_phase(
         self,
         job: Job,
@@ -586,39 +546,6 @@ class Executor:
             logger.error(f"Inference phase error: {e}")
             job.error_message = f"Inference phase error: {str(e)}"
             return False
-    
-    async def _upload_output_data(self, job: Job, work_dir: Path):
-        """
-        Upload output data to S3.
-        
-        Args:
-            job: Job object with S3 paths
-            work_dir: Working directory
-            
-        Raises:
-            ExecutorError: If upload fails
-        """
-        output_dir = work_dir / "output"
-        
-        if not output_dir.exists() or not list(output_dir.iterdir()):
-            logger.warning("No output data found, skipping upload")
-            return
-        
-        logger.info(f"Uploading output data to {job.output_s3_path}")
-        
-        try:
-            success = await self.s3_manager.upload_directory(
-                local_dir=output_dir,
-                s3_prefix=job.output_s3_path
-            )
-            
-            if not success:
-                raise ExecutorError("Failed to upload output data")
-            
-            logger.info("Output data uploaded successfully")
-            
-        except S3TransferError as e:
-            raise ExecutorError(f"S3 upload failed: {e}")
     
     async def _cleanup(
         self,

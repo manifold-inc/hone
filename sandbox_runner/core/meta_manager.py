@@ -611,8 +611,6 @@ class MetaManager:
             "progress_percentage": job.progress_percentage,
             "assigned_gpus": job.assigned_gpus,
             "error_message": job.error_message,
-            "input_s3_path": job.input_s3_path,
-            "output_s3_path": job.output_s3_path,
             "validator_hotkey": job.validator_hotkey,
             "miner_hotkey": job.miner_hotkey,
             "priority": job.priority

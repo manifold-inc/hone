@@ -400,8 +400,6 @@ class DockerOnlyExecutor:
         env_vars = {
             'PHASE': phase,
             'JOB_ID': job.job_id,
-            'INPUT_S3_PATH': job.input_s3_path,
-            'OUTPUT_S3_PATH': job.output_s3_path,
         }
         
         if job.assigned_gpus:

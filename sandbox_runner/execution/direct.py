@@ -190,8 +190,6 @@ class DirectExecutor:
         env_vars.update({
             'PHASE': phase,
             'JOB_ID': job.job_id,
-            'INPUT_S3_PATH': job.input_s3_path,
-            'OUTPUT_S3_PATH': job.output_s3_path,
             'INPUT_DIR': str(work_dir / 'input'),
             'OUTPUT_DIR': str(work_dir / 'output'),
         })
