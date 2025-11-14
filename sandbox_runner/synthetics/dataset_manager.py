@@ -283,3 +283,23 @@ class DatasetManager:
             "train_examples": problem.get("train_examples", []),
             "test_input": problem.get("test_input"),
         }
+    
+    async def should_generate_today(self) -> bool:
+        """Check if we need to generate dataset today"""
+        if self.is_generating:
+            return False
+        
+        if not self.last_generation:
+            return True
+        
+        now = datetime.utcnow()
+        last_gen_date = self.last_generation.date()
+        
+        if now.date() > last_gen_date:
+            hour, minute = map(int, self.generation_time.split(":"))
+            target_time = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            
+            if now >= target_time:
+                return True
+        
+        return False
