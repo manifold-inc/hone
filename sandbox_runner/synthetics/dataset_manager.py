@@ -67,11 +67,9 @@ class DatasetManager:
             logger.info(f"Target: Minimum {self.min_total_tasks} total tasks")
             logger.info("=" * 60)
             
-            # Get unsolved tasks from yesterday
             unsolved = self.storage.get_unsolved_tasks()
             logger.info(f"Found {len(unsolved)} unsolved tasks from yesterday")
             
-            # Sort and keep the hardest unsolved tasks
             unsolved_sorted = sorted(
                 self.storage.unsolved_tasks,
                 key=lambda x: x.get("attempts", 0),
@@ -83,23 +81,21 @@ class DatasetManager:
             
             logger.info(f"Keeping {len(tasks_to_keep)} hardest unsolved tasks")
             
-            # Calculate how many new tasks we need
             num_unsolved_kept = len(tasks_to_keep)
             num_needed = max(
                 self.min_total_tasks - num_unsolved_kept,
-                self.num_new_tasks  # Always generate at least the configured minimum
+                self.num_new_tasks  
             )
             
             logger.info(f"Need to generate {num_needed} new tasks to reach {self.min_total_tasks} total")
             
-            # Generate new tasks
             new_tasks = []
             attempts = 0
-            max_attempts = num_needed * 3  # Allow 3x attempts for uniqueness checks
+            max_attempts = num_needed * 3  
             
             logger.info(f"Generating {num_needed} new synthetic tasks...")
             
-            generation_batch_size = 10  # Log progress every 10 tasks
+            generation_batch_size = 10  
             
             while len(new_tasks) < num_needed and attempts < max_attempts:
                 attempts += 1
@@ -112,12 +108,17 @@ class DatasetManager:
                     else:
                         chain_length = random.randint(5, 7)
                     
-                    problem = self.generator.generate_problem_set(
-                        num_train=3,
-                        num_test=1,
-                        chain_length=chain_length,
-                        preserves_size_only=False
-                    )
+                    problem = None
+                    while not problem:
+                        try:
+                            problem = self.generator.generate_problem_set(
+                                num_train=3,
+                                num_test=1,
+                                chain_length=chain_length,
+                                preserves_size_only=False
+                            )
+                        except:
+                            pass
                     
                     task_hash = self.storage.hash_task(problem)
                     
@@ -127,7 +128,7 @@ class DatasetManager:
                         new_tasks.append({
                             "task": task_for_miners,
                             "task_hash": task_hash,
-                            "test_output": problem["test_output"],  # Store separately
+                            "test_output": problem["test_output"],  
                             "metadata": {
                                 **problem.get("metadata", {}),
                                 "difficulty": self._classify_difficulty(chain_length)
@@ -136,7 +137,6 @@ class DatasetManager:
                         
                         self.storage.mark_task_seen(task_hash)
                         
-                        # Log progress
                         if len(new_tasks) % generation_batch_size == 0:
                             logger.info(f"Generated {len(new_tasks)}/{num_needed} new tasks")
                 
@@ -144,7 +144,6 @@ class DatasetManager:
                     logger.warning(f"Failed to generate task (attempt {attempts}): {e}")
                     continue
             
-            # Final check - if we still don't have enough, generate more with relaxed constraints
             if len(new_tasks) < num_needed:
                 logger.warning(
                     f"Only generated {len(new_tasks)}/{num_needed} unique tasks. "
@@ -153,17 +152,19 @@ class DatasetManager:
                 
                 while len(new_tasks) < num_needed:
                     try:
-                        # Use simpler tasks to ensure we reach minimum
-                        problem = self.generator.generate_problem_set(
-                            num_train=3,
-                            num_test=1,
-                            chain_length=random.randint(1, 3),  # Simpler tasks
-                            preserves_size_only=True  # Size-preserving only
-                        )
+                        problem = None
+                        while not problem:
+                            try:
+                                problem = self.generator.generate_problem_set(
+                                    num_train=3,
+                                    num_test=1,
+                                    chain_length=random.randint(4, 7),
+                                    preserves_size_only=False
+                                )
+                            except:
+                                pass
                         
-                        task_hash = self.storage.hash_task(problem)
-                        
-                        # Accept even if seen before (mark as duplicate)
+                        task_hash = self.storage.hash_task(problem)                        
                         task_for_miners = self._prepare_task_for_miners(problem)
                         
                         new_tasks.append({
@@ -303,3 +304,16 @@ class DatasetManager:
                 return True
         
         return False
+    
+    def get_current_dataset(self) -> List[Dict]:
+        """Get current active dataset for miners"""
+        dataset = self.storage.load_current_dataset()
+        
+        return [
+            {
+                "task_hash": item["task_hash"],
+                "task": item["task"],
+                "metadata": item.get("metadata", {})
+            }
+            for item in dataset
+        ]
