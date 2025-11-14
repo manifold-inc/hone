@@ -2,7 +2,7 @@
 API Routes Module
 """
 
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
 
@@ -40,6 +40,16 @@ class JobStatus(str, Enum):
     TIMEOUT = "timeout"
     CANCELLED = "cancelled"
 
+class JobResultsResponse(BaseModel):
+    """Response containing job results and predictions."""
+    job_id: str
+    status: JobStatus
+    miner_hotkey: str
+    completed_at: Optional[datetime]
+    metrics: Dict[str, Any]  # Aggregated metrics
+    execution_time: Optional[float]
+    error_message: Optional[str]
+
 
 class JobSubmitRequest(BaseModel):
     """Request body for job submission."""
@@ -73,19 +83,7 @@ class JobSubmitRequest(BaseModel):
         description="GPU weight class",
         example="1xH200"
     )
-    
-    input_data_s3_path: str = Field(
-        ...,
-        description="S3 path to input data",
-        example="s3://bucket/inputs/dataset.json"
-    )
-    
-    output_data_s3_path: str = Field(
-        ...,
-        description="S3 path for results",
-        example="s3://bucket/outputs/results.json"
-    )
-    
+        
     priority: int = Field(
         default=0,
         ge=0,
@@ -395,6 +393,49 @@ def create_router(config: Config) -> APIRouter:
             total_completed=status_data["total_completed"],
             total_failed=status_data["total_failed"],
             execution_mode=status_data["execution_mode"]
+        )
+    
+    @router.get(
+        "/jobs/{job_id}/results",
+        response_model=JobResultsResponse,
+        summary="Get job results and predictions"
+    )
+    async def get_job_results(
+        job_id: str,
+        auth: tuple = Depends(authenticate_request),
+        meta_manager = Depends(get_meta_manager)
+    ):
+        """
+        Get detailed results for a completed job including:
+        - Calculated metrics
+        - Execution logs
+        """
+        validator_id, _ = auth
+        
+        logger.info(f"Job results query: {job_id} from {validator_id}")
+        
+        job_data = await meta_manager.get_job_with_results(job_id)
+        
+        if not job_data:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job not found: {job_id}"
+            )
+        
+        if job_data["status"] not in ["completed", "failed", "timeout"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Results not available. Job status: {job_data['status']}"
+            )
+        
+        return JobResultsResponse(
+            job_id=job_id,
+            status=job_data["status"],
+            miner_hotkey=job_data["miner_hotkey"],
+            completed_at=job_data.get("completed_at"),
+            metrics=job_data.get("metrics", {}),
+            execution_time=job_data.get("execution_time"),
+            error_message=job_data.get("error_message")
         )
     
     @router.get(

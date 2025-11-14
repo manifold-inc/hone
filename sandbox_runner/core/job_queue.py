@@ -71,10 +71,7 @@ class Job:
     repo_path: str = ""
     
     weight_class: WeightClass = WeightClass.ONE_GPU
-    
-    input_s3_path: str = ""
-    output_s3_path: str = ""
-    
+        
     priority: int = 0  # 0-10, higher = more important
     
     validator_hotkey: Optional[str] = None

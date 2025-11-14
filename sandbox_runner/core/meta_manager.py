@@ -18,6 +18,7 @@ Handles:
 import asyncio
 import logging
 import uuid
+import json
 from datetime import datetime
 from typing import Optional, Dict, List
 from dataclasses import asdict
@@ -182,6 +183,22 @@ class MetaManager:
                 logger.exception(f"Error in dataset generation loop: {e}")
                 self._dataset_ready_event.set()
                 await asyncio.sleep(3600)
+    async def get_job_with_results(self, job_id: str) -> Optional[Dict]:
+        """Get job with full results including predictions"""
+        if job_id in self._running_jobs:
+            job = self._running_jobs[job_id]
+            return self._job_to_response(job)
+        
+        job = await self.executor.get_job(job_id)
+        if job:
+            return self._job_to_response(job)
+        
+        results_file = Path(f"/app/data/job_results/{job_id}.json")
+        if results_file.exists():
+            with open(results_file, 'r') as f:
+                return json.load(f)
+    
+        return None
     
     async def submit_job(self, request: Dict) -> Dict:
         """
@@ -193,8 +210,6 @@ class MetaManager:
                 - repo_branch: Git branch (default: main)
                 - repo_commit: Specific commit (optional)
                 - weight_class: GPU weight class
-                - input_data_s3_path: S3 input path
-                - output_data_s3_path: S3 output path
                 - priority: Job priority 0-10
                 - validator_hotkey: Validator identifier
                 - miner_hotkey: Miner identifier
@@ -228,8 +243,6 @@ class MetaManager:
             repo_commit=request.get("repo_commit"),
             repo_path=request.get("repo_path", ""),
             weight_class=WeightClass(request.get("weight_class", "1xH200")),
-            input_s3_path=request.get("input_data_s3_path", ""),
-            output_s3_path=request.get("output_data_s3_path", ""),
             priority=request.get("priority", 0),
             validator_hotkey=request.get("validator_hotkey"),
             miner_hotkey=request.get("miner_hotkey", ""),

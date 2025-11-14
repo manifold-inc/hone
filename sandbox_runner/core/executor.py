@@ -31,6 +31,7 @@ from utils.s3 import S3Manager, S3TransferError
 from utils.validation import RepositoryValidator, ValidationError
 from utils.metrics import calculate_detailed_metrics
 from security.network import NetworkPolicy, IptablesNetworkPolicy
+from synthetics.dataset_manager import DatasetManager
 from execution.docker_gvisor import DockerGVisorExecutor
 from execution.docker_only import DockerOnlyExecutor
 from execution.direct import DirectExecutor
@@ -133,6 +134,46 @@ class Executor:
         except Exception:
             return False
     
+    async def _load_dataset_for_job(self, job: Job, work_dir: Path):
+        """Load current dataset for the job."""
+        
+        dataset_manager = DatasetManager(Path("/app/data/datasets"))
+        current_dataset = dataset_manager.get_current_dataset()
+        
+        input_dir = work_dir / "input"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        
+        dataset_file = input_dir / "dataset.json"
+        with open(dataset_file, 'w') as f:
+            json.dump({
+                "tasks": current_dataset,
+                "metadata": {
+                    "job_id": job.job_id,
+                    "generated_at": datetime.utcnow().isoformat()
+                }
+            }, f)
+        
+        logger.info(f"Loaded dataset with {len(current_dataset)} tasks for job {job.job_id}")
+    
+    async def _persist_job_results(self, job: Job):
+        """Persist job results for later retrieval."""
+        results_dir = Path("/app/data/job_results")
+        results_dir.mkdir(parents=True, exist_ok=True)
+        
+        results_file = results_dir / f"{job.job_id}.json"
+        with open(results_file, 'w') as f:
+            json.dump({
+                "job_id": job.job_id,
+                "status": job.status.value,
+                "miner_hotkey": job.miner_hotkey,
+                "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+                "predictions": getattr(job, 'predictions', []),
+                "metrics": getattr(job, 'metrics', {}),
+                "error_message": job.error_message,
+                "execution_time": (job.completed_at - job.started_at).total_seconds() if job.completed_at and job.started_at else None
+            }, f, indent=2)
+
+    
     async def execute_job(self, job: Job) -> None:
         """
         Execute a complete job with all phases.
@@ -190,10 +231,10 @@ class Executor:
                     self.network_policy.monitor_connections(job.job_id, 60)
                 )
             
-            # Download input data
-            job.current_phase = "downloading_input"
+            job.current_phase = "loading_dataset"
             job.progress_percentage = 45.0
-            await self._download_input_data(job, work_dir)
+            await self._load_dataset_for_job(job, work_dir)
+
             
             # Run complete vLLM pipeline (prep -> vllm -> inference)
             job.status = JobStatus.PREP
@@ -255,7 +296,7 @@ class Executor:
                 
             except Exception as e:
                 logger.warning(f"Failed to calculate metrics for job {job_id}: {e}")
-
+            
             job.status = JobStatus.COMPLETED
             job.completed_at = datetime.utcnow()
             job.progress_percentage = 100.0
@@ -295,6 +336,10 @@ class Executor:
                 del self._active_jobs[job_id]
             if job_id in self._job_tasks:
                 del self._job_tasks[job_id]
+            
+            if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.TIMEOUT]:
+                await self._persist_job_results(job)
+
     
     async def _clone_repository(self, job: Job, work_dir: Path) -> Path:
         """
