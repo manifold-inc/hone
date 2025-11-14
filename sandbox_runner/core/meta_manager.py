@@ -27,6 +27,7 @@ from core.job_queue import Job, JobQueue, JobStatus, WeightClass
 from core.gpu_pool import GPUPoolManager
 from core.scheduler import IntelligentScheduler
 from core.executor import Executor
+from synthetics.dataset_manager import DatasetManager
 from config import Config
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,18 @@ class MetaManager:
 
         self._lock = asyncio.Lock()
         self.active_jobs = self._running_jobs
+
+        dataset_storage_dir = Path("/app/data/datasets")
+        self.dataset_manager = DatasetManager(
+            storage_dir=dataset_storage_dir,
+            num_unsolved_to_keep=80,
+            num_new_tasks=20,
+            generation_time="00:00"  # UTC
+        )
+        
+        self._dataset_generation_task: Optional[asyncio.Task] = None
+        self._dataset_ready_event = asyncio.Event()
+        self._dataset_ready_event.set()  
         
         logger.info("Meta-Manager initialized with executor")
     
@@ -93,6 +106,7 @@ class MetaManager:
         self._running = True
         self._processing_task = asyncio.create_task(self._processing_loop())        
         self._monitoring_task = asyncio.create_task(self._monitoring_loop())
+        self._dataset_generation_task = asyncio.create_task(self._dataset_generation_loop())
         
         logger.info("Meta-Manager started")
     
@@ -121,10 +135,53 @@ class MetaManager:
             except asyncio.CancelledError:
                 pass
         
+        if self._dataset_generation_task:
+            self._dataset_generation_task.cancel()
+            try:
+                await self._dataset_generation_task
+            except asyncio.CancelledError:
+                pass
+        
         for job_id in list(self._running_jobs.keys()):
             await self.cancel_job(job_id)
         
         logger.info("Meta-Manager stopped")
+    
+    async def _dataset_generation_loop(self):
+        """Background loop to check if dataset needs regeneration"""
+        while self._running:
+            try:
+                if await self.dataset_manager.should_generate_today():
+                    logger.info("=" * 60)
+                    logger.info("STARTING DAILY DATASET GENERATION")
+                    logger.info("All job submissions will be queued until generation completes")
+                    logger.info("=" * 60)
+                    
+                    self._dataset_ready_event.clear()
+                    
+                    try:
+                        success = await self.dataset_manager.generate_daily_dataset()
+                        
+                        if success:
+                            logger.info("=" * 60)
+                            logger.info("DAILY DATASET GENERATION COMPLETED")
+                            logger.info("Processing queued job submissions...")
+                            logger.info("=" * 60)
+                        else:
+                            logger.error("Daily dataset generation failed")
+                    
+                    finally:
+                        self._dataset_ready_event.set()
+                        logger.info("Job submission queue released")
+                
+                await asyncio.sleep(3600)
+            
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception(f"Error in dataset generation loop: {e}")
+                self._dataset_ready_event.set()
+                await asyncio.sleep(3600)
     
     async def submit_job(self, request: Dict) -> Dict:
         """
@@ -150,6 +207,18 @@ class MetaManager:
                 - queue_position: Position in queue
                 - estimated_start_time: Estimated start time
         """
+
+        if self.dataset_manager.is_generating:
+            logger.info(
+                f"Dataset generation in progress, queuing job submission for validator {request.get('validator_hotkey')}"
+            )
+            
+            await self._dataset_ready_event.wait()
+            
+            logger.info(
+                f"Dataset ready, processing queued job for validator {request.get('validator_hotkey')}"
+            )
+        
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         
         job = Job(
