@@ -151,6 +151,7 @@ class MetaManager:
     
     async def _dataset_generation_loop(self):
         """Background loop to check if dataset needs regeneration"""
+        await asyncio.sleep(5)
         while self._running:
             try:
                 if await self.dataset_manager.should_generate_today():
