@@ -15,7 +15,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 from collections import defaultdict, deque
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,8 @@ class Job:
 
     metrics: Optional[Dict] = None
 
+    use_vllm: bool = False
+    vllm_config: Optional[Dict[str, Any]] = None
 
 class JobQueue:
     """

@@ -108,6 +108,24 @@ class JobSubmitRequest(BaseModel):
         default_factory=dict,
         description="Custom environment variables"
     )
+
+    use_vllm: bool = Field(
+        default=False,
+        description="Whether to use vLLM for inference",
+        example=False
+    )
+    
+    vllm_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="vLLM configuration (model, dtype, etc.)",
+        example={
+            "model": "unsloth/Meta-Llama-3.1-8B-Instruct",
+            "dtype": "half",
+            "gpu_memory_utilization": 0.8,
+            "max_model_len": 12000
+        }
+    )
+
     
     @validator('repo_url')
     def validate_repo_url(cls, v):

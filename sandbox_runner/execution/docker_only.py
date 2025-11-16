@@ -678,8 +678,33 @@ class DockerOnlyExecutor:
         inference_timeout: int
     ) -> Tuple[int, str, str]:
         """
-        Run complete job with vLLM pipeline using shared Docker network.
+        Run complete job with/without vLLM pipeline using shared Docker network
         """
+        if not job.use_vllm:
+            # Run without vLLM
+            prep_exit_code, prep_stdout, prep_stderr = await self.run_container(
+                image_id=image_id,
+                job=job,
+                phase="prep",
+                network_enabled=True,
+                work_dir=work_dir,
+                timeout_seconds=prep_timeout
+            )
+            
+            if prep_exit_code != 0:
+                return prep_exit_code, prep_stdout, prep_stderr
+            
+            inf_exit_code, inf_stdout, inf_stderr = await self.run_container(
+                image_id=image_id,
+                job=job,
+                phase="inference",
+                network_enabled=False,
+                work_dir=work_dir,
+                timeout_seconds=inference_timeout
+            )
+            
+            return inf_exit_code, f"{prep_stdout}\n{inf_stdout}", f"{prep_stderr}\n{inf_stderr}"
+
         network_name = f"sandbox-job-{job.job_id}"
         vllm_container = None
         vllm_port = 8000
@@ -690,7 +715,7 @@ class DockerOnlyExecutor:
             logger.info(f"STEP 0: Creating shared network {network_name}")
             logger.info("=" * 60)
             
-            network = await self._create_network(network_name)
+            _ = await self._create_network(network_name)
             logger.info(f"✓ Created network: {network_name}")
             
             logger.info("=" * 60)
@@ -880,6 +905,27 @@ class DockerOnlyExecutor:
         """
         container_name = f"vllm-{job.job_id}"
         vllm_image = "vllm/vllm-openai:latest"
+
+        vllm_config = job.vllm_config or {}
+        model_name = vllm_config.get("model", "unsloth/Meta-Llama-3.1-8B-Instruct")
+        dtype = vllm_config.get("dtype", "half")
+        gpu_memory = vllm_config.get("gpu_memory_utilization", 0.8)
+        max_model_len = vllm_config.get("max_model_len", 4096)
+
+        command = [
+            '--model', f"/app/models/{model_name.replace('/', '--')}",
+            '--host', '0.0.0.0',
+            '--port', str(port),
+            '--dtype', dtype,
+            '--gpu-memory-utilization', str(gpu_memory),
+        ]
+
+        if max_model_len:
+            command.extend(['--max-model-len', str(max_model_len)])
+
+        extra_args = vllm_config.get("extra_args", {})
+        for key, value in extra_args.items():
+            command.extend([f'--{key.replace("_", "-")}', str(value)])
         
         logger.info(f"Starting vLLM container: {container_name} on network {network_name}")
         
@@ -914,13 +960,7 @@ class DockerOnlyExecutor:
         config = {
             'image': vllm_image,
             'name': container_name,
-            'command': [
-                '--model', model_path_in_container,
-                '--host', '0.0.0.0',
-                '--port', str(port),
-                '--dtype', 'half',
-                '--gpu-memory-utilization', '0.8',
-            ],
+            'command': command,
             'volumes': {
                 str(models_dir): {'bind': '/app/models', 'mode': 'ro'}
             },

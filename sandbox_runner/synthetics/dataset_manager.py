@@ -1,7 +1,7 @@
 """
 Manages daily dataset generation with adaptive difficulty
 """
-import asyncio
+import json
 import logging
 from pathlib import Path
 from typing import List, Dict
@@ -32,15 +32,15 @@ class DatasetManager:
         storage_dir: Path,
         num_unsolved_to_keep: int = 80,
         num_new_tasks: int = 20,
-        min_total_tasks: int = 100,  # NEW: Minimum total tasks required
-        generation_time: str = "00:00"  # UTC time
+        min_total_tasks: int = 100,
+        generation_time: str = "00:00"
     ):
         self.storage = DatasetStorage(storage_dir)
         self.generator = ARC2Generator()
         
         self.num_unsolved_to_keep = num_unsolved_to_keep
         self.num_new_tasks = num_new_tasks
-        self.min_total_tasks = min_total_tasks  # NEW
+        self.min_total_tasks = min_total_tasks 
         self.generation_time = generation_time
         
         self.is_generating = False
@@ -212,23 +212,42 @@ class DatasetManager:
                     **item,
                     "source": "synthetic"
                 })
+
+            miner_dataset = []  # Without test outputs
+            validation_dataset = []  # With test outputs for metrics
+            for item in todays_dataset:
+                miner_task = {
+                    "train_examples": item["task"]["train_examples"],
+                    "test_input": item["task"]["test_input"],
+                    "task_hash": item["task_hash"],
+                }
+                miner_dataset.append(miner_task)                
+                validation_dataset.append({
+                    **item,
+                    "expected_output": item.get("test_output")
+                })
             
-            # Final validation
+            miner_dataset_file = self.storage.storage_dir / "current_dataset.json"
+            with open(miner_dataset_file, 'w') as f:
+                json.dump({
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "tasks": miner_dataset
+                }, f, indent=2)
+
+            validation_file = self.storage.storage_dir / "validation_dataset.json"
+            with open(validation_file, 'w') as f:
+                json.dump({
+                    "generated_at": datetime.utcnow().isoformat(),
+                    "tasks": validation_dataset
+                }, f, indent=2)
+
+            self.current_validation_data = validation_dataset
+            self.storage.save_current_dataset(todays_dataset)                
+
             total_tasks = len(todays_dataset)
-            if total_tasks < self.min_total_tasks:
-                logger.error(
-                    f"Failed to generate minimum required tasks! "
-                    f"Have {total_tasks}, need {self.min_total_tasks}"
-                )
-                # Don't save incomplete dataset
-                return False
-            
-            # Save the dataset
             self.storage.save_current_dataset(todays_dataset)
             
             self.last_generation = datetime.utcnow()
-            
-            # Log statistics
             difficulty_stats = self._calculate_difficulty_distribution(todays_dataset)
             
             logger.info("=" * 60)

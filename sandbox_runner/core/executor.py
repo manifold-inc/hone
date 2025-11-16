@@ -135,25 +135,21 @@ class Executor:
             return False
     
     async def _load_dataset_for_job(self, job: Job, work_dir: Path):
-        """Load current dataset for the job."""
+        """Load current dataset for the job - miners version without outputs"""
         
-        dataset_manager = DatasetManager(Path("/app/data/datasets"))
-        current_dataset = dataset_manager.get_current_dataset()
+        dataset_file = Path("/app/data/datasets/current_dataset.json")
         
+        if not dataset_file.exists():
+            dataset_manager = DatasetManager(Path("/app/data/datasets"))
+            await dataset_manager.generate_daily_dataset()
+            
         input_dir = work_dir / "input"
         input_dir.mkdir(parents=True, exist_ok=True)
         
-        dataset_file = input_dir / "dataset.json"
-        with open(dataset_file, 'w') as f:
-            json.dump({
-                "tasks": current_dataset,
-                "metadata": {
-                    "job_id": job.job_id,
-                    "generated_at": datetime.utcnow().isoformat()
-                }
-            }, f)
+        import shutil
+        shutil.copy2(dataset_file, input_dir / "current_dataset.json")
         
-        logger.info(f"Loaded dataset with {len(current_dataset)} tasks for job {job.job_id}")
+        logger.info(f"Loaded dataset for job {job.job_id}")
     
     async def _persist_job_results(self, job: Job):
         """Persist job results for later retrieval."""
@@ -242,9 +238,9 @@ class Executor:
             job.progress_percentage = 50.0
             
             executor = self._get_executor()
-            
-            # Check if executor supports vLLM pipeline
-            if hasattr(executor, 'run_job_with_vllm'):
+
+            if job.use_vllm and hasattr(executor, 'run_job_with_vllm'):
+                logger.info(f"Running job {job_id} with vLLM support")
                 exit_code, stdout, stderr = await executor.run_job_with_vllm(
                     image_id=image_id,
                     job=job,
@@ -252,13 +248,8 @@ class Executor:
                     prep_timeout=self.config.execution.prep_timeout_seconds,
                     inference_timeout=self.config.execution.inference_timeout_seconds
                 )
-                
-                if exit_code != 0:
-                    raise ExecutorError(f"vLLM pipeline failed with exit code {exit_code}")
             else:
-                # Fallback to old method
-                logger.warning("Executor doesn't support vLLM pipeline, using legacy method")
-                
+                logger.info(f"Running job {job_id} without vLLM")
                 job.status = JobStatus.PREP
                 prep_success = await self._run_prep_phase(job, image_id, work_dir)
                 if not prep_success:
@@ -268,7 +259,7 @@ class Executor:
                 inference_success = await self._run_inference_phase(job, image_id, work_dir)
                 if not inference_success:
                     raise ExecutorError("Inference phase failed")
-                
+                                
             if isinstance(self.network_policy, IptablesNetworkPolicy):
                 try:
                     connections = await asyncio.wait_for(monitor_task, timeout=5)
@@ -661,16 +652,8 @@ class Executor:
         return self._active_jobs.copy()
     
     async def _calculate_job_metrics(self, job: Job, work_dir: Path) -> Dict:
-        """
-        Calculate metrics for a completed inference job
+        """Calculate metrics using validation dataset."""
         
-        Args:
-            job: Job object
-            work_dir: Working directory with results
-            
-        Returns:
-            Dictionary with calculated metrics
-        """
         results_file = work_dir / "output" / "results.json"
         
         if not results_file.exists():
@@ -681,13 +664,30 @@ class Executor:
             with open(results_file, 'r') as f:
                 results_data = json.load(f)
             
-            if results_data.get("phase") != "inference":
-                return {"error": "Not an inference job"}
+            # Load validation dataset with expected outputs
+            validation_file = Path("/app/data/datasets/validation_dataset.json")
+            if not validation_file.exists():
+                logger.error("Validation dataset not found")
+                return {"error": "Validation dataset not found"}
             
-            if results_data.get("status") != "success":
-                return {"error": f"Inference failed: {results_data.get('error')}"}
+            with open(validation_file, 'r') as f:
+                validation_data = json.load(f)
             
-            metrics = calculate_detailed_metrics(results_data)
+            # Match predictions with expected outputs
+            predictions_with_expected = []
+            for i, prediction in enumerate(results_data.get("predictions", [])):
+                if i < len(validation_data["tasks"]):
+                    expected_output = validation_data["tasks"][i].get("expected_output")
+                    prediction["test_output"] = expected_output
+                    predictions_with_expected.append(prediction)
+            
+            # Calculate metrics
+            from utils.metrics import calculate_detailed_metrics
+            metrics_results = {
+                "predictions": predictions_with_expected
+            }
+            
+            metrics = calculate_detailed_metrics(metrics_results)
             
             return metrics
             

@@ -248,6 +248,8 @@ class MetaManager:
             validator_hotkey=request.get("validator_hotkey"),
             miner_hotkey=request.get("miner_hotkey", ""),
             custom_env_vars=request.get("custom_env_vars", {}),
+            use_vllm=request.get("use_vllm", False),
+            vllm_config=request.get("vllm_config"),
             status=JobStatus.PENDING,
             submitted_at=datetime.utcnow()
         )
