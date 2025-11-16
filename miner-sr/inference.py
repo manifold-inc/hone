@@ -478,7 +478,7 @@ def load_input_data(input_dir: Path) -> Dict:
     
     # Try to find the input file
     potential_files = [
-        input_dir / "input.json",
+        input_dir / "current_dataset.json",
     ]
     
     # Also check for any .json file in the directory
@@ -532,6 +532,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
         print("\n[4/4] Validating input data...")
         try:
             problems = load_input_data(input_dir)
+            problems = problems['tasks']
             
             print(f"✓ Found {len(problems)} problems")
             
@@ -605,6 +606,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         # Load input data
         print(f"\n[1/4] Loading input data from {input_dir}...")
         problems = load_input_data(input_dir)
+        problems = problems['tasks']
         
         # Initialize solver with vLLM
         print("[2/4] Initializing ARC solver with vLLM support...")
