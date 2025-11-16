@@ -91,7 +91,7 @@ class IntelligentScheduler:
         if available_gpus == 0:
             logger.debug("No GPUs available for scheduling")
             return None
-        
+                
         jobs = await self.job_queue.get_all_jobs()
         
         if not jobs:

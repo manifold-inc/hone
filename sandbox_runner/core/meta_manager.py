@@ -184,7 +184,7 @@ class MetaManager:
                 logger.exception(f"Error in dataset generation loop: {e}")
                 self._dataset_ready_event.set()
                 await asyncio.sleep(3600)
-                
+
     async def get_job_with_results(self, job_id: str) -> Optional[Dict]:
         """Get job with full results including predictions"""
         if job_id in self._running_jobs:
@@ -224,17 +224,6 @@ class MetaManager:
                 - queue_position: Position in queue
                 - estimated_start_time: Estimated start time
         """
-
-        if self.dataset_manager.is_generating:
-            logger.info(
-                f"Dataset generation in progress, queuing job submission for validator {request.get('validator_hotkey')}"
-            )
-            
-            await self._dataset_ready_event.wait()
-            
-            logger.info(
-                f"Dataset ready, processing queued job for validator {request.get('validator_hotkey')}"
-            )
         
         job_id = f"job_{uuid.uuid4().hex[:12]}"
         
@@ -402,6 +391,11 @@ class MetaManager:
         while self._running:
             try:
                 await self._check_completed_jobs()
+
+
+                while self.dataset_manager.is_generating:
+                    await asyncio.sleep(5.0)
+                    continue
                 
                 scheduled = await self._schedule_next_job()
                 
