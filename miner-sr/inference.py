@@ -551,10 +551,13 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
             # Validate first few problems
             for i, problem in enumerate(problems[:3]):
                 if "train_examples" not in problem:
+                    print(f"    Available keys: {list(problem.keys())}")
                     raise ValueError(f"Problem {i} missing 'train_examples'")
                 if "test_input" not in problem:
+                    print(f"    Available keys: {list(problem.keys())}")
                     raise ValueError(f"Problem {i} missing 'test_input'")
                 if "test_output" in problem:
+                    print(f"    Available keys: {list(problem.keys())}")
                     raise ValueError(f"'test_output' is accessible in prep phase - this is dangerous")
             
             print("✓ Input data validation passed")
