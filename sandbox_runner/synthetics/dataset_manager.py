@@ -227,7 +227,7 @@ class DatasetManager:
                     "expected_output": item.get("test_output")
                 })
             
-            miner_dataset_file = self.storage.storage_dir / "current_dataset.json"
+            miner_dataset_file = self.storage.storage_dir / "miner_current_dataset.json"
             with open(miner_dataset_file, 'w') as f:
                 json.dump({
                     "generated_at": datetime.utcnow().isoformat(),

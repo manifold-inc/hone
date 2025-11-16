@@ -476,34 +476,18 @@ def save_output_data(results: Dict, output_dir: Path):
 def load_input_data(input_dir: Path) -> Dict:
     """Load input data from mounted directory."""
     
+    all_files = list(input_dir.glob("*"))
+    print("all files : ", all_files)
     # Primary file to look for
-    dataset_file = input_dir / "current_dataset.json"
+    dataset_file = input_dir / "miner_current_dataset.json"
     
     if dataset_file.exists():
         print(f"Found dataset file: {dataset_file}")
         with open(dataset_file, 'r') as f:
             data = json.load(f)
-            
-        # Handle both formats (with/without 'tasks' wrapper)
-        if 'tasks' in data:
-            return data
-        else:
-            # Wrap in expected format if needed
-            return {'tasks': data}
-    
-    # Fallback to any .json file
-    if input_dir.exists():
-        json_files = list(input_dir.glob("*.json"))
-        for file_path in json_files:
-            if file_path.exists():
-                print(f"Found input file: {file_path}")
-                with open(file_path, 'r') as f:
-                    data = json.load(f)
-                if 'tasks' in data:
-                    return data
-                else:
-                    return {'tasks': data}
-    
+
+        return data    
+        
     raise FileNotFoundError(f"No input data found in {input_dir}")
 
 

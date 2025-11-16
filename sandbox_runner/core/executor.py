@@ -137,7 +137,7 @@ class Executor:
     async def _load_dataset_for_job(self, job: Job, work_dir: Path):
         """Load current dataset for the job - miners version without outputs"""
         
-        dataset_file = Path("/app/data/datasets/current_dataset.json")
+        dataset_file = Path("/app/data/datasets/miner_current_dataset.json")
         
         if not dataset_file.exists():
             dataset_manager = DatasetManager(Path("/app/data/datasets"))
@@ -147,7 +147,7 @@ class Executor:
         input_dir.mkdir(parents=True, exist_ok=True)
         
         import shutil
-        shutil.copy2(dataset_file, input_dir / "current_dataset.json")
+        shutil.copy2(dataset_file, input_dir / "miner_current_dataset.json")
         
         logger.info(f"Loaded dataset for job {job.job_id}")
     
