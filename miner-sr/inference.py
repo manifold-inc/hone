@@ -476,21 +476,33 @@ def save_output_data(results: Dict, output_dir: Path):
 def load_input_data(input_dir: Path) -> Dict:
     """Load input data from mounted directory."""
     
-    # Try to find the input file
-    potential_files = [
-        input_dir / "current_dataset.json",
-    ]
+    # Primary file to look for
+    dataset_file = input_dir / "current_dataset.json"
     
-    # Also check for any .json file in the directory
+    if dataset_file.exists():
+        print(f"Found dataset file: {dataset_file}")
+        with open(dataset_file, 'r') as f:
+            data = json.load(f)
+            
+        # Handle both formats (with/without 'tasks' wrapper)
+        if 'tasks' in data:
+            return data
+        else:
+            # Wrap in expected format if needed
+            return {'tasks': data}
+    
+    # Fallback to any .json file
     if input_dir.exists():
         json_files = list(input_dir.glob("*.json"))
-        potential_files.extend(json_files)
-    
-    for file_path in potential_files:
-        if file_path.exists():
-            print(f"Found input file: {file_path}")
-            with open(file_path, 'r') as f:
-                return json.load(f)
+        for file_path in json_files:
+            if file_path.exists():
+                print(f"Found input file: {file_path}")
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                if 'tasks' in data:
+                    return data
+                else:
+                    return {'tasks': data}
     
     raise FileNotFoundError(f"No input data found in {input_dir}")
 
@@ -637,26 +649,18 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
                 # Store prediction with metadata
                 prediction_entry = {
                     "problem_index": i,
+                    "task_hash": problem.get("task_hash"),
                     "predicted_output": predicted_output,
-                    "test_output": problem.get("test_output"),  # Include expected output for metrics
                     "metadata": problem.get("metadata", {})
                 }
+
                 predictions.append(prediction_entry)
                 
             except Exception as e:
                 print(f"    ✗ Error solving problem {i}: {e}")
                 import traceback
                 traceback.print_exc()
-                # Store failed prediction
-                predictions.append({
-                    "problem_index": i,
-                    "predicted_output": None,
-                    "test_output": problem.get("test_output"),
-                    "error": str(e),
-                    "metadata": problem.get("metadata", {})
-                })
-        
-        # Save results
+
         print(f"\n[4/4] Saving predictions to {output_dir}...")
         results = {
             "phase": "inference",
