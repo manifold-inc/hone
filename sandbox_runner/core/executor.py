@@ -239,7 +239,7 @@ class Executor:
             
             executor = self._get_executor()
 
-            if job.use_vllm and hasattr(executor, 'run_job_with_vllm'):
+            if job.use_vllm:
                 logger.info(f"Running job {job_id} with vLLM support")
                 exit_code, stdout, stderr = await executor.run_job_with_vllm(
                     image_id=image_id,

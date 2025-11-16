@@ -259,7 +259,9 @@ def create_router(config: Config) -> APIRouter:
             "priority": request.priority,
             "validator_hotkey": request.validator_hotkey or validator_id,
             "miner_hotkey": request.miner_hotkey,
-            "custom_env_vars": request.custom_env_vars
+            "custom_env_vars": request.custom_env_vars,
+            "use_vllm": request.use_vllm,
+            "vllm_config": request.vllm_config
         }
         
         response = await meta_manager.submit_job(job_request)
