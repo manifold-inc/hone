@@ -103,13 +103,13 @@ class DatasetManager:
                 try:
                     import random
                     difficulty_roll = random.random()
-                    if difficulty_roll < 0.3:
+                    if difficulty_roll < 0.5:
                         chain_length = random.randint(3, 5)
                     else:
                         chain_length = random.randint(5, 7)
                     
                     problem = None
-                    while not problem:
+                    while not problem or len(problem['train_examples']) < 3:
                         try:
                             problem = self.generator.generate_problem_set(
                                 num_train=3,
@@ -153,7 +153,7 @@ class DatasetManager:
                 while len(new_tasks) < num_needed:
                     try:
                         problem = None
-                        while not problem:
+                        while not problem or len(problem['train_examples']) < 3:
                             try:
                                 problem = self.generator.generate_problem_set(
                                     num_train=3,
