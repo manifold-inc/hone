@@ -632,6 +632,10 @@ def run_inference_phase(input_dir: Path, output_dir: Path):
         
         for i in range(num_to_solve):
             problem = problems[i]
+            if 'train_examples' not in problem:
+                print(f"    ✗ Problem {i} missing 'train_examples' field")
+                print(f"    Available keys: {list(problem.keys())}")
+
             print(f"\n  Problem {i+1}/{num_to_solve}:")
             print(f"    - Training examples: {len(problem['train_examples'])}")
             print(f"    - Test input shape: {len(problem['test_input'])}x{len(problem['test_input'][0])}")

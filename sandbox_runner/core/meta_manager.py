@@ -184,6 +184,7 @@ class MetaManager:
                 logger.exception(f"Error in dataset generation loop: {e}")
                 self._dataset_ready_event.set()
                 await asyncio.sleep(3600)
+                
     async def get_job_with_results(self, job_id: str) -> Optional[Dict]:
         """Get job with full results including predictions"""
         if job_id in self._running_jobs:
