@@ -11,6 +11,8 @@ from docker.errors import DockerException, ImageNotFound, ContainerError
 
 from core.job_queue import Job
 from config import Config
+from utils.log_capture import LogCapture, create_log_display
+from core.log_manager import get_log_manager
 
 logger = logging.getLogger(__name__)
 
@@ -170,8 +172,8 @@ class BuildLogDisplay:
         sys.stdout.flush()
 
 
-async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
-    loop = asyncio.get_event_loop()
+async def _stream_docker_logs(build_generator, display):
+    _ = asyncio.get_event_loop()
     try:
         for entry in build_generator:
             if 'error' in entry:
@@ -187,10 +189,9 @@ async def _stream_docker_logs(build_generator, display: BuildLogDisplay):
         display.update(f"ERROR: {ex}")
         await asyncio.sleep(0)
 
-async def _stream_container_logs(container, display: BuildLogDisplay) -> str:
-    """
-    Stream container logs in real time into the BuildLogDisplay
-    """
+
+async def _stream_container_logs(container, display) -> str:
+    # The display is now a BuildLogDisplayAdapter
     loop = asyncio.get_event_loop()
     collected: List[str] = []
 
@@ -202,7 +203,7 @@ async def _stream_container_logs(container, display: BuildLogDisplay) -> str:
                 except Exception:
                     text = str(chunk)
                 for ln in text.splitlines():
-                    display.update(ln)
+                    display.update(ln)  # This now also persists logs
                     collected.append(ln + "\n")
         except Exception as e:
             display.update(f"[log-stream] ERROR: {e}")
@@ -226,6 +227,7 @@ class DockerOnlyExecutor:
             config: Application configuration
         """
         self.config = config
+        self.show_terminal_logs = config.execution.show_terminal_logs
         
         try:
             self.docker_client = docker.from_env()
@@ -286,7 +288,13 @@ class DockerOnlyExecutor:
         )
         
         container = None
-        display = BuildLogDisplay(box_lines=50, title=f"🧪 {phase.upper()} LOGS")
+        display = create_log_display(
+            job_id=job.job_id,
+            phase=phase,
+            show_terminal=self.show_terminal_logs,
+            box_lines=50,
+            title=f"🧪 {phase.upper()} LOGS"
+        )
         
         try:
             container = await asyncio.get_event_loop().run_in_executor(
@@ -593,8 +601,14 @@ class DockerOnlyExecutor:
         
         logger.info(f"Building Docker image: {image_tag}")
         
-        display = BuildLogDisplay(box_lines=50)
-        
+        display = create_log_display(
+            job_id=job_id,
+            phase="build",
+            show_terminal=self.show_terminal_logs,
+            box_lines=50,
+            title="🔨 BUILD LOGS"
+        )
+
         try:
             dockerfile_path = repo_path / 'Dockerfile'
             if not dockerfile_path.exists():
@@ -919,6 +933,9 @@ class DockerOnlyExecutor:
             '--dtype', dtype,
             '--gpu-memory-utilization', str(gpu_memory),
         ]
+        if self.config.execution.persist_logs:
+            log_capture = LogCapture(job.job_id, "vllm", self.show_terminal_logs)
+            log_capture.capture_line(f"Starting vLLM container: {container_name}", "info")
 
         if max_model_len:
             command.extend(['--max-model-len', str(max_model_len)])
@@ -955,7 +972,6 @@ class DockerOnlyExecutor:
             model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
         
         model_dir_name = model_name.replace("/", "--")
-        model_path_in_container = f"/app/models/{model_dir_name}"
         
         config = {
             'image': vllm_image,
@@ -1015,7 +1031,14 @@ class DockerOnlyExecutor:
         """
         logger.info(f"Waiting for vLLM startup (checking logs for 'application startup complete.')...")
         
-        display = BuildLogDisplay(box_lines=30, title="🚀 vLLM STARTUP LOGS")
+        display = create_log_display(
+            job_id=container.name.split('-')[-1],
+            phase="vllm",
+            show_terminal=self.show_terminal_logs,
+            box_lines=30,
+            title="🚀 vLLM STARTUP LOGS"
+        )
+
         display.start()
         
         start_time = time.time()

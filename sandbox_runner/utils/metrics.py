@@ -214,52 +214,7 @@ def calculate_detailed_metrics(results_data: Dict) -> Dict:
         problem_metrics["metadata"] = pred.get("metadata", {})
         per_problem_metrics.append(problem_metrics)
     
-    # Breakdown by metadata if available
-    metadata_breakdown = {}
-    for pred in predictions:
-        metadata = pred.get("metadata", {})
-        chain_length = metadata.get("chain_length", "unknown")
-        
-        if chain_length not in metadata_breakdown:
-            metadata_breakdown[chain_length] = []
-        
-        metadata_breakdown[chain_length].append({
-            "problem_index": pred.get("problem_index"),
-            "has_prediction": pred.get("predicted_output") is not None,
-            "metrics": calculate_metrics_for_prediction(
-                pred.get("predicted_output"),
-                pred.get("test_output"),
-                metadata
-            )
-        })
-    
-    # Calculate breakdown statistics
-    breakdown_stats = {}
-    for chain_length, items in metadata_breakdown.items():
-        solved = [item for item in items if item["has_prediction"]]
-        if solved:
-            breakdown_stats[str(chain_length)] = {
-                "count": len(items),
-                "solved": len(solved),
-                "exact_matches": sum(1 for item in solved if item["metrics"]["exact_match"]),
-                "avg_partial_correctness": round(
-                    sum(item["metrics"]["partial_correctness"] for item in solved) / len(solved), 4
-                ),
-                "avg_grid_similarity": round(
-                    sum(item["metrics"]["grid_similarity"] for item in solved) / len(solved), 4
-                )
-            }
-        else:
-            breakdown_stats[str(chain_length)] = {
-                "count": len(items),
-                "solved": 0,
-                "exact_matches": 0,
-                "avg_partial_correctness": 0.0,
-                "avg_grid_similarity": 0.0
-            }
-    
     return {
         "aggregate": aggregate,
-        "per_problem": per_problem_metrics,
-        "breakdown_by_chain_length": breakdown_stats
+        "per_problem": per_problem_metrics
     }

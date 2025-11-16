@@ -11,6 +11,7 @@ Configuration hierarchy:
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+import os
 
 import yaml
 
@@ -63,6 +64,11 @@ class ExecutionConfig:
     repo_clone_timeout_seconds: int = 600  # 10 minutes
     repo_build_timeout_seconds: int = 3600  # 1 hour
     allowed_repo_hosts: list[str] = field(default_factory=lambda: ["github.com", "gitlab.com"])
+    
+    # log settings
+    show_terminal_logs: bool = True  # Show scrolling log boxes in terminal
+    persist_logs: bool = True  # Persist logs for API access
+    log_retention_hours: int = 1  # How long to keep logs in hours
 
 
 @dataclass
@@ -152,7 +158,12 @@ class Config:
 
 def load_config(config_path: Path) -> Config:
     """
-    Load configuration from YAML file.
+    Load configuration from YAML file with environment variable overrides.
+    
+    Environment variables can override config values:
+    - SHOW_TERMINAL_LOGS: true/false to enable/disable terminal log display
+    - LOG_RETENTION_HOURS: number of hours to keep logs
+    - PERSIST_LOGS: true/false to enable/disable log persistence
     
     Args:
         config_path: Path to YAML configuration file
@@ -191,7 +202,22 @@ def load_config(config_path: Path) -> Config:
         config.hardware = HardwareConfig(**yaml_data['hardware'])
     
     if 'execution' in yaml_data:
-        config.execution = ExecutionConfig(**yaml_data['execution'])
+        exec_data = yaml_data['execution'].copy()
+        
+        # Apply environment variable overrides for log settings
+        if 'SHOW_TERMINAL_LOGS' in os.environ:
+            exec_data['show_terminal_logs'] = os.environ['SHOW_TERMINAL_LOGS'].lower() == 'true'
+        
+        if 'PERSIST_LOGS' in os.environ:
+            exec_data['persist_logs'] = os.environ['PERSIST_LOGS'].lower() == 'true'
+        
+        if 'LOG_RETENTION_HOURS' in os.environ:
+            try:
+                exec_data['log_retention_hours'] = int(os.environ['LOG_RETENTION_HOURS'])
+            except ValueError:
+                pass  # Keep default if invalid
+        
+        config.execution = ExecutionConfig(**exec_data)
     
     if 'security' in yaml_data:
         security_data = yaml_data['security']
@@ -261,6 +287,9 @@ def _validate_config(config: Config):
     if config.execution.inference_timeout_seconds < 60:
         raise ValueError(f"Inference timeout must be at least 60 seconds, got {config.execution.inference_timeout_seconds}")
     
+    if config.execution.log_retention_hours < 0:
+        raise ValueError(f"Log retention must be at least 0 hours, got {config.execution.log_retention_hours}")
+    
     if not config.api.require_epistula and not config.api.require_api_key:
         raise ValueError("At least one authentication method must be enabled")
 
@@ -280,14 +309,14 @@ def generate_default_config(output_path: Path):
         },
         'api': {
             'port': 8443,
-            'require_epistula': False, # testing phase
+            'require_epistula': False,  # testing phase
             'require_api_key': True,
             'rate_limit_per_validator': 3,
             'ssl_cert_path': '/etc/ssl/certs/runner.crt',
             'ssl_key_path': '/etc/ssl/private/runner.key'
         },
         'hardware': {
-            'gpu_count': 1, # testing phase
+            'gpu_count': 1,  # testing phase
             'gpu_type': 'H200',
             'cpu_cores': 15,
             'memory_gb': 175
@@ -295,14 +324,17 @@ def generate_default_config(output_path: Path):
         'execution': {
             'mode': 'docker',
             'fallback_on_error': True,
-            'cpu_limit': 5, # testing phase
+            'cpu_limit': 5,  # testing phase
             'memory_limit_gb': 100,
             'prep_timeout_seconds': 3600,
             'inference_timeout_seconds': 3600,
             'disk_quota_gb': 100,
             'max_processes': 32,
             'repo_clone_timeout_seconds': 600,
-            'repo_build_timeout_seconds': 1800
+            'repo_build_timeout_seconds': 1800,
+            'show_terminal_logs': True,
+            'persist_logs': True,
+            'log_retention_hours': 1
         },
         'security': {
             'seccomp': {

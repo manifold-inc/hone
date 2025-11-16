@@ -12,6 +12,7 @@ from monitoring.metrics import metrics_manager
 from core.meta_manager import MetaManager
 from api.routes import create_router
 from api.dashboard_routes import create_dashboard_router
+from api.log_routes import create_logs_router
 
 logger = logging.getLogger("api.gateway")
 
@@ -91,6 +92,10 @@ def create_app(config: Config) -> FastAPI:
             "version": "1.0.0",
             "status": "operational"
         }
+    
+    if config.execution.persist_logs:
+        logs_router = create_logs_router()
+        app.include_router(logs_router, prefix="/v1")
     
     return app
 

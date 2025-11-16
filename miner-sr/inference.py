@@ -505,25 +505,7 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print(f"[2/4] Downloading model to {cache_dir}...")
     print("(This requires internet access)")
     
-    try:
-        print("\n[3/4] Downloading model files...")
-        
-        local_dir = cache_dir / model_name.replace("/", "--")
-        local_dir.mkdir(parents=True, exist_ok=True)
-        
-        downloaded_path = snapshot_download(
-            repo_id=model_name,
-            cache_dir=str(cache_dir),
-            local_dir=str(local_dir),
-            local_dir_use_symlinks=False,
-            resume_download=True,
-            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-        )
-        
-        print(f"✓ Model files downloaded to: {downloaded_path}")
-        print("✓ Model download verified")
-        print(f"✓ Files in model directory: {len(list(Path(downloaded_path).glob('*')))}")
-        
+    try:    
         # Validate input data
         print("\n[4/4] Validating input data...")
         try:
@@ -550,6 +532,24 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
             print(f"WARNING: Input data validation failed: {e}")
             print("Continuing with model download...")
         
+        print("\n[3/4] Downloading model files...")
+        
+        local_dir = cache_dir / model_name.replace("/", "--")
+        local_dir.mkdir(parents=True, exist_ok=True)
+        
+        downloaded_path = snapshot_download(
+            repo_id=model_name,
+            cache_dir=str(cache_dir),
+            local_dir=str(local_dir),
+            local_dir_use_symlinks=False,
+            resume_download=True,
+            ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
+        )
+        
+        print(f"✓ Model files downloaded to: {downloaded_path}")
+        print("✓ Model download verified")
+        print(f"✓ Files in model directory: {len(list(Path(downloaded_path).glob('*')))}")
+
         # Save model info for vLLM to use
         model_info = {
             "model_name": model_name,
