@@ -585,15 +585,11 @@ class Executor:
         Raises:
             ExecutorError: If no executor is available
         """
-        if self.execution_mode == "docker+gvisor" and self.docker_gvisor_executor:
-            return self.docker_gvisor_executor
         
-        if self.fallback_enabled and self.docker_executor:
-            logger.warning("Falling back to docker-only mode")
+        if self.docker_executor:
             return self.docker_executor
         
-        if self.fallback_enabled and self.direct_executor:
-            logger.warning("Falling back to direct execution mode")
+        if self.direct_executor:
             return self.direct_executor
         
         raise ExecutorError("No execution mode available")
