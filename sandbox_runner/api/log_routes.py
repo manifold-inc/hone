@@ -13,7 +13,7 @@ import logging
 
 from api.auth import AuthenticationManager
 from api.routes import authenticate_request, get_meta_manager
-from core.log_manager import get_log_manager
+from core.log_manager import get_log_manager, initialize_log_manager
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,25 @@ class LogStatsResponse(BaseModel):
 
 
 # ============================================================================
+# Helper function to ensure log manager is available
+# ============================================================================
+
+def ensure_log_manager():
+    """Ensure log manager is initialized and available"""
+    try:
+        return get_log_manager()
+    except RuntimeError:
+        # Try to initialize with default settings
+        try:
+            return initialize_log_manager(retention_hours=1)
+        except:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Log service not available"
+            )
+
+
+# ============================================================================
 # Router Creation
 # ============================================================================
 
@@ -83,7 +102,7 @@ def create_logs_router() -> APIRouter:
             limit: Maximum number of log entries to return (1-10000)
             phase: Optional phase filter
         """
-        log_manager = get_log_manager()
+        log_manager = ensure_log_manager()
         result = log_manager.get_logs(
             job_id=job_id,
             cursor_id=cursor_id,
@@ -119,14 +138,7 @@ def create_logs_router() -> APIRouter:
             job_id: Job identifier
             phase: Optional phase filter
         """
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
-        
+        log_manager = ensure_log_manager()
         result = log_manager.get_all_logs(job_id=job_id, phase=phase)
         
         if "error" in result:
@@ -156,13 +168,7 @@ def create_logs_router() -> APIRouter:
             lines: Number of latest lines to return (1-1000)
             phase: Optional phase filter
         """
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
+        log_manager = ensure_log_manager()
         
         # Get all logs and return only the last N entries
         result = log_manager.get_all_logs(job_id=job_id, phase=phase)
@@ -194,14 +200,7 @@ def create_logs_router() -> APIRouter:
         Args:
             job_id: Job identifier
         """
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
-        
+        log_manager = ensure_log_manager()
         log_manager.clear_job_logs(job_id)
         
         return {
@@ -218,14 +217,7 @@ def create_logs_router() -> APIRouter:
         auth: tuple = Depends(authenticate_request)
     ):
         """Get statistics about the log service."""
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
-        
+        log_manager = ensure_log_manager()
         stats = log_manager.get_stats()
         
         return LogStatsResponse(**stats)
@@ -238,14 +230,7 @@ def create_logs_router() -> APIRouter:
         auth: tuple = Depends(authenticate_request)
     ):
         """Get list of job IDs that have active log streams."""
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
-        
+        log_manager = ensure_log_manager()
         active_jobs = log_manager.get_active_jobs()
         
         return {
@@ -267,13 +252,7 @@ def create_logs_router() -> APIRouter:
         Args:
             job_id: Job identifier
         """
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
+        log_manager = ensure_log_manager()
         
         # Get all logs to determine available phases
         result = log_manager.get_all_logs(job_id=job_id)

@@ -75,6 +75,13 @@ def create_app(config: Config) -> FastAPI:
     dashboard_router = create_dashboard_router(config)
     app.include_router(dashboard_router, prefix="/v1")
     
+    if config.execution.log_retention_hours > 0:
+        logs_router = create_logs_router()
+        app.include_router(logs_router, prefix="/v1")
+        logger.info(f"Log routes enabled (retention: {config.execution.log_retention_hours}h)")
+    else:
+        logger.info("Log routes disabled (log_retention_hours = 0)")
+    
     @app.get("/metrics")
     async def metrics():
         """Prometheus metrics endpoint."""
@@ -92,10 +99,6 @@ def create_app(config: Config) -> FastAPI:
             "version": "1.0.0",
             "status": "operational"
         }
-    
-    if config.execution.persist_logs:
-        logs_router = create_logs_router()
-        app.include_router(logs_router, prefix="/v1")
     
     return app
 
