@@ -345,6 +345,7 @@ class LogManager:
     
     def get_active_jobs(self) -> List[str]:
         """Get list of jobs with active log streams"""
+        logger.info(f"getting active jobs logs")
         with self._lock:
             return list(self._streams.keys())
     
