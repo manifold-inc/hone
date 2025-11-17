@@ -10,6 +10,7 @@ from config import Config
 from api.auth import AuthenticationManager, RateLimiter
 from monitoring.metrics import metrics_manager
 from core.meta_manager import MetaManager
+from core.log_manager import initialize_log_manager
 from api.routes import create_router
 from api.dashboard_routes import create_dashboard_router
 from api.log_routes import create_logs_router
@@ -25,6 +26,11 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Hone Subnet Sandbox Runner API")
     
     metrics_manager.initialize()
+
+    if app.state.config.execution.log_retention_hours > 0:
+        log_manager = initialize_log_manager(app.state.config.execution.log_retention_hours)
+        await log_manager.start()
+        logger.info(f"LogManager initialized with {app.state.config.execution.log_retention_hours}h retention")
     
     meta_manager = MetaManager(app.state.config)
     app.state.meta_manager = meta_manager

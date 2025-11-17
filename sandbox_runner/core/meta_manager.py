@@ -31,8 +31,6 @@ from core.executor import Executor
 from synthetics.dataset_manager import DatasetManager
 from config import Config
 
-from core.log_manager import initialize_log_manager
-
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +95,6 @@ class MetaManager:
         self._dataset_generation_task: Optional[asyncio.Task] = None
         self._dataset_ready_event = asyncio.Event()
         self._dataset_ready_event.set()  
-        self.log_manager = initialize_log_manager(config.execution.log_retention_hours)
 
         logger.info("Meta-Manager initialized with executor")
     
@@ -114,8 +111,6 @@ class MetaManager:
         self._monitoring_task = asyncio.create_task(self._monitoring_loop())
         self._dataset_generation_task = asyncio.create_task(self._dataset_generation_loop())
         await self.executor.start()
-
-        await self.log_manager.start()
         
         logger.info("Meta-Manager started")
     
@@ -153,9 +148,6 @@ class MetaManager:
         
         for job_id in list(self._running_jobs.keys()):
             await self.cancel_job(job_id)
-
-        if self.log_manager:
-            await self.log_manager.stop()
         
         logger.info("Meta-Manager stopped")
     
