@@ -1125,7 +1125,7 @@ class DockerOnlyExecutor:
         try:
             if container:
                 
-                logger.info(color_job_id(f"Docker container created: {container.id}", container.id))
+                logger.info(color_job_id(f"Stopping vLLM container: {container.id}", container.id))
                 await asyncio.get_event_loop().run_in_executor(
                     None, lambda: container.stop(timeout=10)
                 )
