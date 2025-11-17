@@ -108,7 +108,7 @@ def _cli() -> int:
     print(f"Input: {input_dir}")
     print(f"Output: {output_dir}")
 
-    run_prep_phase(input_dir, output_dir)
+    run_prep_phase()
     return 0
 
 

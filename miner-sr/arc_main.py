@@ -48,7 +48,7 @@ def main() -> int:
     print(f"Output: {output_dir}")
 
     if args.phase == "prep":
-        run_prep_phase(input_dir, output_dir)
+        run_prep_phase()
     else:
         run_inference_phase(input_dir, output_dir)
 
