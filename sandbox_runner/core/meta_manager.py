@@ -113,6 +113,7 @@ class MetaManager:
         self._processing_task = asyncio.create_task(self._processing_loop())        
         self._monitoring_task = asyncio.create_task(self._monitoring_loop())
         self._dataset_generation_task = asyncio.create_task(self._dataset_generation_loop())
+        await self.executor.start()
 
         await self.log_manager.start()
         

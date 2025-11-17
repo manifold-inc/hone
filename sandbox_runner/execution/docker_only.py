@@ -979,7 +979,7 @@ class DockerOnlyExecutor:
         model_dir_name = model_name.replace("/", "--")
         
         config = {
-            'image': vllm_image,
+            'image': self.vllm_image,
             'name': container_name,
             'command': command,
             'volumes': {
