@@ -315,7 +315,7 @@ with gr.Blocks(title="Log Stream Dashboard", theme=gr.themes.Soft()) as app:
 if __name__ == "__main__":
     app.launch(
         server_name="0.0.0.0",
-        server_port=7860,
+        server_port=9090,
         share=False,
         inbrowser=True
     )
