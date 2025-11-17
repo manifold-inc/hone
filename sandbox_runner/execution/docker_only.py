@@ -172,6 +172,14 @@ class BuildLogDisplay:
         sys.stdout.flush()
 
 
+GREEN = "\033[92m"
+RESET = "\033[0m"
+
+def color_job_id(text: str, job_id: str) -> str:
+    target = f"sandbox-job-{job_id}"
+    return text.replace(target, f"{GREEN}{target}{RESET}")
+
+
 async def _stream_docker_logs(build_generator, display):
     _ = asyncio.get_event_loop()
     try:
@@ -273,15 +281,9 @@ class DockerOnlyExecutor:
         container_name = f"sandbox-{job.job_id}-{phase}"
         
         logger.info(
-            f"Starting Docker container: {container_name}",
-            extra={
-                "job_id": job.job_id,
-                "phase": phase,
-                "image": image_id,
-                "network_enabled": network_enabled,
-                "network_name": network_name
-            }
+            color_job_id(f"Starting Docker container: {container_name}", job.job_id)
         )
+
         
         container_config = self._build_container_config(
             image_id=image_id,
@@ -306,15 +308,12 @@ class DockerOnlyExecutor:
             container = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.containers.create(**container_config)
             )
-            logger.info(
-                f"Docker container created: {container.id[:12]}",
-                extra={"container_id": container.id}
-            )
-            
+            logger.info(color_job_id(f"Docker container created: {container.id}", job.job_id))
+
             display.start()
             
             await asyncio.get_event_loop().run_in_executor(None, container.start)
-            logger.info(f"Docker container started: {container.id[:12]}")
+            logger.info(color_job_id(f"Docker container started: {container.id}", job.job_id))
             
             logs_task = asyncio.create_task(_stream_container_logs(container, display))
             
@@ -337,19 +336,7 @@ class DockerOnlyExecutor:
             display.end(status_txt)
             
             container_state = container.attrs['State']
-            logger.info(
-                f"Docker container finished: {container.id[:12]} (exit_code={exit_code})",
-                extra={
-                    "job_id": job.job_id,
-                    "phase": phase,
-                    "exit_code": exit_code,
-                    "started_at": container_state.get('StartedAt'),
-                    "finished_at": container_state.get('FinishedAt'),
-                    "error": container_state.get('Error', ''),
-                    "oom_killed": container_state.get('OOMKilled', False),
-                    "stdout_lines": len(combined_logs.splitlines()) if combined_logs else 0,
-                }
-            )
+            logger.info(color_job_id(f"Docker container finished: {container.id}", job.job_id))
             
             if exit_code != 0:
                 logger.error(
@@ -870,7 +857,11 @@ class DockerOnlyExecutor:
                             }
                         )
                     )
-                    logger.info(f"Created isolated Docker network: {network_name} (subnet: {subnet})")
+                    logger.info(color_job_id(
+                        f"Created isolated Docker network: {network_name} (subnet: {subnet})",
+                        network_name.replace("sandbox-job-", "")
+                    ))
+
                     return network
                     
                 except docker.errors.APIError as e:
@@ -949,7 +940,10 @@ class DockerOnlyExecutor:
         for key, value in extra_args.items():
             command.extend([f'--{key.replace("_", "-")}', str(value)])
         
-        logger.info(f"Starting vLLM container: {container_name} on network {network_name}")
+        logger.info(color_job_id(
+            f"Starting vLLM container: {container_name} on network {network_name}",
+            job.job_id
+        ))
         
         try:
             await asyncio.get_event_loop().run_in_executor(
@@ -1009,7 +1003,7 @@ class DockerOnlyExecutor:
             
             await asyncio.get_event_loop().run_in_executor(None, container.start)
             
-            logger.info(f"vLLM container started: {container.id[:12]}")
+            logger.info(color_job_id(f"vLLM container started: {container.id}", job.job_id))
             
             return container, container.id
             
@@ -1131,7 +1125,7 @@ class DockerOnlyExecutor:
         try:
             if container:
                 
-                logger.info(f"Stopping vLLM container: {container.id[:12]}")
+                logger.info(color_job_id(f"Docker container created: {container.id}", container.id))
                 await asyncio.get_event_loop().run_in_executor(
                     None, lambda: container.stop(timeout=10)
                 )
