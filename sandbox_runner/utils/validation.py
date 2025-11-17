@@ -45,7 +45,7 @@ class RepositoryValidator:
         'arc_main.py',
         'arc_prep_phase.py',
         'arc_inference_phase.py',
-        'Dockerfile'
+        'Dockerfile',
         'requirements.txt'
     ]
     
