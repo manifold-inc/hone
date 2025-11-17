@@ -191,7 +191,7 @@ def calculate_detailed_metrics(results_data: Dict) -> Dict:
     Calculate detailed metrics from inference results
     
     Args:
-        results_data: Results dictionary from inference.py output
+        results_data: Results dictionary from arc_main.py output
         
     Returns:
         Dictionary with detailed metrics breakdown

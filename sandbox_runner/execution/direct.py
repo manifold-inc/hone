@@ -218,7 +218,7 @@ class DirectExecutor:
         Returns:
             Command as list of arguments
         """
-        inference_script = work_dir / 'repo' / 'inference.py'
+        inference_script = work_dir / 'repo' / 'arc_main.py'
         
         command = [
             'python3',

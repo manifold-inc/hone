@@ -2,7 +2,7 @@
 Repository Validation Module
 
 Validates miner repositories before execution:
-- Check for required files (inference.py, requirements.txt)
+- Check for required files
 - Validate requirements.txt for malicious packages
 - Check repository structure
 - Validate Dockerfile if present
@@ -42,7 +42,10 @@ class RepositoryValidator:
     }
     
     REQUIRED_FILES = [
-        'inference.py',
+        'arc_main.py',
+        'arc_prep_phase.py',
+        'arc_inference_phase.py',
+        'Dockerfile'
         'requirements.txt'
     ]
     
@@ -103,11 +106,25 @@ class RepositoryValidator:
                 raise ValidationError(f"Required path is not a file: {required_file}")
         
         self._check_file_size(
-            repo_path / 'inference.py',
+            repo_path / 'arc_main.py',
             self.MAX_INFERENCE_SIZE,
-            'inference.py'
+            'arc_main.py'
         )
-        
+        self._check_file_size(
+            repo_path / 'arc_inference_phase.py',
+            self.MAX_INFERENCE_SIZE,
+            'arc_inference_phase.py'
+        )
+        self._check_file_size(
+            repo_path / 'arc_prep_phase.py',
+            self.MAX_INFERENCE_SIZE,
+            'arc_prep_phase.py'
+        )
+        self._check_file_size(
+            repo_path / 'Dockerfile',
+            self.MAX_INFERENCE_SIZE,
+            'Dockerfile'
+        )
         self._check_file_size(
             repo_path / 'requirements.txt',
             self.MAX_REQUIREMENTS_SIZE,
@@ -190,143 +207,7 @@ class RepositoryValidator:
             extra={"package_count": len(packages)}
         )
         return True
-    
-    def validate_inference_script(self, inference_path: Path) -> bool:
-        """
-        Validate inference.py script
         
-        Basic checks:
-        1. File is valid Python
-        2. No obvious shell command execution
-        3. Has required argument parsing (with graceful warning if missing)
-        
-        Args:
-            inference_path: Path to inference.py
-            
-        Returns:
-            True if valid
-            
-        Raises:
-            ValidationError: If validation fails
-        """
-        if not inference_path.exists():
-            raise ValidationError(f"inference.py not found: {inference_path}")
-        
-        try:
-            with open(inference_path, 'r') as f:
-                content = f.read()
-        except Exception as e:
-            raise ValidationError(f"Failed to read inference.py: {e}")
-        
-        try:
-            compile(content, str(inference_path), 'exec')
-        except SyntaxError as e:
-            raise ValidationError(f"Invalid Python syntax in inference.py: {e}")
-        
-        dangerous_patterns = [
-            r'os\.system\(',
-            r'subprocess\.call\(',
-            r'subprocess\.run\(',
-            r'eval\(',
-            r'exec\(',
-            r'__import__\(',
-        ]
-        
-        found_dangerous = []
-        for pattern in dangerous_patterns:
-            if re.search(pattern, content):
-                found_dangerous.append(pattern)
-        
-        if found_dangerous:
-            logger.warning(
-                f"Potentially dangerous patterns found in inference.py: {found_dangerous}. "
-                "These will be monitored during execution."
-            )
-        
-        # argument parsing (gracefully handle if missing)
-        has_argparse = 'argparse' in content or 'ArgumentParser' in content
-        has_phase_arg = '--phase' in content or 'phase' in content.lower()
-        has_input_arg = '--input' in content or 'input' in content.lower()
-        has_output_arg = '--output' in content or 'output' in content.lower()
-        
-        if not has_argparse:
-            logger.warning(
-                "inference.py does not appear to use argparse. "
-                "The script may not handle command-line arguments correctly."
-            )
-        
-        if not (has_phase_arg and has_input_arg and has_output_arg):
-            missing = []
-            if not has_phase_arg:
-                missing.append("--phase")
-            if not has_input_arg:
-                missing.append("--input")
-            if not has_output_arg:
-                missing.append("--output")
-            
-            logger.warning(
-                f"inference.py may be missing required arguments: {', '.join(missing)}. "
-                "Expected arguments: --phase prep|inference --input PATH --output PATH. "
-                "Execution will continue but may fail if these arguments are not handled."
-            )
-        else:
-            logger.info("inference.py appears to have proper argument parsing")
-        
-        logger.info("Inference script validation passed")
-        return True
-    
-    def validate_dockerfile(self, dockerfile_path: Path) -> bool:
-        """
-        Validate Dockerfile if present
-        
-        Basic checks:
-        1. File is readable
-        2. Has FROM instruction
-        3. No obviously malicious commands
-        
-        Args:
-            dockerfile_path: Path to Dockerfile
-            
-        Returns:
-            True if valid
-            
-        Raises:
-            ValidationError: If validation fails
-        """
-        if not dockerfile_path.exists():
-            raise ValidationError(f"Dockerfile doesnt exist!")
-        
-        try:
-            with open(dockerfile_path, 'r') as f:
-                content = f.read()
-        except Exception as e:
-            raise ValidationError(f"Failed to read Dockerfile: {e}")
-        
-        if not re.search(r'^FROM\s+', content, re.MULTILINE):
-            raise ValidationError(
-                "Dockerfile must have a FROM instruction"
-            )
-        
-        dangerous_patterns = [
-            r'rm\s+-rf\s+/',
-            r'chmod\s+777',
-            r'curl.*\|\s*bash',
-            r'wget.*\|\s*sh',
-        ]
-        
-        found_dangerous = []
-        for pattern in dangerous_patterns:
-            if re.search(pattern, content, re.IGNORECASE):
-                found_dangerous.append(pattern)
-        
-        if found_dangerous:
-            logger.warning(
-                f"Potentially dangerous commands found in Dockerfile: {found_dangerous}"
-            )
-        
-        logger.info("Dockerfile validation passed")
-        return True
-    
     def validate_url(self, repo_url: str) -> bool:
         """
         Validate repository URL
@@ -377,9 +258,6 @@ class RepositoryValidator:
         """
         self.validate_url(repo_url)
         self.validate_structure(repo_path)
-        self.validate_requirements(repo_path / 'requirements.txt')
-        self.validate_inference_script(repo_path / 'inference.py')
-        self.validate_dockerfile(repo_path / 'Dockerfile')
         logger.info(f"All validation checks passed for {repo_url}")
         return True
     

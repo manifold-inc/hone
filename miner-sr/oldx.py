@@ -20,6 +20,8 @@ print(f"Current directory: {os.getcwd()}")
 print(f"Arguments: {sys.argv}")
 
 
+model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
+
 class ARCSolver:
     """
     ARC solver with vLLM and rule-based strategies
@@ -497,7 +499,6 @@ def run_prep_phase(input_dir: Path, output_dir: Path):
     print("PREP PHASE - Downloading Model")
     print("=" * 60)
     
-    model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
     cache_dir = Path("/app/models")
     cache_dir.mkdir(parents=True, exist_ok=True)
     

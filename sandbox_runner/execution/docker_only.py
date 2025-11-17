@@ -413,7 +413,7 @@ class DockerOnlyExecutor:
         env_vars.update(job.custom_env_vars or {})
         
         command = [
-            'python3', 'inference.py', 
+            'python3', 'arc_main.py', 
             '--phase', phase,
             '--input', '/input',
             '--output', '/output'

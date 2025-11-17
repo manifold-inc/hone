@@ -19,7 +19,6 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-COPY inference.py .
-RUN chmod +x inference.py
+COPY . .
 
-CMD ["python3", "inference.py"]
+CMD ["python3", "arc_main.py"]
