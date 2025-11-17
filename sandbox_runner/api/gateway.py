@@ -87,7 +87,7 @@ def create_app(config: Config) -> FastAPI:
         logger.info(f"Log routes enabled (retention: {config.execution.log_retention_hours}h)")
         for route in app.routes:
             if hasattr(route, 'path'):
-                logger.debug(f"Registered route: {route.path}")
+                logger.info(f"Registered route: {route.path}")
 
     else:
         logger.info("Log routes disabled (log_retention_hours = 0)")
