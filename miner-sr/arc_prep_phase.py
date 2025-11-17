@@ -31,7 +31,7 @@ from arc_solver_llm import model_name
 
 
 def run_prep_phase(cache_dir = Path("/app/models")) -> None:
-    """Prep phase: download model(s) and optionally validate input data."""
+    """Prep phase: download model(s)"""
     print("\n" + "=" * 60)
     print("PREP PHASE - Downloading Models / Assets")
     print("=" * 60)
@@ -41,12 +41,9 @@ def run_prep_phase(cache_dir = Path("/app/models")) -> None:
 
     print(f"\n[1/4] Default example model to download: {model_name}")
     print(f"[2/4] Using cache directory: {cache_dir}")
-    print("(This phase is allowed to use the internet.)")
+    print("(This phase is allowed to use the internet)")
 
     try:
-        # -----------------------
-        # Download the example model
-        # -----------------------
         print("\n[4/4] Downloading model files from Hugging Face...")
 
         # Make sure to use the cache dir as root for your downloaded ressources (models, datasets, etc)
