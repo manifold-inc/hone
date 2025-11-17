@@ -27,7 +27,7 @@ from typing import List, Dict, Optional
 
 # This is the model *downloaded in prep phase* by default
 # The prep-phase script imports this name
-model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
+model_name = "unsloth/QwQ-32B"
 
 
 class ARCSolver:
