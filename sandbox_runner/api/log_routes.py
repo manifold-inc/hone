@@ -83,14 +83,7 @@ def create_logs_router() -> APIRouter:
             limit: Maximum number of log entries to return (1-10000)
             phase: Optional phase filter
         """
-        try:
-            log_manager = get_log_manager()
-        except RuntimeError:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
-            )
-        
+        log_manager = get_log_manager()
         result = log_manager.get_logs(
             job_id=job_id,
             cursor_id=cursor_id,
