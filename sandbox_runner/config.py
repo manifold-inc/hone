@@ -66,9 +66,9 @@ class ExecutionConfig:
     allowed_repo_hosts: list[str] = field(default_factory=lambda: ["github.com", "gitlab.com"])
     
     # log settings
-    show_terminal_logs: bool = True  # Show scrolling log boxes in terminal
-    persist_logs: bool = True  # Persist logs for API access
-    log_retention_hours: int = 1  # How long to keep logs in hours
+    show_terminal_logs: bool = True 
+    persist_logs: bool = True
+    log_retention_hours: int = 1
 
 
 @dataclass

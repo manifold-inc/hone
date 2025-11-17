@@ -87,6 +87,9 @@ class Executor:
             f"Executor initialized (mode={self.execution_mode}, "
             f"fallback={self.fallback_enabled})"
         )
+
+    async def start(self):
+        await self.docker_executor.start()
     
     def _init_executors(self):
         """Initialize execution mode handlers."""

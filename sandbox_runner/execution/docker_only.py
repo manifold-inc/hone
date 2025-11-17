@@ -219,7 +219,7 @@ class DockerOnlyExecutor:
     Docker-only container executor    
     """
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, vllm_image="vllm/vllm-openai:latest"):
         """
         Initialize Docker-only executor
         
@@ -228,13 +228,19 @@ class DockerOnlyExecutor:
         """
         self.config = config
         self.show_terminal_logs = config.execution.show_terminal_logs
-        
+        self.vllm_image = vllm_image
         try:
             self.docker_client = docker.from_env()
             logger.info("Docker client initialized (docker-only mode)")
         except DockerException as e:
             logger.error(f"Failed to initialize Docker client: {e}")
             raise DockerExecutionError(f"Docker not available: {e}")
+        
+    async def start(self):
+        # pull latest vllm image
+        await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: self.docker_client.images.pull(self.vllm_image)
+                )
     
     async def run_container(
         self,
@@ -918,7 +924,6 @@ class DockerOnlyExecutor:
             Tuple of (container, container_id)
         """
         container_name = f"vllm-{job.job_id}"
-        vllm_image = "vllm/vllm-openai:latest"
 
         vllm_config = job.vllm_config or {}
         model_name = vllm_config.get("model", "unsloth/Meta-Llama-3.1-8B-Instruct")
@@ -948,14 +953,14 @@ class DockerOnlyExecutor:
         
         try:
             await asyncio.get_event_loop().run_in_executor(
-                None, lambda: self.docker_client.images.get(vllm_image)
+                None, lambda: self.docker_client.images.get(self.vllm_image)
             )
-            logger.info(f"vLLM image already available: {vllm_image}")
+            logger.info(f"vLLM image already available: {self.vllm_image}")
         except ImageNotFound:
-            logger.info(f"Pulling vLLM image: {vllm_image}...")
+            logger.info(f"Pulling vLLM image: {self.vllm_image}...")
             try:
                 await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self.docker_client.images.pull(vllm_image)
+                    None, lambda: self.docker_client.images.pull(self.vllm_image)
                 )
                 logger.info(f"✓ vLLM image pulled successfully")
             except Exception as e:
