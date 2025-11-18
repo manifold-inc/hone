@@ -179,78 +179,6 @@ def color_job_id(text: str, job_id: str) -> str:
     target = f"sandbox-job-{job_id}"
     return text.replace(target, f"{GREEN}{target}{RESET}")
 
-def _log_docker_run_command(
-    container_name: str,
-    image: str,
-    command: list,
-    volumes: dict,
-    environment: dict = None,
-    network: str = None,
-    network_mode: str = None,
-    device_requests: list = None,
-    runtime: str = None,
-    working_dir: str = None,
-    user: str = None,
-    security_opt: list = None,
-    cap_drop: list = None,
-    read_only: bool = False,
-    tmpfs: dict = None
-) -> None:
-    """log equivalent docker run command"""
-    BLUE = "\033[94m"
-    RESET = "\033[0m"
-    
-    docker_cmd = ["docker run"]
-    docker_cmd.append(f"--name {container_name}")
-    
-    if environment:
-        for key, val in environment.items():
-            docker_cmd.append(f"-e {key}={val}")
-    
-    if volumes:
-        for host_path, mount_info in volumes.items():
-            mode = mount_info['mode']
-            docker_cmd.append(f"-v {host_path}:{mount_info['bind']}:{mode}")
-    
-    if working_dir:
-        docker_cmd.append(f"--workdir {working_dir}")
-    
-    if user:
-        docker_cmd.append(f"--user {user}")
-    
-    if network:
-        docker_cmd.append(f"--network {network}")
-    elif network_mode:
-        docker_cmd.append(f"--network {network_mode}")
-    
-    if device_requests and len(device_requests) > 0:
-        device_ids = device_requests[0].device_ids
-        gpu_ids = ','.join([str(i) for i in range(len(device_ids))])
-        docker_cmd.append(f"--gpus '\"device={gpu_ids}\"'")
-    
-    if runtime:
-        docker_cmd.append(f"--runtime {runtime}")
-    
-    if security_opt:
-        for opt in security_opt:
-            docker_cmd.append(f"--security-opt {opt}")
-    
-    if cap_drop:
-        for cap in cap_drop:
-            docker_cmd.append(f"--cap-drop {cap}")
-    
-    if read_only:
-        docker_cmd.append("--read-only")
-    
-    if tmpfs:
-        for path, opts in tmpfs.items():
-            docker_cmd.append(f"--tmpfs {path}:{opts}")
-    
-    docker_cmd.append(image)
-    docker_cmd.extend(command)
-    
-    logger.info(f"{BLUE}Docker run command:\n{' '.join(docker_cmd)}{RESET}")
-
 
 async def _stream_docker_logs(build_generator, display):
     _ = asyncio.get_event_loop()
@@ -474,14 +402,7 @@ class DockerOnlyExecutor:
             'PHASE': phase,
             'JOB_ID': job.job_id,
         }
-        
-        if job.assigned_gpus:
-            env_vars['CUDA_VISIBLE_DEVICES'] = ','.join(
-                str(gpu) for gpu in job.assigned_gpus
-            )
-        else:
-            env_vars['CUDA_VISIBLE_DEVICES'] = ''
-        
+                
         env_vars.update(job.custom_env_vars or {})
         
         command = [
@@ -550,32 +471,12 @@ class DockerOnlyExecutor:
         
         # this causes issues with docker / hf parallel download - need to adjust dynamically
         #config['pids_limit'] = self.config.execution.max_processes
-        """
         if self.config.security.readonly_rootfs:
             config['read_only'] = True
             config['tmpfs'] = {
                 '/tmp': 'rw,noexec,nosuid,size=1g',
                 '/var/tmp': 'rw,noexec,nosuid,size=1g'
             }
-        """
-        _log_docker_run_command(
-            container_name=container_name,
-            image=image_id,
-            command=command,
-            volumes=volumes,
-            environment=env_vars,
-            network=network_name if network_name else None,
-            network_mode=network_mode if not network_name else None,
-            device_requests=config.get('device_requests'),
-            runtime=config.get('runtime'),
-            working_dir='/app',
-            user='root',
-            security_opt=security_opt,
-            cap_drop=cap_drop,
-            read_only=config.get('read_only', False),
-            tmpfs=config.get('tmpfs')
-        )
-        
         return config
     
     async def _wait_for_container(
@@ -1071,21 +972,7 @@ class DockerOnlyExecutor:
                 )
             ]
             config['runtime'] = 'nvidia'
-            config['environment'] = {
-                'CUDA_VISIBLE_DEVICES': ','.join(str(gpu) for gpu in job.assigned_gpus)
-            }
-        
-        _log_docker_run_command(
-            container_name=container_name,
-            image=self.vllm_image,
-            command=command,
-            volumes=config['volumes'],
-            environment=config.get('environment'),
-            network=network_name,
-            device_requests=config.get('device_requests'),
-            runtime=config.get('runtime')
-        )
-        
+                
         try:
             container = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.containers.create(**config)
