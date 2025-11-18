@@ -4,9 +4,10 @@ Enhanced Log Streaming Dashboard using Gradio
 Features:
 - Auto-fetches active jobs from /v1/status endpoint
 - Real-time log streaming with /v1/logs/{job_id}/tail
+- Interactive gauges and visualizations
+- Performance optimized with caching
 - Multi-job log viewing
-- Job ID filtering
-- Phase filtering and auto-refresh (2s or 5s)
+- Phase filtering and auto-refresh
 - GPU and queue statistics
 """
 
@@ -16,12 +17,16 @@ import json
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import time
+import plotly.graph_objects as go
+from functools import lru_cache
 
+# Configuration
 API_BASE_URL = "http://localhost:8080"
 API_KEY = "dev-key-12345"
 
-log_cursors = {}
-selected_jobs = set()  # Track which jobs user wants to monitor
+# Cache for reducing API calls
+_status_cache = {"data": None, "timestamp": 0}
+_cache_ttl = 1.0  # 1 second cache
 
 
 def get_client():
@@ -29,54 +34,126 @@ def get_client():
     return httpx.Client(
         base_url=API_BASE_URL,
         headers={"X-API-Key": API_KEY},
-        timeout=30.0
+        timeout=10.0
     )
 
 
-def get_runner_status() -> Dict:
-    """Get runner status including active job IDs"""
+def get_runner_status(use_cache: bool = True) -> Dict:
+    """Get runner status including active job IDs with caching"""
+    global _status_cache
+    
+    if use_cache and _status_cache["data"] and (time.time() - _status_cache["timestamp"] < _cache_ttl):
+        return _status_cache["data"]
+    
     try:
         client = get_client()
         response = client.get("/v1/status")
         if response.status_code == 200:
-            return response.json()
+            data = response.json()
+            _status_cache = {"data": data, "timestamp": time.time()}
+            return data
         return {}
     except Exception as e:
         print(f"Error fetching status: {e}")
-        return {}
+        return _status_cache.get("data", {})
 
 
-def get_gpu_allocation_info() -> str:
-    """Get GPU allocation info in formatted text"""
+def create_gpu_gauge(total: int, allocated: int, available: int) -> go.Figure:
+    """Create a gauge chart for GPU utilization"""
+    utilization = (allocated / max(total, 1)) * 100
+    
+    fig = go.Figure(go.Indicator(
+        mode="gauge+number+delta",
+        value=allocated,
+        domain={'x': [0, 1], 'y': [0, 1]},
+        title={'text': f"GPU Allocation<br><sub>{available} available</sub>", 'font': {'size': 16}},
+        delta={'reference': total, 'increasing': {'color': "orange"}},
+        number={'suffix': f" / {total}", 'font': {'size': 24}},
+        gauge={
+            'axis': {'range': [None, total], 'tickwidth': 1, 'tickcolor': "darkgray"},
+            'bar': {'color': "#4299e1"},
+            'bgcolor': "white",
+            'borderwidth': 2,
+            'bordercolor': "gray",
+            'steps': [
+                {'range': [0, total * 0.5], 'color': '#e6f7ff'},
+                {'range': [total * 0.5, total * 0.8], 'color': '#fffbe6'},
+                {'range': [total * 0.8, total], 'color': '#fff1f0'}
+            ],
+            'threshold': {
+                'line': {'color': "red", 'width': 4},
+                'thickness': 0.75,
+                'value': total * 0.9
+            }
+        }
+    ))
+    
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font={'color': "white"},
+        height=220,
+        margin=dict(l=20, r=20, t=60, b=20)
+    )
+    
+    return fig
+
+
+def create_job_stats_chart(active: int, completed: int, failed: int, queued: int) -> go.Figure:
+    """Create bar chart for job statistics"""
+    fig = go.Figure(data=[
+        go.Bar(
+            x=['Active', 'Queued', 'Completed', 'Failed'],
+            y=[active, queued, completed, failed],
+            marker_color=['#4299e1', '#fbbf24', '#10b981', '#ef4444'],
+            text=[active, queued, completed, failed],
+            textposition='auto',
+        )
+    ])
+    
+    fig.update_layout(
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font={'color': "white"},
+        height=220,
+        margin=dict(l=20, r=20, t=40, b=40),
+        title={'text': "Job Statistics", 'font': {'size': 16}},
+        xaxis={'showgrid': False},
+        yaxis={'showgrid': True, 'gridcolor': 'rgba(255,255,255,0.1)'}
+    )
+    
+    return fig
+
+
+def get_queue_info() -> str:
+    """Get queue information in formatted text"""
     try:
         status = get_runner_status()
         
         if not status:
-            return "Failed to fetch GPU status"
+            return "Failed to fetch queue status"
         
-        total_gpus = status.get("total_gpus", 0)
-        available_gpus = status.get("available_gpus", 0)
-        allocated_gpus = status.get("allocated_gpus", 0)
+        queue_depth = status.get("queue_depth", 0)
         
-        utilization = (allocated_gpus / max(total_gpus, 1)) * 100
-        
-        gpu_text = f"""
+        queue_text = f"""
 ╔══════════════════════════════════════════════════════════════╗
-║                     GPU ALLOCATION                           ║
+║                      QUEUE STATUS                            ║
 ╚══════════════════════════════════════════════════════════════╝
 
-🎮 GPU STATUS:
-   • Total GPUs: {total_gpus}
-   • Available: {available_gpus}
-   • Allocated: {allocated_gpus}
-   • Utilization: {utilization:.1f}%
+📊 QUEUE DEPTH: {queue_depth}
 
-⏰ Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
 """
         
-        return gpu_text
+        if queue_depth == 0:
+            queue_text += "   ✓ Queue is empty - all systems ready\n"
+        else:
+            queue_text += f"   ⏳ {queue_depth} job(s) waiting in queue\n"
+        
+        queue_text += f"\n⏰ Last Updated: {datetime.now().strftime('%H:%M:%S')}\n"
+        
+        return queue_text
     except Exception as e:
-        return f"Error fetching GPU info: {str(e)}"
+        return f"Error fetching queue info: {str(e)}"
 
 
 def get_active_jobs_table() -> Tuple[List[List[str]], List[str]]:
@@ -100,11 +177,9 @@ def get_active_jobs_table() -> Tuple[List[List[str]], List[str]]:
                 if response.status_code == 200:
                     job = response.json()
                     
-                    # Format GPU allocation
                     gpus = job.get("assigned_gpus", [])
                     gpu_str = f"GPU {','.join(map(str, gpus))}" if gpus else "N/A"
                     
-                    # Format timestamp
                     started_at = job.get("started_at")
                     if started_at:
                         try:
@@ -115,9 +190,18 @@ def get_active_jobs_table() -> Tuple[List[List[str]], List[str]]:
                     else:
                         time_str = "N/A"
                     
+                    phase = job.get("current_phase", "unknown")
+                    phase_emoji = {
+                        "build": "🔨",
+                        "prep": "📦",
+                        "inference": "🧠",
+                        "vllm": "🚀"
+                    }
+                    phase_display = f"{phase_emoji.get(phase, '📝')} {phase}"
+                    
                     table_data.append([
                         job_id,
-                        job.get("current_phase", "unknown"),
+                        phase_display,
                         f"{job.get('progress_percentage', 0):.1f}%",
                         job.get("weight_class", "unknown"),
                         gpu_str,
@@ -126,12 +210,12 @@ def get_active_jobs_table() -> Tuple[List[List[str]], List[str]]:
                     ])
                 else:
                     table_data.append([
-                        job_id, "unknown", "0%", "unknown", "N/A", "N/A", "error"
+                        job_id, "❌ error", "0%", "unknown", "N/A", "N/A", "error"
                     ])
             except Exception as e:
                 print(f"Error fetching job {job_id}: {e}")
                 table_data.append([
-                    job_id, "error", "0%", "unknown", "N/A", "N/A", "error"
+                    job_id, "❌ error", "0%", "unknown", "N/A", "N/A", "error"
                 ])
         
         return table_data, active_job_ids
@@ -174,7 +258,6 @@ def get_job_logs_tail(job_id: str, lines: int = 100, phase_filter: str = "all") 
                 except:
                     timestamp_str = timestamp[:8] if len(timestamp) >= 8 else "??:??:??"
                 
-                # Color coding
                 phase_emoji = {
                     "build": "🔨",
                     "prep": "📦",
@@ -206,7 +289,7 @@ def get_job_logs_tail(job_id: str, lines: int = 100, phase_filter: str = "all") 
 def get_all_active_logs(selected_job_ids: List[str], phase_filter: str = "all") -> str:
     """Get logs for all selected jobs"""
     if not selected_job_ids:
-        return "No active jobs selected. Click 'Refresh Jobs' to load active jobs."
+        return "No active jobs selected. Click 'Refresh' to load active jobs."
     
     all_logs = []
     all_logs.append("=" * 100)
@@ -227,65 +310,85 @@ def get_all_active_logs(selected_job_ids: List[str], phase_filter: str = "all") 
     return "\n".join(all_logs)
 
 
-def get_runner_stats() -> str:
-    """Get runner statistics in formatted text"""
+def get_runner_info() -> str:
+    """Get runner info in formatted text"""
     try:
         status = get_runner_status()
         
         if not status:
             return "Failed to fetch runner status"
         
-        stats_text = f"""
+        total_submitted = status.get('total_submitted', 0)
+        total_completed = status.get('total_completed', 0)
+        success_rate = (total_completed / max(total_submitted, 1)) * 100
+        
+        info_text = f"""
 ╔══════════════════════════════════════════════════════════════╗
-║                  SANDBOX RUNNER STATUS                       ║
+║                    RUNNER INFO                               ║
 ╚══════════════════════════════════════════════════════════════╝
 
-🖥️  RUNNER INFO:
+🖥️  RUNNER:
    • ID: {status.get('runner_id', 'unknown')}
-   • Status: {status.get('status', 'unknown')}
-   • Execution Mode: {status.get('execution_mode', 'unknown')}
+   • Status: {status.get('status', 'unknown').upper()}
+   • Mode: {status.get('execution_mode', 'unknown')}
 
-📊 JOB STATISTICS:
-   • Active Jobs: {status.get('active_jobs', 0)}
-   • Queue Depth: {status.get('queue_depth', 0)}
-   • Total Submitted: {status.get('total_submitted', 0)}
-   • Total Completed: {status.get('total_completed', 0)}
+📈 PERFORMANCE:
+   • Success Rate: {success_rate:.1f}%
+   • Total Completed: {total_completed}
    • Total Failed: {status.get('total_failed', 0)}
-   • Success Rate: {status.get('total_completed', 0) / max(status.get('total_submitted', 1), 1) * 100:.1f}%
 
-⏰ Last Updated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+⏰ Updated: {datetime.now().strftime('%H:%M:%S')}
 """
         
-        return stats_text
+        return info_text
     except Exception as e:
-        return f"Error fetching stats: {str(e)}"
+        return f"Error fetching runner info: {str(e)}"
 
 
 def select_job_from_table(evt: gr.SelectData, table_data):
     """Handle job selection from table"""
-    if evt.index[0] < len(table_data):
-        job_id = table_data[evt.index[0]][0]
-        return job_id, True, 2  # return job_id, enable auto-refresh, set to 2s
-    return "", False, 5
+    try:
+        if hasattr(table_data, 'iloc'):
+            job_id = str(table_data.iloc[evt.index[0], 0])
+        elif isinstance(table_data, list) and evt.index[0] < len(table_data):
+            job_id = table_data[evt.index[0]][0]
+        else:
+            return "", False, 2
+        
+        return job_id, True, 2
+    except Exception as e:
+        print(f"Error selecting job: {e}")
+        return "", False, 2
 
 
 def refresh_all(phase_filter: str, job_id_filter: str = ""):
-    """Refresh jobs table and logs"""
+    """Refresh all dashboard data"""
+    status = get_runner_status(use_cache=False)
+    
     table_data, active_job_ids = get_active_jobs_table()
     
-    # Filter logs by job_id if specified
     if job_id_filter and job_id_filter.strip():
         logs = get_all_active_logs([job_id_filter.strip()], phase_filter)
     else:
         logs = get_all_active_logs(active_job_ids, phase_filter)
     
-    stats = get_runner_stats()
-    gpu_info = get_gpu_allocation_info()
+    gpu_gauge = create_gpu_gauge(
+        status.get("total_gpus", 0),
+        status.get("allocated_gpus", 0),
+        status.get("available_gpus", 0)
+    )
     
-    # Format job IDs for display
-    job_ids_text = "\n".join(active_job_ids) if active_job_ids else "No active jobs"
+    job_chart = create_job_stats_chart(
+        status.get("active_jobs", 0),
+        status.get("total_completed", 0),
+        status.get("total_failed", 0),
+        status.get("queue_depth", 0)
+    )
     
-    return table_data, logs, stats, gpu_info, job_ids_text
+    runner_info = get_runner_info()
+    queue_info = get_queue_info()
+    
+    return table_data, logs, gpu_gauge, job_chart, runner_info, queue_info
 
 
 def clear_job_filter():
@@ -295,13 +398,31 @@ def clear_job_filter():
 
 # Create Gradio interface
 with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
-    gr.Markdown("# 🚀 Sandbox Runner Dashboard")
-    gr.Markdown("Real-time monitoring for GPU job execution")
+    gr.HTML("""
+        <div style="text-align: center; padding: 20px 0;">
+            <h1 style="font-size: 2.5em; margin: 0; background: linear-gradient(90deg, #4299e1 0%, #667eea 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent;">
+                🚀 Sandbox Runner Dashboard
+            </h1>
+            <p style="color: #718096; margin-top: 10px; font-size: 1.1em;">Real-time GPU job monitoring & analytics</p>
+        </div>
+    """)
     
     with gr.Row():
-        # Left column - Active Jobs
-        with gr.Column(scale=2):
-            gr.Markdown("### 📋 Active Jobs")
+        # Left column - Jobs & Logs
+        with gr.Column(scale=3):
+            with gr.Row():
+                with gr.Column(scale=3):
+                    gr.Markdown("### 📋 Active Jobs")
+                with gr.Column(scale=2):
+                    with gr.Row():
+                        refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
+                        auto_refresh = gr.Checkbox(label="Auto", value=False)
+                        refresh_interval = gr.Radio(
+                            label="",
+                            choices=[2, 5],
+                            value=5,
+                            show_label=False
+                        )
             
             jobs_table = gr.Dataframe(
                 headers=[
@@ -316,103 +437,91 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
                 value=[],
                 interactive=False,
                 wrap=True,
-                column_widths=["22%", "14%", "10%", "12%", "10%", "10%", "22%"]
+                column_widths=["22%", "14%", "10%", "12%", "10%", "10%", "22%"],
+                height=250
             )
             
-            with gr.Row():
-                refresh_btn = gr.Button("🔄 Refresh All", variant="primary", scale=2)
-                auto_refresh = gr.Checkbox(label="Auto-refresh", value=False, scale=1)
-                refresh_interval = gr.Radio(
-                    label="Interval",
-                    choices=[2, 5],
-                    value=5,
-                    scale=1
-                )
-        
-        # Right column - Controls & Stats
-        with gr.Column(scale=1):
-            gr.Markdown("### ⚙️ Controls")
-            
+            gr.Markdown("### ⚙️ Filters")
             with gr.Row():
                 job_id_filter = gr.Textbox(
-                    label="Job ID Filter",
-                    placeholder="Enter job ID to filter logs...",
+                    label="Job ID",
+                    placeholder="Click job or enter ID...",
                     scale=3
                 )
-                clear_filter_btn = gr.Button("Clear", scale=1)
+                phase_filter = gr.Dropdown(
+                    label="Phase",
+                    choices=["all", "build", "prep", "inference", "vllm"],
+                    value="all",
+                    scale=2
+                )
+                clear_filter_btn = gr.Button("✕", scale=1, size="sm")
             
-            phase_filter = gr.Dropdown(
-                label="Phase Filter",
-                choices=["all", "build", "prep", "inference", "vllm"],
-                value="all"
-            )
-            
-            gr.Markdown("### 🎮 GPU Allocation")
-            gpu_output = gr.Textbox(
+            gr.Markdown("### 📜 Live Logs")
+            log_output = gr.Textbox(
                 label="",
-                lines=10,
-                max_lines=12,
+                lines=25,
+                max_lines=40,
                 show_label=False,
-                interactive=False
+                show_copy_button=True,
+                interactive=False,
+                container=False
             )
+        
+        # Right column - Stats & Visualizations
+        with gr.Column(scale=2):
+            gr.Markdown("### 📊 System Overview")
             
-            gr.Markdown("### 📊 Runner Stats")
-            stats_output = gr.Textbox(
-                label="",
-                lines=15,
-                max_lines=18,
-                show_label=False,
-                interactive=False
-            )
-    
-    # Job IDs display (hidden, for internal use)
-    active_job_ids_state = gr.Textbox(
-        label="Active Job IDs",
-        visible=True,
-        lines=3,
-        interactive=False
-    )
-    
-    # Log viewer
-    gr.Markdown("### 📜 Live Logs")
-    log_output = gr.Textbox(
-        label="",
-        lines=30,
-        max_lines=50,
-        show_label=False,
-        show_copy_button=True,
-        interactive=False
-    )
+            with gr.Row():
+                gpu_gauge_plot = gr.Plot(label="GPU Allocation")
+            
+            with gr.Row():
+                job_stats_plot = gr.Plot(label="Job Statistics")
+            
+            gr.Markdown("### 📈 Details")
+            
+            with gr.Accordion("🖥️ Runner Info", open=True):
+                runner_info_output = gr.Textbox(
+                    label="",
+                    lines=12,
+                    max_lines=15,
+                    show_label=False,
+                    interactive=False
+                )
+            
+            with gr.Accordion("📊 Queue Status", open=True):
+                queue_info_output = gr.Textbox(
+                    label="",
+                    lines=8,
+                    max_lines=10,
+                    show_label=False,
+                    interactive=False
+                )
     
     # Event handlers
     refresh_btn.click(
-        fn=refresh_all,
+        fn=lambda pf, jf: refresh_all(pf, jf),
         inputs=[phase_filter, job_id_filter],
-        outputs=[jobs_table, log_output, stats_output, gpu_output, active_job_ids_state]
+        outputs=[jobs_table, log_output, gpu_gauge_plot, job_stats_plot, runner_info_output, queue_info_output]
     )
     
-    # Phase filter change
     phase_filter.change(
-        fn=refresh_all,
+        fn=lambda pf, jf: refresh_all(pf, jf),
         inputs=[phase_filter, job_id_filter],
-        outputs=[jobs_table, log_output, stats_output, gpu_output, active_job_ids_state]
+        outputs=[jobs_table, log_output, gpu_gauge_plot, job_stats_plot, runner_info_output, queue_info_output]
     )
     
-    # Job ID filter change
     job_id_filter.change(
-        fn=refresh_all,
+        fn=lambda pf, jf: refresh_all(pf, jf),
         inputs=[phase_filter, job_id_filter],
-        outputs=[jobs_table, log_output, stats_output, gpu_output, active_job_ids_state]
+        outputs=[jobs_table, log_output, gpu_gauge_plot, job_stats_plot, runner_info_output, queue_info_output]
     )
     
-    # Clear filter button
     clear_filter_btn.click(
         fn=clear_job_filter,
         inputs=[],
         outputs=[job_id_filter, auto_refresh, refresh_interval]
     )
     
-    # Job selection from table
     jobs_table.select(
         fn=select_job_from_table,
         inputs=[jobs_table],
@@ -438,34 +547,32 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
     )
     
     timer.tick(
-        fn=refresh_all,
+        fn=lambda pf, jf: refresh_all(pf, jf),
         inputs=[phase_filter, job_id_filter],
-        outputs=[jobs_table, log_output, stats_output, gpu_output, active_job_ids_state]
+        outputs=[jobs_table, log_output, gpu_gauge_plot, job_stats_plot, runner_info_output, queue_info_output]
     )
     
-    # Initial load on app start
+    # Initial load
     app.load(
-        fn=refresh_all,
+        fn=lambda pf, jf: refresh_all(pf, jf),
         inputs=[phase_filter, job_id_filter],
-        outputs=[jobs_table, log_output, stats_output, gpu_output, active_job_ids_state]
+        outputs=[jobs_table, log_output, gpu_gauge_plot, job_stats_plot, runner_info_output, queue_info_output]
     )
     
     # Custom CSS
     app.css = """
     /* Terminal-style log output */
-    .log-output textarea {
-        font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace !important;
-        background-color: #1e1e1e !important;
-        color: #d4d4d4 !important;
-        font-size: 13px !important;
-        line-height: 1.5 !important;
+    textarea {
+        font-family: 'SF Mono', 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace !important;
     }
     
-    /* Stats output styling */
-    .stats-output textarea {
-        font-family: 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace !important;
-        font-size: 12px !important;
-        line-height: 1.4 !important;
+    /* Log output specific */
+    #component-* textarea {
+        background-color: #1a1d23 !important;
+        color: #e2e8f0 !important;
+        font-size: 13px !important;
+        line-height: 1.6 !important;
+        border: 1px solid #2d3748 !important;
     }
     
     /* Table styling */
@@ -480,27 +587,56 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
     }
     
     .dataframe th {
-        background: linear-gradient(180deg, #2a2d3a 0%, #1f2229 100%) !important;
+        background: linear-gradient(180deg, #4299e1 0%, #3182ce 100%) !important;
         color: #ffffff !important;
         font-weight: 600 !important;
         padding: 12px 8px !important;
         text-align: left !important;
-        border-bottom: 2px solid #4a5568 !important;
+        border: none !important;
     }
     
     .dataframe td {
         padding: 10px 8px !important;
-        border-bottom: 1px solid #2d3748 !important;
+        border-bottom: 1px solid #e2e8f0 !important;
     }
     
-    .dataframe tr:hover {
+    .dataframe tbody tr:hover {
         background-color: rgba(66, 153, 225, 0.1) !important;
         cursor: pointer !important;
+        transition: background-color 0.2s ease !important;
+    }
+    
+    /* Button styling */
+    .gr-button-primary {
+        background: linear-gradient(90deg, #4299e1 0%, #667eea 100%) !important;
+        border: none !important;
+    }
+    
+    .gr-button-primary:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 4px 12px rgba(66, 153, 225, 0.4) !important;
+    }
+    
+    /* Accordion styling */
+    .gr-accordion {
+        border: 1px solid #e2e8f0 !important;
+        border-radius: 8px !important;
+    }
+    
+    /* Plotly charts */
+    .plotly {
+        border-radius: 8px !important;
+        border: 1px solid #e2e8f0 !important;
     }
     
     /* Compact spacing */
     .gr-box {
-        padding: 0.5rem !important;
+        padding: 0.75rem !important;
+    }
+    
+    /* Info boxes */
+    .gr-form {
+        border: none !important;
     }
     """
 
