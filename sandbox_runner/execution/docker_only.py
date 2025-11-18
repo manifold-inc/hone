@@ -225,7 +225,7 @@ def _log_docker_run_command(
     
     if device_requests and len(device_requests) > 0:
         device_ids = device_requests[0].device_ids
-        gpu_ids = ','.join([i for i in range(len(device_ids))])
+        gpu_ids = ','.join([str(i) for i in range(len(device_ids))])
         docker_cmd.append(f"--gpus '\"device={gpu_ids}\"'")
     
     if runtime:
