@@ -1,410 +1,326 @@
 import asyncio
 import aiohttp
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional
 from datetime import datetime, timezone
 from loguru import logger
-import json
 
-from common.epistula import Epistula
-from common.constants import QUERY_ENDPOINT, CHECK_TASK_ENDPOINT, MAX_POLL_ATTEMPTS, POLL_INTERVAL 
+from validator.sandbox_client import SandboxRunnerClient
 from validator.telemetry import TelemetryClient
 
-def calculate_grid_similarity(grid1: List[List[int]], grid2: List[List[int]]) -> float:
-    """Calculate pixel-wise similarity between two grids"""
-    if not grid1 or not grid2:
-        return 0.0
-    
-    # size mismatch
-    if len(grid1) != len(grid2) or (grid1 and len(grid1[0]) != len(grid2[0])):
-        return 0.0
-    
-    total_cells = len(grid1) * len(grid1[0])
-    if total_cells == 0:
-        return 0.0
-    
-    matching_cells = sum(
-        1 for i in range(len(grid1))
-        for j in range(len(grid1[0]))
-        if grid1[i][j] == grid2[i][j]
-    )
-    
-    return matching_cells / total_cells
 
-def calculate_partial_correctness(predicted: List[List[int]], expected: List[List[int]]) -> float:
+async def fetch_miner_info(
+    session: aiohttp.ClientSession,
+    uid: int,
+    miner: Dict,
+    default_port: int,
+    timeout: int
+) -> Optional[Dict]:
     """
-    Calculate partial correctness score considering:
-    - Shape matching
-    - Color distribution
-    - Pattern similarity
-    """
-    if not predicted or not expected:
-        return 0.0
+    Fetch miner info from /info endpoint
     
-    score = 0.0
-    weights = {'shape': 0.3, 'grid': 0.5, 'colors': 0.2}
-    
-    # shape score
-    shape_match = (len(predicted) == len(expected) and 
-                   len(predicted[0]) == len(expected[0]) if predicted else False)
-    score += weights['shape'] if shape_match else 0
-    
-    # grid similarity
-    if shape_match:
-        score += weights['grid'] * calculate_grid_similarity(predicted, expected)
-    
-    # color distribution similarity
-    pred_colors = set()
-    exp_colors = set()
-    for row in predicted:
-        pred_colors.update(row)
-    for row in expected:
-        exp_colors.update(row)
-    
-    if exp_colors:
-        color_overlap = len(pred_colors & exp_colors) / len(exp_colors)
-        score += weights['colors'] * color_overlap
-    
-    return min(1.0, score)
-
-def calculate_efficiency_score(response_time: float, max_time: float = 30.0) -> float:
-    """Calculate efficiency score based on response time"""
-    if response_time >= max_time:
-        return 0.0
-    return 1.0 - (response_time / max_time)
-
-def _deep_validate_data(data: Any, path: str = "root") -> Tuple[bool, str]:
-    """Deep validation of data structure for serialization"""
-    try:
-        serialized = json.dumps(data)
-        deserialized = json.loads(serialized)        
-        if isinstance(data, dict) and 'train_examples' in data:
-            original_len = len(data['train_examples'])
-            deserialized_len = len(deserialized['train_examples'])
-            if original_len != deserialized_len:
-                return False, f"train_examples length mismatch: {original_len} -> {deserialized_len}"
-            
-            for i, (orig_ex, deser_ex) in enumerate(zip(data['train_examples'], deserialized['train_examples'])):
-                if 'input' not in deser_ex or 'output' not in deser_ex:
-                    return False, f"Example {i} missing input/output after serialization"
-        
-        return True, "OK"
-    except Exception as e:
-        return False, f"Serialization error: {e}"
-
-async def _submit_task_to_miner(
-    session: aiohttp.ClientSession,
-    chain,
-    config,
-    uid: int,
-    miner: Dict,
-    problem_data: Dict
-) -> Optional[str]:
-    """Submit a task to a miner and get back a task ID"""
-    ip = miner.get("ip")
-    port = miner.get("port") or config.default_miner_port
-    url = f"http://{ip}:{port}{QUERY_ENDPOINT}"
-    
-    query_data = {
-        "problem_id": problem_data['id'],
-        "train_examples": problem_data['problem_set']['train_examples'],
-        "test_input": problem_data['problem_set']['test_input'],
-        "num_train": problem_data['num_train_examples']
-    }
-
-        
-    is_valid, msg = _deep_validate_data(query_data, "query_data")
-    if not is_valid:
-        logger.error(f"⚠️  Data validation failed for UID {uid}: {msg}")
-        return None
-    
-    body, headers = Epistula.create_request(
-        keypair=chain.keypair,
-        receiver_hotkey=miner.get("hotkey"),
-        data=query_data,
-        version=1
-    )
-        
-    try:
-        async with session.post(url, json=body, headers=headers, timeout=5) as resp:
-            if resp.status != 200:
-                response_text = await resp.text()
-                return None
-            
-            response_text = await resp.text()
-            response_json = json.loads(response_text)
-            task_id = response_json.get('data', {}).get('task_id')
-            
-            if not task_id:
-                logger.error(f"No task_id in response from UID {uid}")
-                logger.debug(f"Full response: {response_json}")
-                return None
-            
-            logger.debug(f"UID {uid} accepted task with ID: {task_id}")
-            return task_id
-            
-    except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError) as e:
-        return None
-
-async def _poll_task_result(
-    session: aiohttp.ClientSession,
-    chain,
-    config,
-    uid: int,
-    miner: Dict,
-    task_id: str,
-    problem_data: Dict,
-    max_attempts: int = MAX_POLL_ATTEMPTS,
-    poll_interval: float = POLL_INTERVAL
-) -> Dict:
-    """Poll for task result from miner"""
-    ip = miner.get("ip")
-    port = miner.get("port") or config.default_miner_port
-    url = f"http://{ip}:{port}{CHECK_TASK_ENDPOINT}/{task_id}"
-    
-    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
-    
-    for attempt in range(max_attempts):
-        try:
-            check_data = {"task_id": task_id}
-            body, headers = Epistula.create_request(
-                keypair=chain.keypair,
-                receiver_hotkey=miner.get("hotkey"),
-                data=check_data,
-                version=1
-            )
-            body_json = json.dumps(body, sort_keys=True)
-
-            async with session.get(url, data=body_json, headers=headers, timeout=5) as resp:
-                if resp.status != 200:
-                    await asyncio.sleep(poll_interval)
-                    continue
-                
-                response_text = await resp.text()
-                response_json = json.loads(response_text)
-                task_data = response_json.get('data', {})
-                
-                status = task_data.get('status')
-                
-                if status == 'completed':
-                    dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
-                    predicted_output = task_data.get('result', {}).get('output')
-                    
-                    if not predicted_output or not isinstance(predicted_output, list):
-                        logger.error(f"Invalid output format from UID {uid}")
-                        return {
-                            "uid": uid,
-                            "problem_id": problem_data['id'],
-                            "success": False,
-                            "response": None,
-                            "error": "Invalid output format",
-                            "rt": dt,
-                            "metrics": {
-                                "exact_match": False,
-                                "partial_correctness": 0.0,
-                                "grid_similarity": 0.0,
-                                "efficiency_score": 0.0
-                            },
-                            "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
-                            "chain_length": problem_data.get('metadata', {}).get('chain_length'),
-                            "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
-                            "num_train_examples": problem_data.get('num_train_examples')
-                        }
-                    
-                    expected_output = problem_data['problem_set']['test_output']
-                    exact_match = predicted_output == expected_output
-                    partial_correctness = calculate_partial_correctness(predicted_output, expected_output)
-                    grid_similarity = calculate_grid_similarity(predicted_output, expected_output)
-                    efficiency_score = calculate_efficiency_score(dt)
-                    
-                    logger.info(f"UID {uid} | Problem {problem_data['id']} | Task {task_id} | "
-                              f"Exact: {exact_match} | Partial: {partial_correctness:.2f} | "
-                              f"Similarity: {grid_similarity:.2f} | Time: {dt:.2f}s")
-                    
-                    return {
-                        "uid": uid,
-                        "problem_id": problem_data['id'],
-                        "success": True,
-                        "response": task_data.get('result', {}),
-                        "error": None,
-                        "rt": dt,
-                        "metrics": {
-                            "exact_match": exact_match,
-                            "partial_correctness": partial_correctness,
-                            "grid_similarity": grid_similarity,
-                            "efficiency_score": efficiency_score
-                        },
-                        "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
-                        "chain_length": problem_data.get('metadata', {}).get('chain_length'),
-                        "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
-                        "num_train_examples": problem_data.get('num_train_examples')
-                    }
-                
-                elif status == 'failed':
-                    dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
-                    error_msg = task_data.get('error', 'Unknown error')
-                    logger.error(f"Task {task_id} failed for UID {uid}: {error_msg}")
-                    return {
-                        "uid": uid,
-                        "problem_id": problem_data['id'],
-                        "success": False,
-                        "response": None,
-                        "error": error_msg,
-                        "rt": dt,
-                        "metrics": {
-                            "exact_match": False,
-                            "partial_correctness": 0.0,
-                            "grid_similarity": 0.0,
-                            "efficiency_score": 0.0
-                        },
-                        "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
-                        "chain_length": problem_data.get('metadata', {}).get('chain_length'),
-                        "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
-                        "num_train_examples": problem_data.get('num_train_examples')
-                    }
-                
-                elif status in ['pending', 'processing']:
-                    await asyncio.sleep(poll_interval)
-                    continue
-                
-                else:
-                    logger.warning(f"Unknown status '{status}' for task {task_id} from UID {uid}")
-                    await asyncio.sleep(poll_interval)
-                    continue
-                    
-        except (asyncio.TimeoutError, aiohttp.ClientError, json.JSONDecodeError) as e:
-            logger.error(f"Error checking task {task_id} for UID {uid}: {e}")
-            await asyncio.sleep(poll_interval)
-            continue
-    
-    dt = (datetime.now(timezone.utc).replace(tzinfo=None) - t0).total_seconds()
-    logger.error(f"Timeout waiting for task {task_id} from UID {uid} after {max_attempts} attempts")
-    return {
-        "uid": uid,
-        "problem_id": problem_data['id'],
-        "success": False,
-        "response": None,
-        "error": "Timeout waiting for result",
-        "rt": dt,
-        "metrics": {
-            "exact_match": False,
-            "partial_correctness": 0.0,
-            "grid_similarity": 0.0,
-            "efficiency_score": 0.0
-        },
-        "base_task_num": problem_data.get('metadata', {}).get('base_task_num'),
-        "chain_length": problem_data.get('metadata', {}).get('chain_length'),
-        "transformation_chain": problem_data.get('metadata', {}).get('transformation_chain'),
-        "num_train_examples": problem_data.get('num_train_examples')
-    }
-
-async def _query_one_with_problem(
-    session: aiohttp.ClientSession,
-    chain,
-    config,
-    uid: int,
-    miner: Dict,
-    problem_data: Dict
-) -> Dict:
-    """Query a single miner with an ARC problem using task-based approach"""
-    
-    task_id = await _submit_task_to_miner(session, chain, config, uid, miner, problem_data)
-    
-    if not task_id:
-        return {
-            "uid": uid,
-            "problem_id": problem_data['id'],
-            "success": False,
-            "response": None,
-            "error": "Failed to submit task",
-            "rt": 0.0,
-            "metrics": {
-                "exact_match": False,
-                "partial_correctness": 0.0,
-                "grid_similarity": 0.0,
-                "efficiency_score": 0.0
-            }
+    Returns:
+        {
+            "repo_url": str,
+            "repo_branch": str,
+            "repo_commit": str (optional),
+            "repo_path": str,
+            "weight_class": str,
+            "use_vllm": bool,
+            "vllm_config": dict (optional),
+            "custom_env_vars": dict,
+            "version": str,
+            "hotkey": str
         }
+    """
+    ip = miner.get("ip")
+    port = miner.get("port") or default_port
+    url = f"http://{ip}:{port}/info"
     
-    result = await _poll_task_result(
-        session, chain, config, uid, miner, task_id, problem_data,
-        max_attempts=18,
-        poll_interval=10
-    )
-    
-    return result
+    try:
+        async with session.get(url, timeout=timeout) as resp:
+            if resp.status != 200:
+                logger.warning(f"UID {uid}: /info returned {resp.status}")
+                return None
+            
+            info = await resp.json()
+            
+            # validate required fields
+            if not info.get("repo_url"):
+                logger.error(f"UID {uid}: Missing repo_url in /info response")
+                return None
+            
+            if not info.get("weight_class"):
+                logger.warning(f"UID {uid}: Missing weight_class, defaulting to 1xH200")
+                info["weight_class"] = "1xH200"
+            
+            logger.debug(f"UID {uid}: Fetched info - repo: {info.get('repo_url')}, weight: {info.get('weight_class')}")
+            return info
+            
+    except asyncio.TimeoutError:
+        logger.warning(f"UID {uid}: Timeout fetching /info")
+        return None
+    except aiohttp.ClientError as e:
+        logger.warning(f"UID {uid}: Network error fetching /info: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"UID {uid}: Unexpected error fetching /info: {e}")
+        return None
 
-async def query_miners_with_problems(
+
+async def query_miners_via_sandbox(
     chain,
     db,
     config,
     miners: Dict[int, Dict],
-    problems_batch: List[Dict],
     current_block: int,
     telemetry_client: TelemetryClient
-) -> Dict[int, List[Dict]]:
-    """Query all miners with multiple problems using task-based approach"""
-    results: Dict[int, List[Dict]] = {uid: [] for uid in miners.keys()}
-    timeout = aiohttp.ClientTimeout(total=60)
+) -> Dict[int, Dict]:
+    """
+    Query miners by submitting jobs to sandbox runner
+    
+    Flow:
+    1. Fetch /info from each miner to get repo URL and requirements
+    2. Submit job to sandbox runner for each miner
+    3. Poll sandbox runner for job completion (up to 3 hours)
+    4. Retrieve metrics from completed jobs
+    5. Save results to database
+    
+    Args:
+        chain: Chain interface
+        db: Database
+        config: Validator config
+        miners: Dict of {uid: miner_info}
+        current_block: Current block number
+        telemetry_client: Telemetry client
+    
+    Returns:
+        Dict of {uid: result_dict}
+    """
+    
+    sandbox_client = SandboxRunnerClient(
+        endpoint=config.sandbox_runner_endpoint,
+        api_key=config.sandbox_runner_api_key
+    )
+    
+    # step 1: fetch miner info concurrently
+    logger.info(f"Fetching /info from {len(miners)} miners...")
+    
+    miner_infos = {}
+    timeout = aiohttp.ClientTimeout(total=config.miner_info_timeout_seconds)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        tasks = []
-        for problem_data in problems_batch:
-            for uid, miner in miners.items():
-                tasks.append(_query_one_with_problem(
-                    session, chain, config, uid, miner, problem_data
-                ))
+        tasks = [
+            fetch_miner_info(session, uid, miner, config.default_miner_port, config.miner_info_timeout_seconds)
+            for uid, miner in miners.items()
+        ]
         
-        for fut in asyncio.as_completed(tasks):
-            res = await fut
-            uid = res["uid"]
-            results[uid].append(res)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for uid, result in zip(miners.keys(), results):
+            if isinstance(result, Exception):
+                logger.error(f"UID {uid}: Exception fetching info: {result}")
+            elif result:
+                miner_infos[uid] = result
+    
+    logger.info(f"Successfully fetched info from {len(miner_infos)}/{len(miners)} miners")
+    
+    # step 2: submit jobs to sandbox runner
+    job_submissions = {}
+    
+    for uid, info in miner_infos.items():
+        try:
+            miner = miners[uid]
+            
+            logger.info(f"UID {uid}: Submitting job to sandbox runner")
+            logger.debug(f"  Repo: {info['repo_url']}")
+            logger.debug(f"  Branch: {info.get('repo_branch', 'main')}")
+            logger.debug(f"  Weight: {info['weight_class']}")
+            
+            response = await sandbox_client.submit_job(
+                repo_url=info["repo_url"],
+                repo_branch=info.get("repo_branch", "main"),
+                repo_commit=info.get("repo_commit"),
+                repo_path=info.get("repo_path", ""),
+                weight_class=info["weight_class"],
+                miner_hotkey=miner.get("hotkey"),
+                validator_hotkey=config.hotkey,
+                priority=5,
+                use_vllm=info.get("use_vllm", False),
+                vllm_config=info.get("vllm_config"),
+                custom_env_vars=info.get("custom_env_vars", {})
+            )
+            
+            job_id = response.get("job_id")
+            queue_position = response.get("queue_position")
+            
+            job_submissions[uid] = {
+                "job_id": job_id,
+                "miner": miner,
+                "info": info,
+                "submitted_at": datetime.now(timezone.utc)
+            }
+            
+            logger.info(f"UID {uid}: Job {job_id} submitted (queue position: {queue_position})")
+            
+        except Exception as e:
+            logger.error(f"UID {uid}: Failed to submit job to sandbox: {e}")
+            
+            # record submission failure
+            await db.record_query_result(
+                block=current_block,
+                uid=uid,
+                success=False,
+                response=None,
+                error=f"Sandbox job submission failed: {e}",
+                response_time=0.0,
+                ts=datetime.now(timezone.utc).replace(tzinfo=None),
+                exact_match=False,
+                partial_correctness=0.0,
+                grid_similarity=0.0,
+                efficiency_score=0.0,
+                problem_id=None
+            )
+    
+    if not job_submissions:
+        logger.warning("No jobs were successfully submitted to sandbox runner")
+        return {}
+    
+    logger.info(f"Submitted {len(job_submissions)} jobs to sandbox runner")
+    
+    # step 3: poll all jobs until completion
+    results = {}
+    
+    async def poll_and_record(uid: int, job_info: Dict):
+        """Poll a single job and record results to database"""
+        job_id = job_info["job_id"]
+        miner = job_info["miner"]
+        
+        start_time = datetime.now(timezone.utc)
+        
+        def on_status_change(job_id, status, full_status):
+            """Log status changes"""
+            progress = full_status.get("progress_percentage", 0)
+            phase = full_status.get("current_phase", "unknown")
+            logger.info(f"UID {uid} | Job {job_id} | {status} | {phase} | {progress:.1f}%")
+        
+        # poll until complete with 3h timeout
+        final_status = await sandbox_client.poll_until_complete(
+            job_id=job_id,
+            poll_interval=config.sandbox_poll_interval_seconds,
+            max_attempts=config.sandbox_max_poll_attempts,
+            on_status_change=on_status_change
+        )
+        
+        end_time = datetime.now(timezone.utc)
+        execution_time = (end_time - start_time).total_seconds()
+        
+        # step 4: get metrics if job completed successfully
+        metrics_data = None
+        if final_status.get("status") == "completed":
+            metrics_data = await sandbox_client.get_job_metrics(job_id)
+        
+        # step 5: record to database
+        if metrics_data and metrics_data.get("metrics"):
+            metrics = metrics_data["metrics"]
             
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
-                success=res["success"],
-                response=res["response"],
-                error=res["error"],
-                response_time=res["rt"],
+                success=True,
+                response={"job_id": job_id, "sandbox_status": "completed"},
+                error=None,
+                response_time=execution_time,
                 ts=datetime.now(timezone.utc).replace(tzinfo=None),
-                exact_match=res["metrics"]["exact_match"],
-                partial_correctness=res["metrics"]["partial_correctness"],
-                grid_similarity=res["metrics"]["grid_similarity"],
-                efficiency_score=res["metrics"]["efficiency_score"],
-                problem_id=res["problem_id"],
-                base_task_num=res.get("base_task_num"),
-                chain_length=res.get("chain_length"),
-                transformation_chain=res.get("transformation_chain"),
-                num_train_examples=res.get("num_train_examples")
+                exact_match=metrics.get("exact_match", False),
+                partial_correctness=metrics.get("partial_correctness", 0.0),
+                grid_similarity=metrics.get("grid_similarity", 0.0),
+                efficiency_score=metrics.get("efficiency_score", 0.0),
+                problem_id=metrics.get("problem_id"),
+                base_task_num=metrics.get("base_task_num"),
+                chain_length=metrics.get("chain_length"),
+                transformation_chain=metrics.get("transformation_chain"),
+                num_train_examples=metrics.get("num_train_examples")
             )
+            
+            logger.info(
+                f"UID {uid} | Job {job_id} completed | "
+                f"Exact: {metrics.get('exact_match')} | "
+                f"Partial: {metrics.get('partial_correctness', 0):.2f} | "
+                f"Similarity: {metrics.get('grid_similarity', 0):.2f} | "
+                f"Time: {execution_time:.1f}s"
+            )
+            
+            results[uid] = {
+                "uid": uid,
+                "success": True,
+                "metrics": metrics,
+                "execution_time": execution_time,
+                "job_id": job_id
+            }
+            
+            # publish to telemetry
             try:
-                if res["success"]:
-                    telemetry_client.publish(
-                        "/validator/ingest_miner_metrics",
-                        {
-                            "ts": datetime.now(timezone.utc).isoformat(),
-                            "block": current_block,
-                            "uid": uid,
-                            "problem_id": res["problem_id"],
-                            "success": res["success"],
-                            "response_time": res["rt"],
-                            "metrics": {
-                                "exact_match": res["metrics"]["exact_match"],
-                                "partial_correctness": res["metrics"]["partial_correctness"],
-                                "grid_similarity": res["metrics"]["grid_similarity"],
-                                "efficiency_score": res["metrics"]["efficiency_score"],
-                            },
-                        },
-                    )
+                telemetry_client.publish(
+                    "/validator/sandbox_job_completed",
+                    {
+                        "ts": datetime.now(timezone.utc).isoformat(),
+                        "block": current_block,
+                        "uid": uid,
+                        "job_id": job_id,
+                        "execution_time": execution_time,
+                        "metrics": {
+                            "exact_match": metrics.get("exact_match"),
+                            "partial_correctness": metrics.get("partial_correctness"),
+                            "grid_similarity": metrics.get("grid_similarity"),
+                            "efficiency_score": metrics.get("efficiency_score"),
+                        }
+                    }
+                )
             except Exception as e:
-                logger.warning("Couldn't send query data & results to the dashboard API - error : {e}")
-
+                logger.warning(f"Failed to publish telemetry: {e}")
+            
+        else:
+            # job failed or timed out
+            error_msg = final_status.get("error_message", f"Job status: {final_status.get('status')}")
+            
+            await db.record_query_result(
+                block=current_block,
+                uid=uid,
+                success=False,
+                response=None,
+                error=error_msg,
+                response_time=execution_time,
+                ts=datetime.now(timezone.utc).replace(tzinfo=None),
+                exact_match=False,
+                partial_correctness=0.0,
+                grid_similarity=0.0,
+                efficiency_score=0.0,
+                problem_id=None
+            )
+            
+            logger.error(f"UID {uid} | Job {job_id} failed: {error_msg}")
+            
+            results[uid] = {
+                "uid": uid,
+                "success": False,
+                "error": error_msg,
+                "job_id": job_id
+            }
     
-    total_queries = sum(len(r) for r in results.values())
-    successful = sum(1 for uid_results in results.values() for r in uid_results if r["success"])
-    exact_matches = sum(1 for uid_results in results.values() for r in uid_results if r["metrics"]["exact_match"])
+    # poll all jobs concurrently
+    logger.info(f"Polling {len(job_submissions)} jobs (timeout: {config.sandbox_runner_timeout_hours}h)...")
     
-    logger.info(f"Queried {len(miners)} miners with {len(problems_batch)} problems")
-    logger.info(f"Total: {total_queries} | Success: {successful} | Exact: {exact_matches}")
+    tasks = [
+        poll_and_record(uid, job_info)
+        for uid, job_info in job_submissions.items()
+    ]
+    
+    await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # log summary
+    successful = sum(1 for r in results.values() if r.get("success"))
+    failed = len(results) - successful
+    
+    logger.info(f"Sandbox runner cycle complete: {successful} successful, {failed} failed")
     
     return results
