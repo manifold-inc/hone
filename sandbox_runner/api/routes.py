@@ -1,7 +1,3 @@
-"""
-API Routes Module
-"""
-
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -46,7 +42,7 @@ class JobResultsResponse(BaseModel):
     status: JobStatus
     miner_hotkey: str
     completed_at: Optional[datetime]
-    metrics: Dict[str, Any]  # Aggregated metrics
+    metrics: Dict[str, Any]
     execution_time: Optional[float]
     error_message: Optional[str]
 
@@ -162,7 +158,7 @@ class JobStatusResponse(BaseModel):
 
 
 class RunnerStatus(BaseModel):
-    """Overall runner status."""
+    """Overall runner status - UPDATED with active_job_ids."""
     runner_id: str
     status: str
     total_gpus: int
@@ -170,6 +166,7 @@ class RunnerStatus(BaseModel):
     allocated_gpus: int
     queue_depth: int
     active_jobs: int
+    active_job_ids: List[str]  # NEW: List of currently running/building job IDs
     total_submitted: int
     total_completed: int
     total_failed: int
@@ -395,6 +392,8 @@ def create_router(config: Config) -> APIRouter:
         gpu_stats = status_data["gpu_stats"]
         queue_stats = status_data["queue_stats"]
         
+        active_job_ids = status_data.get("active_job_ids", [])
+        
         return RunnerStatus(
             runner_id=status_data["runner_id"],
             status=status_data["status"],
@@ -403,6 +402,7 @@ def create_router(config: Config) -> APIRouter:
             allocated_gpus=gpu_stats["allocated_gpus"],
             queue_depth=queue_stats["total_jobs"],
             active_jobs=status_data["active_jobs"],
+            active_job_ids=active_job_ids,  # NEW
             total_submitted=status_data["total_submitted"],
             total_completed=status_data["total_completed"],
             total_failed=status_data["total_failed"],

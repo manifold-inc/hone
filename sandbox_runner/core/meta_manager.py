@@ -370,6 +370,7 @@ class MetaManager:
             "total_completed": self._total_jobs_completed,
             "total_failed": self._total_jobs_failed,
             "execution_mode": self.config.execution.mode,
+            "active_job_ids": list(active_jobs.keys()),
             "queue_stats": {
                 "total_jobs": await self.job_queue.get_total_depth(),
                 "by_weight_class": queue_by_weight
