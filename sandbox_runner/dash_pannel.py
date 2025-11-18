@@ -437,8 +437,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
                 value=[],
                 interactive=False,
                 wrap=True,
-                column_widths=["22%", "14%", "10%", "12%", "10%", "10%", "22%"],
-                height=250
+                column_widths=["22%", "14%", "10%", "12%", "10%", "10%", "22%"]
             )
             
             gr.Markdown("### ⚙️ Filters")
