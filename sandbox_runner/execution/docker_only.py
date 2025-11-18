@@ -225,7 +225,7 @@ def _log_docker_run_command(
     
     if device_requests and len(device_requests) > 0:
         device_ids = device_requests[0].device_ids
-        gpu_ids = ','.join(device_ids)
+        gpu_ids = ','.join([i for i in range(len(device_ids))])
         docker_cmd.append(f"--gpus '\"device={gpu_ids}\"'")
     
     if runtime:
@@ -491,24 +491,6 @@ class DockerOnlyExecutor:
             '--output', '/output'
         ]
         
-        _log_docker_run_command(
-            container_name=container_name,
-            image=image_id,
-            command=command,
-            volumes=volumes,
-            environment=env_vars,
-            network=network_name if network_name else None,
-            network_mode=network_mode if not network_name else None,
-            device_requests=config.get('device_requests'),
-            runtime=config.get('runtime'),
-            working_dir='/app',
-            user='root',
-            security_opt=security_opt,
-            cap_drop=cap_drop,
-            read_only=config.get('read_only', False),
-            tmpfs=config.get('tmpfs')
-        )
-        
         if network_name:
             network_mode = network_name
         else:
@@ -568,13 +550,31 @@ class DockerOnlyExecutor:
         
         # this causes issues with docker / hf parallel download - need to adjust dynamically
         #config['pids_limit'] = self.config.execution.max_processes
-        
+        """
         if self.config.security.readonly_rootfs:
             config['read_only'] = True
             config['tmpfs'] = {
                 '/tmp': 'rw,noexec,nosuid,size=1g',
                 '/var/tmp': 'rw,noexec,nosuid,size=1g'
             }
+        """
+        _log_docker_run_command(
+            container_name=container_name,
+            image=image_id,
+            command=command,
+            volumes=volumes,
+            environment=env_vars,
+            network=network_name if network_name else None,
+            network_mode=network_mode if not network_name else None,
+            device_requests=config.get('device_requests'),
+            runtime=config.get('runtime'),
+            working_dir='/app',
+            user='root',
+            security_opt=security_opt,
+            cap_drop=cap_drop,
+            read_only=config.get('read_only', False),
+            tmpfs=config.get('tmpfs')
+        )
         
         return config
     
