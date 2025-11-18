@@ -655,6 +655,50 @@ class DockerOnlyExecutor:
             return True
         except Exception:
             return False
+    
+    async def _cleanup_stale_networks(self):
+        """Clean up stale sandbox networks that might be blocking subnet allocation"""
+        try:
+            networks = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: self.docker_client.networks.list()
+            )
+            
+            for network in networks:
+                if network.name.startswith('sandbox-job-'):
+                    try:
+                        # force remove containers on this network
+                        network_info = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: self.docker_client.api.inspect_network(network.id)
+                        )
+                        
+                        containers = network_info.get('Containers', {})
+                        for container_id in containers:
+                            try:
+                                container = await asyncio.get_event_loop().run_in_executor(
+                                    None,
+                                    lambda: self.docker_client.containers.get(container_id)
+                                )
+                                await asyncio.get_event_loop().run_in_executor(
+                                    None,
+                                    lambda: container.remove(force=True)
+                                )
+                                logger.info(f"Force removed stale container {container_id[:12]}")
+                            except Exception as e:
+                                logger.debug(f"Failed to remove container {container_id[:12]}: {e}")
+                        
+                        await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: network.remove()
+                        )
+                        logger.info(f"Removed stale network: {network.name}")
+                        
+                    except Exception as e:
+                        logger.debug(f"Failed to remove network {network.name}: {e}")
+                        
+        except Exception as e:
+            logger.warning(f"Failed to cleanup stale networks: {e}")
             
     async def run_job_with_vllm(
         self,
@@ -788,34 +832,74 @@ class DockerOnlyExecutor:
     async def _create_network(self, network_name: str):
         """Create an isolated Docker network without internet access."""
         try:
-            # remove any existing network with the same name
+            # force cleanup of existing network and any containers on it
             try:
                 existing_network = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: self.docker_client.networks.get(network_name)
                 )
+                
+                # force remove all containers on this network first
+                try:
+                    network_info = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self.docker_client.api.inspect_network(network_name)
+                    )
+                    containers = network_info.get('Containers', {})
+                    for container_id in containers:
+                        try:
+                            container = await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: self.docker_client.containers.get(container_id)
+                            )
+                            await asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: container.remove(force=True)
+                            )
+                            logger.info(f"Force removed container {container_id[:12]} from network")
+                        except Exception as e:
+                            logger.warning(f"Failed to remove container {container_id[:12]}: {e}")
+                except Exception as e:
+                    logger.debug(f"Failed to inspect/clean network containers: {e}")
+                
                 await asyncio.get_event_loop().run_in_executor(
                     None,
-                    existing_network.remove
+                    lambda: existing_network.remove()
                 )
                 logger.info(f"Removed existing network: {network_name}")
             except Exception:
                 pass
             
-            # multiple subnet ranges to avoid conflicts
+            # more subnet ranges with more options and smaller subnets
+            import random
             subnet_options = [
                 '172.28.0.0/16',
                 '172.29.0.0/16',
                 '172.30.0.0/16',
                 '172.31.0.0/16',
+                # Additional 10.x ranges
                 '10.100.0.0/16',
                 '10.101.0.0/16',
+                '10.102.0.0/16',
+                '10.103.0.0/16',
+                '10.104.0.0/16',
+                '10.105.0.0/16',
+                # Smaller /24 subnets for more options
+                f'10.200.{random.randint(1, 250)}.0/24',
+                f'10.201.{random.randint(1, 250)}.0/24',
+                f'10.202.{random.randint(1, 250)}.0/24',
             ]
+            
+            # to avoid always hitting the same exhausted ranges
+            random.shuffle(subnet_options)
             
             last_error = None
             for subnet in subnet_options:
                 try:
-                    gateway = subnet.replace('0.0/16', '0.1')
+                    if '/24' in subnet:
+                        gateway = subnet.replace('.0/24', '.1')
+                    else:
+                        gateway = subnet.replace('0.0/16', '0.1')
                     
                     ipam_pool = docker.types.IPAMPool(
                         subnet=subnet,
@@ -846,11 +930,44 @@ class DockerOnlyExecutor:
                     
                 except docker.errors.APIError as e:
                     last_error = e
-                    if "overlaps" in str(e).lower():
-                        logger.debug(f"Subnet {subnet} overlaps, trying next option...")
+                    if "overlaps" in str(e).lower() or "pool" in str(e).lower():
+                        logger.debug(f"Subnet {subnet} overlaps/conflicts, trying next option...")
                         continue
                     else:
                         raise
+            
+            # If all options failed, try to clean up stale networks and retry
+            logger.warning("All subnet options exhausted, attempting cleanup of stale networks...")
+            await self._cleanup_stale_networks()
+            
+            # Try one more time with a random subnet
+            random_subnet = f'10.250.{random.randint(1, 250)}.0/24'
+            try:
+                gateway = random_subnet.replace('.0/24', '.1')
+                ipam_pool = docker.types.IPAMPool(
+                    subnet=random_subnet,
+                    gateway=gateway
+                )
+                ipam_config = docker.types.IPAMConfig(
+                    pool_configs=[ipam_pool]
+                )
+                
+                network = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: self.docker_client.networks.create(
+                        network_name,
+                        driver="bridge",
+                        check_duplicate=True,
+                        ipam=ipam_config,
+                        options={
+                            "com.docker.network.bridge.enable_ip_masquerade": "false"
+                        }
+                    )
+                )
+                logger.info(f"Created network with random subnet: {random_subnet}")
+                return network
+            except Exception:
+                pass
             
             if last_error:
                 logger.error(f"Failed to create network after trying all subnet options")
@@ -1103,17 +1220,43 @@ class DockerOnlyExecutor:
             raise
 
     async def stop_vllm_container(self, container) -> None:
-        """Stop and remove vLLM container."""
+        """Stop and remove vLLM container"""
         try:
             if container:
-                
                 logger.info(color_job_id(f"Stopping vLLM container: {container.id}", container.id))
-                await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: container.stop(timeout=10)
-                )
-                await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: container.remove(force=True)
-                )
-                logger.info("✓ vLLM container stopped")
+                
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: container.stop(timeout=10)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to stop vLLM container gracefully: {e}")
+                    
+                    # force kill if stop failed
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, lambda: container.kill()
+                        )
+                    except Exception as kill_e:
+                        logger.warning(f"Failed to kill vLLM container: {kill_e}")
+                
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: container.remove(force=True)
+                    )
+                    logger.info("✓ vLLM container removed")
+                except Exception as remove_e:
+                    logger.warning(f"Failed to remove vLLM container: {remove_e}")
+                    
+                    # last resort: remove by ID directly
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, 
+                            lambda: self.docker_client.api.remove_container(container.id, force=True)
+                        )
+                        logger.info("✓ vLLM container force removed via API")
+                    except Exception as api_e:
+                        logger.error(f"Complete failure to remove container: {api_e}")
+                        
         except Exception as e:
-            logger.warning(f"Failed to stop vLLM container: {e}")
+            logger.error(f"Unexpected error in stop_vllm_container: {e}")
