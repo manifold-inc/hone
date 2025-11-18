@@ -88,7 +88,7 @@ def generate(colors=None, size=18):
       if not draw(grid, output1, [0, 1]): continue
       grid, output2 = common.grids(size, size)
       if not draw(grid, output2, [1, 0]): continue
-      if output1 == output2: break  # Avoid ambigous problems.
+      if output1 == output2: break  # Avoid ambiguous problems.
 
   grid, output = common.grids(size, size)
   draw(grid, output)
