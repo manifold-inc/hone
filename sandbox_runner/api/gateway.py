@@ -75,6 +75,7 @@ def create_app(config: Config) -> FastAPI:
     
     _add_exception_handlers(app)
     
+    # Include all routers
     router = create_router(config)
     app.include_router(router, prefix="/v1")
 
@@ -85,12 +86,14 @@ def create_app(config: Config) -> FastAPI:
         logs_router = create_logs_router()
         app.include_router(logs_router, prefix="/v1")
         logger.info(f"Log routes enabled (retention: {config.execution.log_retention_hours}h)")
-        for route in app.routes:
-            if hasattr(route, 'path'):
-                logger.info(f"Registered route: {route.path}")
-
     else:
         logger.info("Log routes disabled (log_retention_hours = 0)")
+    
+    # Log all registered routes - AFTER all routers are included
+    logger.info("Registered routes:")
+    for route in app.routes:
+        if hasattr(route, 'path'):
+            logger.info(f"  {route.path}")
     
     @app.get("/metrics")
     async def metrics():

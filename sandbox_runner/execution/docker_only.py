@@ -964,6 +964,7 @@ class DockerOnlyExecutor:
             'network': network_name,  
         }
         
+        gpu_count = job.weight_class.gpu_count()
         if job.assigned_gpus:
             config['device_requests'] = [
                 docker.types.DeviceRequest(
@@ -972,6 +973,10 @@ class DockerOnlyExecutor:
                 )
             ]
             config['runtime'] = 'nvidia'
+            if gpu_count > 1:
+                command.extend(['--tensor-parallel-size', str(gpu_count)])
+                logger.info(f"Configuring vLLM with tensor parallelism: {gpu_count} GPUs")
+
                 
         try:
             container = await asyncio.get_event_loop().run_in_executor(
