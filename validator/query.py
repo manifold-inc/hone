@@ -44,7 +44,6 @@ async def fetch_miner_info(
             
             info = await resp.json()
             
-            # validate required fields
             if not info.get("repo_url"):
                 logger.error(f"UID {uid}: Missing repo_url in /info response")
                 return None
@@ -90,6 +89,17 @@ async def query_miners_via_sandbox(
         Dict of {uid: result_dict}
     """
     
+    logger.info(f"Persisting {len(miners)} miners to database...")
+    for uid, miner_node in miners.items():
+        await db.upsert_miner(
+            uid=uid,
+            hotkey=miner_node.get('hotkey'),
+            ip=miner_node.get('ip'),
+            port=miner_node.get('port'),
+            stake=miner_node.get('stake'),
+            last_update_block=current_block
+        )
+    
     sandbox_client = SandboxRunnerClient(
         endpoint=config.sandbox_runner_endpoint,
         api_key=config.sandbox_runner_api_key
@@ -100,7 +110,6 @@ async def query_miners_via_sandbox(
     logger.info(f"Max submissions per day: {config.max_submissions_per_day}")
     logger.info(f"=" * 80)
     
-    # filter out miners who have hit daily limit
     eligible_miners = {}
     for uid, miner in miners.items():
         hotkey = miner.get("hotkey")
@@ -125,7 +134,6 @@ async def query_miners_via_sandbox(
     
     logger.info(f"Fetching /info from {len(eligible_miners)} eligible miners...")
     
-    # fetch miner info concurrently
     miner_infos = {}
     timeout = aiohttp.ClientTimeout(total=config.miner_info_timeout_seconds)
     
@@ -145,7 +153,6 @@ async def query_miners_via_sandbox(
     
     logger.info(f"Successfully fetched info from {len(miner_infos)}/{len(eligible_miners)} miners")
     
-    # check submission history and decide what to evaluate
     jobs_to_submit = {}
     cached_results = {}
     
@@ -153,7 +160,6 @@ async def query_miners_via_sandbox(
         miner = eligible_miners[uid]
         hotkey = miner.get("hotkey")
         
-        # check if identical solution already evaluated
         history = await db.get_submission_history(
             hotkey=hotkey,
             repo_url=info["repo_url"],
@@ -164,7 +170,6 @@ async def query_miners_via_sandbox(
         )
         
         if history:
-            # use cached metrics
             logger.info(f"UID {uid} ({hotkey[:12]}...): Using cached metrics (evaluated {history['evaluation_count']} times)")
             
             cached_results[uid] = {
@@ -180,7 +185,6 @@ async def query_miners_via_sandbox(
                 "last_evaluated_at": history["last_evaluated_at"]
             }
             
-            # record to query_results with from_cache=True
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
@@ -202,11 +206,9 @@ async def query_miners_via_sandbox(
                 from_cache=True
             )
             
-            # increment daily submission count
             await db.increment_daily_submissions(hotkey)
             
         else:
-            # new solution - needs evaluation
             jobs_to_submit[uid] = {
                 "miner": miner,
                 "info": info
@@ -218,7 +220,6 @@ async def query_miners_via_sandbox(
         logger.info("All submissions were cached - no sandbox jobs needed")
         return cached_results
     
-    # submit new jobs to sandbox runner
     job_submissions = {}
     
     for uid, job_data in jobs_to_submit.items():
@@ -261,7 +262,6 @@ async def query_miners_via_sandbox(
         except Exception as e:
             logger.error(f"UID {uid}: Failed to submit job to sandbox: {e}")
             
-            # record submission failure
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
@@ -284,11 +284,9 @@ async def query_miners_via_sandbox(
     
     logger.info(f"Submitted {len(job_submissions)} new jobs to sandbox runner")
     
-    # poll all jobs until completion
     fresh_results = {}
     
     async def poll_and_record(uid: int, job_info: Dict):
-        """Poll a single job and record results to database"""
         job_id = job_info["job_id"]
         miner = job_info["miner"]
         info = job_info["info"]
@@ -301,7 +299,6 @@ async def query_miners_via_sandbox(
             phase = full_status.get("current_phase", "unknown")
             logger.info(f"UID {uid} | Job {job_id} | {status} | {phase} | {progress:.1f}%")
         
-        # poll until complete with 3h timeout
         final_status = await sandbox_client.poll_until_complete(
             job_id=job_id,
             poll_interval=config.sandbox_poll_interval_seconds,
@@ -312,16 +309,13 @@ async def query_miners_via_sandbox(
         end_time = datetime.now(timezone.utc)
         execution_time = (end_time - start_time).total_seconds()
         
-        # get metrics if job completed successfully
         metrics_data = None
         if final_status.get("status") == "completed":
             metrics_data = await sandbox_client.get_job_metrics(job_id)
         
-        # record to database
         if metrics_data and metrics_data.get("metrics"):
             metrics = metrics_data["metrics"]
             
-            # calculate aggregate metrics for this job
             exact_match = metrics.get("exact_match", False)
             partial_correctness = metrics.get("partial_correctness", 0.0)
             grid_similarity = metrics.get("grid_similarity", 0.0)
@@ -353,7 +347,6 @@ async def query_miners_via_sandbox(
                 from_cache=False
             )
             
-            # save to submission history for future caching
             await db.save_submission_history(
                 hotkey=hotkey,
                 repo_url=info["repo_url"],
@@ -367,10 +360,9 @@ async def query_miners_via_sandbox(
                 partial_correctness_avg=partial_correctness,
                 grid_similarity_avg=grid_similarity,
                 efficiency_avg=efficiency_score,
-                overall_score=partial_correctness  # will be recalculated in scoring
+                overall_score=partial_correctness
             )
             
-            # increment daily submission count
             await db.increment_daily_submissions(hotkey)
             
             logger.info(
@@ -394,7 +386,6 @@ async def query_miners_via_sandbox(
                 "job_id": job_id
             }
             
-            # publish to telemetry
             try:
                 telemetry_client.publish(
                     "/validator/sandbox_job_completed",
@@ -416,7 +407,6 @@ async def query_miners_via_sandbox(
                 logger.warning(f"Failed to publish telemetry: {e}")
             
         else:
-            # job failed or timed out
             error_msg = final_status.get("error_message", f"Job status: {final_status.get('status')}")
             
             await db.record_query_result(
@@ -451,7 +441,6 @@ async def query_miners_via_sandbox(
                 "job_id": job_id
             }
     
-    # poll all jobs concurrently
     logger.info(f"Polling {len(job_submissions)} jobs (timeout: {config.sandbox_runner_timeout_hours}h)...")
     
     tasks = [
@@ -461,10 +450,8 @@ async def query_miners_via_sandbox(
     
     await asyncio.gather(*tasks, return_exceptions=True)
     
-    # combine cached and fresh results
     all_results = {**cached_results, **fresh_results}
     
-    # log summary
     successful_fresh = sum(1 for r in fresh_results.values() if r.get("success"))
     failed_fresh = len(fresh_results) - successful_fresh
     

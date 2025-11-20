@@ -113,16 +113,19 @@ class Database:
         Check if identical solution has been evaluated before
         Returns cached metrics if found
         """
+        repo_commit = repo_commit or ''
+        repo_path = repo_path or ''
+        
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
                 SELECT * FROM submission_history
                 WHERE hotkey = $1 
-                  AND repo_url = $2 
-                  AND repo_branch = $3 
-                  AND COALESCE(repo_commit, '') = COALESCE($4, '')
-                  AND repo_path = $5
-                  AND weight_class = $6
+                AND repo_url = $2 
+                AND repo_branch = $3 
+                AND repo_commit = $4
+                AND repo_path = $5
+                AND weight_class = $6
                 """,
                 hotkey, repo_url, repo_branch, repo_commit, repo_path, weight_class
             )
