@@ -27,16 +27,10 @@ class RunnerConfig:
 @dataclass
 class APIConfig:
     """API Gateway configuration."""
-    port: int = 8443
-    require_epistula: bool = True
+    port: int = 8080
     require_api_key: bool = True
     rate_limit_per_validator: int = 1  # requests per minute
-    ssl_cert_path: Optional[Path] = None
-    ssl_key_path: Optional[Path] = None
     api_key_header: str = "X-API-Key"
-    epistula_signature_header: str = "X-Epistula-Signature"
-    epistula_request_id_header: str = "X-Epistula-Request-ID"
-    epistula_timestamp_header: str = "X-Epistula-Timestamp"
 
 
 @dataclass

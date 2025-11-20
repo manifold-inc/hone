@@ -7,15 +7,9 @@ runner:
 
 api:
   port: 8080
-  require_epistula: false
   require_api_key: true
-  rate_limit_per_validator: 100  # requests per minute
-    
-  # Header names for authentication
+  rate_limit_per_validator: 100
   api_key_header: "X-API-Key"
-  epistula_signature_header: "X-Epistula-Signature"
-  epistula_request_id_header: "X-Epistula-Request-ID"
-  epistula_timestamp_header: "X-Epistula-Timestamp"
 
 hardware:
   gpu_count: 1

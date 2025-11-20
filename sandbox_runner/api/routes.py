@@ -202,17 +202,10 @@ async def authenticate_request(
     validator_id = None
     auth_method = "none"
     
-    if auth_manager.config.require_epistula:
-        validator_id = await auth_manager.verify_epistula_signature(request)
-        auth_method = "epistula"
-    
     if auth_manager.config.require_api_key:
         api_key = await auth_manager.verify_api_key()
-        if auth_method == "epistula":
-            auth_method = "dual"
-        else:
-            validator_id = api_key
-            auth_method = "api_key"
+        validator_id = api_key
+        auth_method = "api_key"
     
     if validator_id:
         await rate_limiter.check_rate_limit(validator_id)
