@@ -1,0 +1,93 @@
+# Sandbox Runner Configuration
+
+runner:
+  id: "runner-1"
+  name: "Sandbox Runner Instance 1"
+  location: "us-east-1"
+
+api:
+  port: 8080
+  require_api_key: true
+  rate_limit_per_validator: 100
+  api_key_header: "X-API-Key"
+
+hardware:
+  gpu_count: 1
+  gpu_type: "H200"
+  cpu_cores: 15
+  memory_gb: 175
+
+execution:
+  mode: "docker"
+  
+  fallback_on_error: true
+  
+  # Resource limits per job
+  cpu_limit: 5              # CPU cores
+  memory_limit_gb: 100       # RAM in GB
+  disk_quota_gb: 100         # Disk space
+  max_processes: 32         # Max processes per job
+  
+  # Timeouts
+  prep_timeout_seconds: 3600      # 1 hour for prep phase
+  inference_timeout_seconds: 3600  # 1 hour for inference
+  repo_clone_timeout_seconds: 600  # 10 minutes for git clone
+  repo_build_timeout_seconds: 1800 # 30 minutes for Docker build
+  
+  # Allowed repository hosts
+  allowed_repo_hosts:
+    - "github.com"
+    - "gitlab.com"
+
+security:  
+  # syscall filtering
+  seccomp:
+    enabled: true
+    default_action: "SCMP_ACT_ERRNO"
+  
+  network_policy:
+    prep_allow_internet: true    # Allow internet in prep phase
+    inference_block_internet: true  # Block internet in inference
+    
+    # Domains allowed during prep phase
+    allowed_prep_domains:
+      - "huggingface.co"
+      - "github.com"
+      - "gitlab.com"
+      - "raw.githubusercontent.com"
+      - "cdn.jsdelivr.net"
+    
+    blocked_domains: []
+  
+  readonly_rootfs: true
+  no_new_privileges: true
+  
+  drop_capabilities:
+    - "CAP_SYS_ADMIN"
+    - "CAP_NET_ADMIN"
+    - "CAP_SYS_MODULE"
+    - "CAP_SYS_RAWIO"
+    - "CAP_SYS_PTRACE"
+  
+
+monitoring:
+  prometheus_port: 9090
+  prometheus_path: "/metrics"
+  
+  enable_falco: true
+  
+  # Logging
+  log_format: "json"  # json | text
+
+storage:
+  s3_bucket: "hone-subnet-data"
+  s3_region: "us-east-1"
+  # s3_endpoint: "https://s3.us-east-1.amazonaws.com"
+  
+  # S3 credentials (can also use IAM roles)
+  # s3_access_key: "YOUR_ACCESS_KEY"
+  # s3_secret_key: "YOUR_SECRET_KEY"
+  
+  # S3 path prefixes
+  input_prefix: "inputs/"
+  output_prefix: "outputs/"

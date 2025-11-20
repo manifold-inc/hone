@@ -57,11 +57,27 @@ class ValidatorConfig:
     
     current_block_provider: Callable[[], int] = field(default=lambda: 0)
 
-    min_train_examples: int = int(os.getenv("MIN_TRAIN_EXAMPLES", "3"))
-    max_train_examples: int = int(os.getenv("MAX_TRAIN_EXAMPLES", "4"))
-
     retention_days: int = int(os.getenv("RETENTION_DAYS", "30"))
     cleanup_interval_hours: int = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
+    
+    # sandbox runner configuration
+    sandbox_runner_endpoint: str = os.getenv("SANDBOX_RUNNER_ENDPOINT")
+    sandbox_runner_api_key: Optional[str] = os.getenv("SANDBOX_RUNNER_API_KEY")
+    sandbox_runner_timeout_hours: int = int(os.getenv("SANDBOX_RUNNER_TIMEOUT_HOURS", "3"))
+    
+    # job polling configuration
+    sandbox_poll_interval_seconds: int = int(os.getenv("SANDBOX_POLL_INTERVAL", "30"))
+    sandbox_max_poll_attempts: int = int(os.getenv("SANDBOX_MAX_POLL_ATTEMPTS", "360"))  # 3h with 30s intervals
+    
+    # miner info fetching
+    miner_info_timeout_seconds: int = int(os.getenv("MINER_INFO_TIMEOUT", "5"))
+
+    miner_info_timeout_seconds: int = int(os.getenv("MINER_INFO_TIMEOUT", "5"))
+    
+    max_submissions_per_day: int = int(os.getenv("MAX_SUBMISSIONS_PER_DAY", "1"))
+    min_accuracy_floor: float = float(os.getenv("MIN_ACCURACY_FLOOR", "0.20"))
+    top_miners_count: int = int(os.getenv("TOP_MINERS_COUNT", "5"))
+
     
     @property
     def cycle_duration(self) -> int:
@@ -90,3 +106,8 @@ class ValidatorConfig:
     @property
     def idle_sleep_seconds(self) -> int:
         return 2
+    
+    def __post_init__(self):
+        if self.use_mock_chain and self.hotkey is None:
+            # for mock testing
+            self.hotkey = "5MockValidatorHotkey123456789"
