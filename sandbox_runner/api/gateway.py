@@ -88,13 +88,7 @@ def create_app(config: Config) -> FastAPI:
         logger.info(f"Log routes enabled (retention: {config.execution.log_retention_hours}h)")
     else:
         logger.info("Log routes disabled (log_retention_hours = 0)")
-    
-    # Log all registered routes - AFTER all routers are included
-    logger.info("Registered routes:")
-    for route in app.routes:
-        if hasattr(route, 'path'):
-            logger.info(f"  {route.path}")
-    
+        
     @app.get("/metrics")
     async def metrics():
         """Prometheus metrics endpoint."""

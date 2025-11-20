@@ -218,7 +218,8 @@ async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
     nodes = chain.get_nodes()
     total_uids = len(nodes)
     all_uids = list(range(total_uids))
-    all_weights = [0.0] * total_uids
+    array_size = max(len(nodes), BURN_UID + 1)
+    all_weights = [0.0] * array_size
     
     if not scores or sum(scores.values()) <= 0:
         all_weights[BURN_UID] = 1.0

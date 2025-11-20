@@ -164,4 +164,5 @@ async def run_continuous(validator, stop_event: asyncio.Event = None):
             
         except Exception as e:
             logger.error(f"Error in validator cycle: {e}", exc_info=True)
+            logger.exception(e)
             await asyncio.sleep(5)
