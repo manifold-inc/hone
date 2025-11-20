@@ -6,7 +6,8 @@ setup:
 	sudo bash setup.sh
 
 run:
-	pm2 start "python3 -m main --config config.local.yaml" --name hone-runner
+	pm2 start main --name hone-runner --interpreter python3 -- --config config.local.yaml
 
 dash:
-	pm2 start dash_pannel.py --name dash-panel --interpreter python3 --name dash
+	pm2 start dash_pannel.py --name dash-panel --interpreter python3
+
