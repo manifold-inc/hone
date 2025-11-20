@@ -1,43 +1,61 @@
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from loguru import logger
 from substrateinterface.exceptions import SubstrateRequestException
 from common.chain import can_set_weights
 import os
+import math
 
 
-async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
+async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, Dict]) -> Tuple[Dict[int, float], Dict[int, str]]:
     """
-    Calculate comprehensive scores for miners based on:
-    - Exact match rate (40% weight)
-    - Partial correctness (30% weight) 
-    - Grid similarity (20% weight)
-    - Efficiency (10% weight)
+    NEW INCENTIVE MECHANISM:
     
-    - If accuracy is 0 AND similarity metrics < 0.9, score = 0
-    - Efficiency is excluded from scoring when accuracy = 0 and similarity < 0.9
+    1. Calculate aggregate metrics for all REGISTERED miners from recent query results
+    2. Filter miners meeting minimum accuracy floor (default 20%)
+    3. Update leaderboard with current top performers
+    4. Return exponentially distributed rewards for top 5 miners
+    
+    Returns:
+        (scores: Dict[uid -> weight], hotkey_map: Dict[uid -> hotkey])
     """
     current_block = config.current_block_provider()
     window_blocks = config.score_window_blocks
     min_responses = config.min_responses
+    min_accuracy_floor = config.min_accuracy_floor
+    top_miners_count = config.top_miners_count
 
+    logger.info(f"=" * 80)
+    logger.info(f"Calculating scores for leaderboard")
+    logger.info(f"  Min accuracy floor: {min_accuracy_floor * 100:.1f}%")
+    logger.info(f"  Top miners to reward: {top_miners_count}")
+    logger.info(f"  Window: {window_blocks} blocks")
+    logger.info(f"=" * 80)
+
+    # get recent results
     rows = await db.get_recent_results(window_blocks=window_blocks, current_block=current_block)
     
-    # agg metrics per miner
-    miner_stats: Dict[int, Dict] = {}
+    # aggregate metrics per hotkey (only for registered miners)
+    registered_hotkeys = {miner.get("hotkey") for miner in miners.values() if miner.get("hotkey")}
+    
+    miner_stats: Dict[str, Dict] = {}
     
     for r in rows:
-        uid = int(r['uid'])
-        if uid not in miner_stats:
-            miner_stats[uid] = {
+        hotkey = r.get('hotkey')
+        if not hotkey or hotkey not in registered_hotkeys:
+            continue
+            
+        if hotkey not in miner_stats:
+            miner_stats[hotkey] = {
                 'count': 0,
                 'exact_matches': 0,
                 'partial_sum': 0.0,
                 'similarity_sum': 0.0,
                 'efficiency_sum': 0.0,
-                'successful_responses': 0
+                'successful_responses': 0,
+                'uid': r.get('uid')
             }
         
-        stats = miner_stats[uid]
+        stats = miner_stats[hotkey]
         stats['count'] += 1
         
         if r['success']:
@@ -47,26 +65,15 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
             stats['similarity_sum'] += float(r.get('grid_similarity', 0.0))
             stats['efficiency_sum'] += float(r.get('efficiency_score', 0.0))
     
-    scores: Dict[int, Dict[str, float]] = {}
-    weights = {
-        'exact_match': 0.4,
-        'partial': 0.3,
-        'similarity': 0.2,
-        'efficiency': 0.1
-    }
+    # calculate overall scores and filter by floor
+    qualifying_miners: List[Tuple[str, int, Dict]] = []
     
-    for uid, stats in miner_stats.items():
+    for hotkey, stats in miner_stats.items():
         if stats['count'] < min_responses:
-            logger.debug(f"UID {uid}: only {stats['count']} responses < min_responses={min_responses}")
+            logger.debug(f"Hotkey {hotkey[:12]}...: only {stats['count']} responses < min_responses={min_responses}")
             continue
         
         if stats['successful_responses'] == 0:
-            scores[uid] = {
-                "score": 0.0,
-                "exact_match_rate": 0.0,
-                "partial_correctness_avg": 0.0,
-                "efficiency_avg": 0.0
-            }
             continue
         
         exact_rate = stats['exact_matches'] / stats['count']
@@ -74,123 +81,190 @@ async def calculate_scores(db, config) -> Dict[int, Dict[str, float]]:
         similarity_avg = stats['similarity_sum'] / stats['successful_responses']
         efficiency_avg = stats['efficiency_sum'] / stats['successful_responses']
         
-        poor_quality = (exact_rate == 0.0 and 
-                       partial_avg < 0.9 and 
-                       similarity_avg < 0.9)
+        # check floor requirement - exact match rate must be >= floor
+        if exact_rate < min_accuracy_floor:
+            logger.debug(f"Hotkey {hotkey[:12]}...: Below floor ({exact_rate*100:.1f}% < {min_accuracy_floor*100:.1f}%)")
+            continue
         
-        if poor_quality:
-            final_score = 0.0
-            logger.info(f"UID {uid} | Score: 0.0 (poor quality - acc=0, similarity<0.9)")
-        else:
-            if exact_rate == 0.0 and (partial_avg < 0.9 or similarity_avg < 0.9):
-                adjusted_weights = {
-                    'exact_match': 0.4 / 0.9,  # 44.4%
-                    'partial': 0.3 / 0.9,      # 33.3%
-                    'similarity': 0.2 / 0.9,   # 22.2%
-                    'efficiency': 0.0          # 0%
-                }
-                final_score = (
-                    adjusted_weights['exact_match'] * exact_rate +
-                    adjusted_weights['partial'] * partial_avg +
-                    adjusted_weights['similarity'] * similarity_avg
-                )
-                logger.info(f"UID {uid} | Score: {final_score:.3f} (no efficiency - low acc) | "
-                           f"Exact: {exact_rate:.2f} | Partial: {partial_avg:.2f} | "
-                           f"Similarity: {similarity_avg:.2f}")
-            else:
-                final_score = (
-                    weights['exact_match'] * exact_rate +
-                    weights['partial'] * partial_avg +
-                    weights['similarity'] * similarity_avg +
-                    weights['efficiency'] * efficiency_avg
-                )
-                logger.info(f"UID {uid} | Score: {final_score:.3f} | "
-                           f"Exact: {exact_rate:.2f} | Partial: {partial_avg:.2f} | "
-                           f"Efficiency: {efficiency_avg:.2f}")
+        # calculate overall score using same weights as before
+        weights = {
+            'exact_match': 0.4,
+            'partial': 0.3,
+            'similarity': 0.2,
+            'efficiency': 0.1
+        }
         
-        scores[uid] = {
-            "score": final_score,
+        overall_score = (
+            weights['exact_match'] * exact_rate +
+            weights['partial'] * partial_avg +
+            weights['similarity'] * similarity_avg +
+            weights['efficiency'] * efficiency_avg
+        )
+        
+        metrics = {
+            "overall_score": overall_score,
             "exact_match_rate": exact_rate,
             "partial_correctness_avg": partial_avg,
+            "grid_similarity_avg": similarity_avg,
             "efficiency_avg": efficiency_avg
         }
+        
+        qualifying_miners.append((hotkey, stats['uid'], metrics))
+        
+        logger.info(
+            f"Hotkey {hotkey[:12]}... | Score: {overall_score:.3f} | "
+            f"Exact: {exact_rate*100:.1f}% | Partial: {partial_avg:.2f} | "
+            f"Similarity: {similarity_avg:.2f} | Efficiency: {efficiency_avg:.2f}"
+        )
     
-    await db.save_scores(scores)
+    logger.info(f"Found {len(qualifying_miners)} miners meeting floor requirement")
     
-    return {uid: metrics["score"] for uid, metrics in scores.items()}
-
-
-def _validate_scores(scores: Dict[int, float]) -> bool:
-    if not scores:
-        logger.warning("No scores provided")
-        return False
+    if not qualifying_miners:
+        logger.warning("No miners meet minimum accuracy floor")
+        return {}, {}
     
-    if any(s < 0 for s in scores.values()):
-        logger.error("Negative scores found")
-        return False
+    # sort by overall score (descending)
+    qualifying_miners.sort(key=lambda x: x[2]["overall_score"], reverse=True)
     
-    if sum(scores.values()) <= 0:
-        logger.error("Total score is zero or negative")
-        return False
+    top_miners = qualifying_miners[:top_miners_count]
     
-    return True
+    for hotkey, uid, metrics in top_miners:
+        # get repo info from most recent submission
+        miner = await db.get_miner_by_hotkey(hotkey)
+        if miner:
+            # find most recent query result for this hotkey to get repo info
+            recent_results = await db.get_recent_results(window_blocks=window_blocks, current_block=current_block)
+            repo_info = None
+            for r in recent_results:
+                if r.get('hotkey') == hotkey and r.get('repo_url'):
+                    repo_info = r
+                    break
+            
+            if repo_info:
+                await db.update_leaderboard(
+                    hotkey=hotkey,
+                    uid=uid,
+                    overall_score=metrics["overall_score"],
+                    exact_match_rate=metrics["exact_match_rate"],
+                    partial_correctness_avg=metrics["partial_correctness_avg"],
+                    grid_similarity_avg=metrics["grid_similarity_avg"],
+                    efficiency_avg=metrics["efficiency_avg"],
+                    repo_url=repo_info.get('repo_url'),
+                    repo_branch=repo_info.get('repo_branch', 'main'),
+                    repo_commit=repo_info.get('repo_commit'),
+                    repo_path=repo_info.get('repo_path', '')
+                )
+    
+    # remove miners from leaderboard who are no longer in top N
+    current_leaderboard = await db.get_leaderboard(limit=100)  # get all
+    leaderboard_hotkeys = {entry['hotkey'] for entry in current_leaderboard}
+    top_hotkeys = {hotkey for hotkey, _, _ in top_miners}
+    
+    for hotkey in (leaderboard_hotkeys - top_hotkeys):
+        logger.info(f"Removing {hotkey[:12]}... from leaderboard (no longer in top {top_miners_count})")
+        await db.remove_from_leaderboard(hotkey)
+        
+    decay_factor = 0.8  # (higher = more concentrated)
+    
+    exponential_weights = []
+    for rank in range(len(top_miners)):
+        exponential_weights.append(math.exp(-decay_factor * rank))
+    
+    total_weight = sum(exponential_weights)
+    normalized_weights = [w / total_weight for w in exponential_weights]
+    
+    # create final weight dictionary
+    final_scores = {}
+    hotkey_map = {}
+    
+    for i, (hotkey, uid, metrics) in enumerate(top_miners):
+        weight = normalized_weights[i]
+        final_scores[uid] = weight
+        hotkey_map[uid] = hotkey
+        
+        logger.info(
+            f"#{i+1} | UID {uid} | Hotkey {hotkey[:12]}... | "
+            f"Score: {metrics['overall_score']:.3f} | "
+            f"Weight: {weight*100:.2f}%"
+        )
+    
+    # save detailed scores to database
+    scores_with_metrics = {}
+    for hotkey, uid, metrics in qualifying_miners:
+        scores_with_metrics[uid] = metrics
+    
+    await db.save_scores(scores_with_metrics, {uid: hk for hk, uid, _ in qualifying_miners})
+    
+    logger.info(f"=" * 80)
+    logger.info(f"Leaderboard updated: {len(top_miners)} miners in top {top_miners_count}")
+    logger.info(f"Exponential distribution with decay factor: {decay_factor}")
+    logger.info(f"=" * 80)
+    
+    return final_scores, hotkey_map
 
 
 async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
+    """
+    Set weights on chain    
+    """
     
     BURN_UID = int(os.getenv("BURN_UID", "251"))
-    BURN_WEIGHT_PERCENT = float(os.getenv("BURN_WEIGHT_PERCENT", "0.99"))
-    
-    use_burn = BURN_WEIGHT_PERCENT > 0
-    
-    if use_burn:
-        logger.info(f"🔥 Burn protection enabled: {BURN_WEIGHT_PERCENT*100:.0f}% to UID {BURN_UID}")
+    BURN_PERCENTAGE = float(os.getenv("BURN_PERCENTAGE", "0.95"))
+    MINER_PERCENTAGE = 1.0 - BURN_PERCENTAGE
     
     if not chain.substrate:
         chain.connect()
     
     nodes = chain.get_nodes()
     total_uids = len(nodes)
-    logger.info(f"Total UIDs in subnet: {total_uids}")
-    
     all_uids = list(range(total_uids))
     all_weights = [0.0] * total_uids
     
-    if not _validate_scores(scores):
-        if use_burn:
-            all_weights[BURN_UID] = 1.0
-            logger.info("No valid scores, setting 100% weight to burn UID")
-        else:
-            logger.warning("No valid scores and burn protection disabled - cannot set weights")
-            return False
+    if not scores or sum(scores.values()) <= 0:
+        all_weights[BURN_UID] = 1.0
+        logger.warning("No qualifying miners - burning 100%")
     else:
-        if use_burn:
-            remaining_weight_percent = 1.0 - BURN_WEIGHT_PERCENT
-            burn_weight_percent = BURN_WEIGHT_PERCENT
-            
-            total_score = sum(scores.values())
-            if total_score > 0:
-                miner_percentages = {uid: (score / total_score) * remaining_weight_percent 
-                                    for uid, score in scores.items()}
-                
-                all_weights[BURN_UID] = burn_weight_percent
-                
-                for uid, weight_pct in miner_percentages.items():
-                    all_weights[uid] = weight_pct
-                
-                logger.info(f"Setting weights: {BURN_WEIGHT_PERCENT*100:.0f}% to burn UID {BURN_UID}, "
-                           f"{remaining_weight_percent*100:.0f}% split among {len(scores)} miners")
+        all_weights[BURN_UID] = BURN_PERCENTAGE
+        
+        for uid, weight in scores.items():
+            if uid < total_uids:
+                all_weights[uid] = weight * MINER_PERCENTAGE
+        
+        weight_sum = sum(all_weights)
+        if weight_sum > 0:
+            all_weights = [w / weight_sum for w in all_weights]
+        
+        logger.info(f"Weights: {BURN_PERCENTAGE*100:.0f}% burn + {MINER_PERCENTAGE*100:.0f}% to top miners")
+    
+    if not scores or sum(scores.values()) <= 0:
+        # no qualifying miners - burn everything
+        logger.warning("No qualifying miners found - burning 100% to burn UID")
+        all_weights[BURN_UID] = 1.0
+        
+        logger.info("=" * 60)
+        logger.info("BURN MODE - No miners meet minimum requirements")
+        logger.info(f"  UID {BURN_UID:>3} - Weight: 100.00%")
+        logger.info("=" * 60)
+    else:
+        # distribute according to exponential weights
+        for uid, weight in scores.items():
+            if uid < total_uids:
+                all_weights[uid] = weight
             else:
-                logger.warning("Total score is zero, setting 100% to burn UID")
-                all_weights[BURN_UID] = 1.0
-        else:
-            total_score = sum(scores.values())
-            if total_score > 0:
-                for uid, score in scores.items():
-                    all_weights[uid] = score / total_score
-            else:
-                logger.warning("Total score is zero, cannot set weights")
-                return False
+                logger.warning(f"UID {uid} out of range (max: {total_uids-1})")
+        
+        # normalize to ensure sum = 1.0
+        weight_sum = sum(all_weights)
+        if weight_sum > 0:
+            all_weights = [w / weight_sum for w in all_weights]
+        
+        logger.info("=" * 60)
+        logger.info("Exponential distribution for top miners:")
+        for uid, weight in enumerate(all_weights):
+            if weight > 0:
+                percentage = weight * 100
+                logger.info(f"  UID {uid:>3} - Weight: {percentage:>6.2f}%")
+        logger.info("=" * 60)
     
     weight_sum = sum(all_weights)
     logger.info(f"Total weight sum: {weight_sum:.10f}")
@@ -200,14 +274,6 @@ async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
         all_weights = [w / weight_sum for w in all_weights]
         weight_sum = sum(all_weights)
         logger.info(f"Normalized weight sum: {weight_sum:.10f}")
-    
-    logger.info("=" * 60)
-    logger.info("Non-zero weights being set:")
-    for uid, weight in enumerate(all_weights):
-        if weight > 0:
-            percentage = weight * 100
-            logger.info(f"  UID {uid:>3} - Weight: {percentage:>6.2f}%")
-    logger.info("=" * 60)
 
     try:
         result = chain.set_weights(

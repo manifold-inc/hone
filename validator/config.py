@@ -71,6 +71,13 @@ class ValidatorConfig:
     
     # miner info fetching
     miner_info_timeout_seconds: int = int(os.getenv("MINER_INFO_TIMEOUT", "5"))
+
+    miner_info_timeout_seconds: int = int(os.getenv("MINER_INFO_TIMEOUT", "5"))
+    
+    max_submissions_per_day: int = int(os.getenv("MAX_SUBMISSIONS_PER_DAY", "1"))
+    min_accuracy_floor: float = float(os.getenv("MIN_ACCURACY_FLOOR", "0.20"))
+    top_miners_count: int = int(os.getenv("TOP_MINERS_COUNT", "5"))
+
     
     @property
     def cycle_duration(self) -> int:

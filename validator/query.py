@@ -76,15 +76,8 @@ async def query_miners_via_sandbox(
     telemetry_client: TelemetryClient
 ) -> Dict[int, Dict]:
     """
-    Query miners by submitting jobs to sandbox runner
-    
-    Flow:
-    1. Fetch /info from each miner to get repo URL and requirements
-    2. Submit job to sandbox runner for each miner
-    3. Poll sandbox runner for job completion (up to 3 hours)
-    4. Retrieve metrics from completed jobs
-    5. Save results to database
-    
+    Query miners by submitting jobs to sandbox runner with submission history and daily limits
+        
     Args:
         chain: Chain interface
         db: Database
@@ -102,36 +95,139 @@ async def query_miners_via_sandbox(
         api_key=config.sandbox_runner_api_key
     )
     
-    # step 1: fetch miner info concurrently
-    logger.info(f"Fetching /info from {len(miners)} miners...")
+    logger.info(f"=" * 80)
+    logger.info(f"Checking daily submission limits for {len(miners)} miners...")
+    logger.info(f"Max submissions per day: {config.max_submissions_per_day}")
+    logger.info(f"=" * 80)
     
+    # filter out miners who have hit daily limit
+    eligible_miners = {}
+    for uid, miner in miners.items():
+        hotkey = miner.get("hotkey")
+        if not hotkey:
+            logger.warning(f"UID {uid}: No hotkey found, skipping")
+            continue
+        
+        can_submit, current_count = await db.check_daily_submission_limit(
+            hotkey, config.max_submissions_per_day
+        )
+        
+        if not can_submit:
+            logger.info(f"UID {uid} ({hotkey[:12]}...): Daily limit reached ({current_count}/{config.max_submissions_per_day})")
+            continue
+        
+        eligible_miners[uid] = miner
+        logger.debug(f"UID {uid} ({hotkey[:12]}...): Eligible ({current_count}/{config.max_submissions_per_day} used)")
+    
+    if not eligible_miners:
+        logger.warning("No miners eligible for submission (all hit daily limits)")
+        return {}
+    
+    logger.info(f"Fetching /info from {len(eligible_miners)} eligible miners...")
+    
+    # fetch miner info concurrently
     miner_infos = {}
     timeout = aiohttp.ClientTimeout(total=config.miner_info_timeout_seconds)
     
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [
             fetch_miner_info(session, uid, miner, config.default_miner_port, config.miner_info_timeout_seconds)
-            for uid, miner in miners.items()
+            for uid, miner in eligible_miners.items()
         ]
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        for uid, result in zip(miners.keys(), results):
+        for uid, result in zip(eligible_miners.keys(), results):
             if isinstance(result, Exception):
                 logger.error(f"UID {uid}: Exception fetching info: {result}")
             elif result:
                 miner_infos[uid] = result
     
-    logger.info(f"Successfully fetched info from {len(miner_infos)}/{len(miners)} miners")
+    logger.info(f"Successfully fetched info from {len(miner_infos)}/{len(eligible_miners)} miners")
     
-    # step 2: submit jobs to sandbox runner
-    job_submissions = {}
+    # check submission history and decide what to evaluate
+    jobs_to_submit = {}
+    cached_results = {}
     
     for uid, info in miner_infos.items():
-        try:
-            miner = miners[uid]
+        miner = eligible_miners[uid]
+        hotkey = miner.get("hotkey")
+        
+        # check if identical solution already evaluated
+        history = await db.get_submission_history(
+            hotkey=hotkey,
+            repo_url=info["repo_url"],
+            repo_branch=info.get("repo_branch", "main"),
+            repo_commit=info.get("repo_commit"),
+            repo_path=info.get("repo_path", ""),
+            weight_class=info["weight_class"]
+        )
+        
+        if history:
+            # use cached metrics
+            logger.info(f"UID {uid} ({hotkey[:12]}...): Using cached metrics (evaluated {history['evaluation_count']} times)")
             
-            logger.info(f"UID {uid}: Submitting job to sandbox runner")
+            cached_results[uid] = {
+                "uid": uid,
+                "hotkey": hotkey,
+                "info": info,
+                "from_cache": True,
+                "exact_match_rate": float(history["exact_match_rate"]),
+                "partial_correctness_avg": float(history["partial_correctness_avg"]),
+                "grid_similarity_avg": float(history["grid_similarity_avg"]),
+                "efficiency_avg": float(history["efficiency_avg"]),
+                "overall_score": float(history["overall_score"]),
+                "last_evaluated_at": history["last_evaluated_at"]
+            }
+            
+            # record to query_results with from_cache=True
+            await db.record_query_result(
+                block=current_block,
+                uid=uid,
+                hotkey=hotkey,
+                success=True,
+                response={"cached": True, "history_id": history["id"]},
+                error=None,
+                response_time=0.0,
+                ts=datetime.now(timezone.utc).replace(tzinfo=None),
+                exact_match=history["exact_match_rate"] == 1.0,
+                partial_correctness=float(history["partial_correctness_avg"]),
+                grid_similarity=float(history["grid_similarity_avg"]),
+                efficiency_score=float(history["efficiency_avg"]),
+                repo_url=info["repo_url"],
+                repo_branch=info.get("repo_branch", "main"),
+                repo_commit=info.get("repo_commit"),
+                repo_path=info.get("repo_path", ""),
+                weight_class=info["weight_class"],
+                from_cache=True
+            )
+            
+            # increment daily submission count
+            await db.increment_daily_submissions(hotkey)
+            
+        else:
+            # new solution - needs evaluation
+            jobs_to_submit[uid] = {
+                "miner": miner,
+                "info": info
+            }
+    
+    logger.info(f"Results: {len(cached_results)} from cache, {len(jobs_to_submit)} need evaluation")
+    
+    if not jobs_to_submit:
+        logger.info("All submissions were cached - no sandbox jobs needed")
+        return cached_results
+    
+    # submit new jobs to sandbox runner
+    job_submissions = {}
+    
+    for uid, job_data in jobs_to_submit.items():
+        try:
+            miner = job_data["miner"]
+            info = job_data["info"]
+            hotkey = miner.get("hotkey")
+            
+            logger.info(f"UID {uid}: Submitting NEW solution to sandbox runner")
             logger.debug(f"  Repo: {info['repo_url']}")
             logger.debug(f"  Branch: {info.get('repo_branch', 'main')}")
             logger.debug(f"  Weight: {info['weight_class']}")
@@ -142,7 +238,7 @@ async def query_miners_via_sandbox(
                 repo_commit=info.get("repo_commit"),
                 repo_path=info.get("repo_path", ""),
                 weight_class=info["weight_class"],
-                miner_hotkey=miner.get("hotkey"),
+                miner_hotkey=hotkey,
                 validator_hotkey=config.hotkey,
                 priority=5,
                 use_vllm=info.get("use_vllm", False),
@@ -169,6 +265,7 @@ async def query_miners_via_sandbox(
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
+                hotkey=miner.get("hotkey"),
                 success=False,
                 response=None,
                 error=f"Sandbox job submission failed: {e}",
@@ -182,23 +279,24 @@ async def query_miners_via_sandbox(
             )
     
     if not job_submissions:
-        logger.warning("No jobs were successfully submitted to sandbox runner")
-        return {}
+        logger.info("No new jobs submitted (all failed)")
+        return cached_results
     
-    logger.info(f"Submitted {len(job_submissions)} jobs to sandbox runner")
+    logger.info(f"Submitted {len(job_submissions)} new jobs to sandbox runner")
     
-    # step 3: poll all jobs until completion
-    results = {}
+    # poll all jobs until completion
+    fresh_results = {}
     
     async def poll_and_record(uid: int, job_info: Dict):
         """Poll a single job and record results to database"""
         job_id = job_info["job_id"]
         miner = job_info["miner"]
+        info = job_info["info"]
+        hotkey = miner.get("hotkey")
         
         start_time = datetime.now(timezone.utc)
         
         def on_status_change(job_id, status, full_status):
-            """Log status changes"""
             progress = full_status.get("progress_percentage", 0)
             phase = full_status.get("current_phase", "unknown")
             logger.info(f"UID {uid} | Job {job_id} | {status} | {phase} | {progress:.1f}%")
@@ -214,46 +312,84 @@ async def query_miners_via_sandbox(
         end_time = datetime.now(timezone.utc)
         execution_time = (end_time - start_time).total_seconds()
         
-        # step 4: get metrics if job completed successfully
+        # get metrics if job completed successfully
         metrics_data = None
         if final_status.get("status") == "completed":
             metrics_data = await sandbox_client.get_job_metrics(job_id)
         
-        # step 5: record to database
+        # record to database
         if metrics_data and metrics_data.get("metrics"):
             metrics = metrics_data["metrics"]
+            
+            # calculate aggregate metrics for this job
+            exact_match = metrics.get("exact_match", False)
+            partial_correctness = metrics.get("partial_correctness", 0.0)
+            grid_similarity = metrics.get("grid_similarity", 0.0)
+            efficiency_score = metrics.get("efficiency_score", 0.0)
             
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
+                hotkey=hotkey,
                 success=True,
                 response={"job_id": job_id, "sandbox_status": "completed"},
                 error=None,
                 response_time=execution_time,
                 ts=datetime.now(timezone.utc).replace(tzinfo=None),
-                exact_match=metrics.get("exact_match", False),
-                partial_correctness=metrics.get("partial_correctness", 0.0),
-                grid_similarity=metrics.get("grid_similarity", 0.0),
-                efficiency_score=metrics.get("efficiency_score", 0.0),
+                exact_match=exact_match,
+                partial_correctness=partial_correctness,
+                grid_similarity=grid_similarity,
+                efficiency_score=efficiency_score,
                 problem_id=metrics.get("problem_id"),
                 base_task_num=metrics.get("base_task_num"),
                 chain_length=metrics.get("chain_length"),
                 transformation_chain=metrics.get("transformation_chain"),
-                num_train_examples=metrics.get("num_train_examples")
+                num_train_examples=metrics.get("num_train_examples"),
+                repo_url=info["repo_url"],
+                repo_branch=info.get("repo_branch", "main"),
+                repo_commit=info.get("repo_commit"),
+                repo_path=info.get("repo_path", ""),
+                weight_class=info["weight_class"],
+                from_cache=False
             )
+            
+            # save to submission history for future caching
+            await db.save_submission_history(
+                hotkey=hotkey,
+                repo_url=info["repo_url"],
+                repo_branch=info.get("repo_branch", "main"),
+                repo_commit=info.get("repo_commit"),
+                repo_path=info.get("repo_path", ""),
+                weight_class=info["weight_class"],
+                use_vllm=info.get("use_vllm", False),
+                vllm_config=info.get("vllm_config"),
+                exact_match_rate=1.0 if exact_match else 0.0,
+                partial_correctness_avg=partial_correctness,
+                grid_similarity_avg=grid_similarity,
+                efficiency_avg=efficiency_score,
+                overall_score=partial_correctness  # will be recalculated in scoring
+            )
+            
+            # increment daily submission count
+            await db.increment_daily_submissions(hotkey)
             
             logger.info(
                 f"UID {uid} | Job {job_id} completed | "
-                f"Exact: {metrics.get('exact_match')} | "
-                f"Partial: {metrics.get('partial_correctness', 0):.2f} | "
-                f"Similarity: {metrics.get('grid_similarity', 0):.2f} | "
+                f"Exact: {exact_match} | "
+                f"Partial: {partial_correctness:.2f} | "
+                f"Similarity: {grid_similarity:.2f} | "
                 f"Time: {execution_time:.1f}s"
             )
             
-            results[uid] = {
+            fresh_results[uid] = {
                 "uid": uid,
+                "hotkey": hotkey,
                 "success": True,
-                "metrics": metrics,
+                "from_cache": False,
+                "exact_match_rate": 1.0 if exact_match else 0.0,
+                "partial_correctness_avg": partial_correctness,
+                "grid_similarity_avg": grid_similarity,
+                "efficiency_avg": efficiency_score,
                 "execution_time": execution_time,
                 "job_id": job_id
             }
@@ -269,10 +405,10 @@ async def query_miners_via_sandbox(
                         "job_id": job_id,
                         "execution_time": execution_time,
                         "metrics": {
-                            "exact_match": metrics.get("exact_match"),
-                            "partial_correctness": metrics.get("partial_correctness"),
-                            "grid_similarity": metrics.get("grid_similarity"),
-                            "efficiency_score": metrics.get("efficiency_score"),
+                            "exact_match": exact_match,
+                            "partial_correctness": partial_correctness,
+                            "grid_similarity": grid_similarity,
+                            "efficiency_score": efficiency_score,
                         }
                     }
                 )
@@ -286,6 +422,7 @@ async def query_miners_via_sandbox(
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
+                hotkey=hotkey,
                 success=False,
                 response=None,
                 error=error_msg,
@@ -295,13 +432,20 @@ async def query_miners_via_sandbox(
                 partial_correctness=0.0,
                 grid_similarity=0.0,
                 efficiency_score=0.0,
-                problem_id=None
+                problem_id=None,
+                repo_url=info["repo_url"],
+                repo_branch=info.get("repo_branch", "main"),
+                repo_commit=info.get("repo_commit"),
+                repo_path=info.get("repo_path", ""),
+                weight_class=info["weight_class"],
+                from_cache=False
             )
             
             logger.error(f"UID {uid} | Job {job_id} failed: {error_msg}")
             
-            results[uid] = {
+            fresh_results[uid] = {
                 "uid": uid,
+                "hotkey": hotkey,
                 "success": False,
                 "error": error_msg,
                 "job_id": job_id
@@ -317,10 +461,16 @@ async def query_miners_via_sandbox(
     
     await asyncio.gather(*tasks, return_exceptions=True)
     
+    # combine cached and fresh results
+    all_results = {**cached_results, **fresh_results}
+    
     # log summary
-    successful = sum(1 for r in results.values() if r.get("success"))
-    failed = len(results) - successful
+    successful_fresh = sum(1 for r in fresh_results.values() if r.get("success"))
+    failed_fresh = len(fresh_results) - successful_fresh
     
-    logger.info(f"Sandbox runner cycle complete: {successful} successful, {failed} failed")
+    logger.info(f"Sandbox runner cycle complete:")
+    logger.info(f"  Cached: {len(cached_results)}")
+    logger.info(f"  Fresh successful: {successful_fresh}")
+    logger.info(f"  Fresh failed: {failed_fresh}")
     
-    return results
+    return all_results

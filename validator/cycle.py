@@ -5,14 +5,16 @@ from datetime import datetime, timezone
 
 async def run_query_cycle(validator, state):
     """
-    Run query cycle via sandbox runner
+    Run query cycle via sandbox runner with submission history and daily limits
     
     New flow:
     1. Discover miners from chain
-    2. Fetch /info from each miner
-    3. Submit jobs to sandbox runner
-    4. Poll for completion (up to 3 hours)
-    5. Save metrics to database
+    2. Check daily submission limits
+    3. Fetch /info from eligible miners
+    4. Check submission history to avoid re-evaluation
+    5. Submit new jobs to sandbox runner OR use cached metrics
+    6. Poll for completion
+    7. Save metrics to database and update submission history
     """
     
     # publish validator heartbeat
@@ -70,12 +72,7 @@ async def run_query_cycle(validator, state):
     
     logger.info(f"Discovered and persisted {len(miners)} miners")
     
-    # query miners via sandbox runner
-    # this will:
-    # 1. fetch /info from each miner
-    # 2. submit jobs to sandbox runner
-    # 3. poll until completion
-    # 4. save metrics to database
+    # query miners via sandbox runner (with submission history and daily limits)
     await query.query_miners_via_sandbox(
         validator.chain,
         validator.db,
@@ -97,10 +94,14 @@ async def run_query_cycle(validator, state):
 
 async def run_weights_cycle(validator, state):
     """
-    Set weights based on accumulated scores from database
+    Set weights based on top 5 miners from leaderboard with exponential distribution
     
-    This remains unchanged - scoring logic stays the same,
-    it just reads from metrics stored by sandbox runner jobs
+    NEW MECHANISM:
+    1. Calculate aggregate metrics for all registered miners
+    2. Filter by minimum accuracy floor (default 20%)
+    3. Update leaderboard with top performers
+    4. Apply exponential distribution to top 5 miners
+    5. Burn 100% if no miners meet floor
     """
     current_block = validator.get_current_block()
     
@@ -113,14 +114,22 @@ async def run_weights_cycle(validator, state):
     logger.info(f"Starting weights cycle at block {current_block}")
     logger.info(f"=" * 80)
     
-    # calculate scores from recent query results
-    scores = await scoring.calculate_scores(validator.db, validator.config)
+    # get current registered miners
+    miners = await discovery.discover_miners(validator.chain)
+    
+    # calculate scores and update leaderboard
+    scores, hotkey_map = await scoring.calculate_scores_and_update_leaderboard(
+        validator.db, 
+        validator.config,
+        miners
+    )
 
     if scores:
-        logger.info(f"Calculated scores for {len(scores)} miners")
+        logger.info(f"Calculated weights for {len(scores)} top miners")
         await scoring.set_weights(validator.chain, validator.config, scores)
     else:
-        logger.warning("No scores calculated - insufficient data or no miners")
+        logger.warning("No miners meet minimum requirements - burning 100%")
+        await scoring.set_weights(validator.chain, validator.config, {})
     
     state['last_weights_block'] = current_block
     logger.info(f"Weights cycle complete")
@@ -129,10 +138,12 @@ async def run_weights_cycle(validator, state):
 async def run_continuous(validator, stop_event: asyncio.Event = None):
     """
     Main loop that runs query and weights cycles continuously
-    
-    This remains largely unchanged - just runs the cycles
     """
     logger.info("Starting continuous validator loop")
+    logger.info(f"Config:")
+    logger.info(f"  Max submissions per day: {validator.config.max_submissions_per_day}")
+    logger.info(f"  Min accuracy floor: {validator.config.min_accuracy_floor * 100:.1f}%")
+    logger.info(f"  Top miners count: {validator.config.top_miners_count}")
     
     while True:
         if stop_event and stop_event.is_set():
@@ -140,10 +151,10 @@ async def run_continuous(validator, stop_event: asyncio.Event = None):
             break
         
         try:
-            # run query cycle (miners via sandbox runner)
+            # run query cycle (miners via sandbox runner with history/limits)
             await run_query_cycle(validator, validator.state)
             
-            # run weights cycle (calculate and set weights)
+            # run weights cycle (exponential distribution for top 5)
             await run_weights_cycle(validator, validator.state)
             
             logger.info(f"Completed cycle {validator.state['cycle_count']}, waiting before next cycle...")
