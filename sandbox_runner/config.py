@@ -283,10 +283,6 @@ def _validate_config(config: Config):
     
     if config.execution.log_retention_hours < 0:
         raise ValueError(f"Log retention must be at least 0 hours, got {config.execution.log_retention_hours}")
-    
-    if not config.api.require_epistula and not config.api.require_api_key:
-        raise ValueError("At least one authentication method must be enabled")
-
 
 def generate_default_config(output_path: Path):
     """
