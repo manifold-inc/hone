@@ -4,8 +4,8 @@ Enhanced Sandbox Runner Dashboard using Gradio
 
 Features:
 - Real-time job monitoring with proper error handling
-- Failed jobs tracking with logs persistence
-- Success jobs metrics page
+- Failed jobs tracking via API
+- Success jobs metrics page via API
 - Disk space monitoring
 - Interactive gauges and visualizations
 """
@@ -21,7 +21,6 @@ import shutil
 from pathlib import Path
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-import functools
 
 # ============================================================
 # Configuration
@@ -30,21 +29,12 @@ import functools
 API_BASE_URL = "http://localhost:8080"
 API_KEY = "dev-key-12345"
 
-# Local storage for failed jobs
-FAILED_JOBS_DIR = Path("/tmp/sandbox_failed_jobs")
-SUCCESS_JOBS_DIR = Path("/tmp/sandbox_success_jobs")
-FAILED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-SUCCESS_JOBS_DIR.mkdir(parents=True, exist_ok=True)
-
-MAX_DISK_USAGE_PERCENT = 50.0
-
 # Cache for reducing API calls
 _status_cache = {"data": None, "timestamp": 0.0}
 _CACHE_TTL = 1.0
 
 # Async HTTP client with aggressive timeouts
 _async_client: Optional[httpx.AsyncClient] = None
-_client_lock = asyncio.Lock()
 
 # Thread pool for running async operations
 _executor = ThreadPoolExecutor(max_workers=10)
@@ -57,7 +47,7 @@ def get_async_client() -> httpx.AsyncClient:
         _async_client = httpx.AsyncClient(
             base_url=API_BASE_URL,
             headers={"X-API-Key": API_KEY},
-            timeout=httpx.Timeout(5.0, connect=2.0),  # aggressive timeouts
+            timeout=httpx.Timeout(5.0, connect=2.0),
             limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
     return _async_client
@@ -78,15 +68,20 @@ def run_async(coro):
 # ============================================================
 
 def get_disk_usage() -> Dict:
-    """Get disk usage statistics"""
+    """Get disk usage statistics for /app/data"""
     try:
-        total, used, free = shutil.disk_usage("/tmp")
+        data_path = Path("/app/data")
+        if not data_path.exists():
+            data_path = Path("/tmp")
+        
+        total, used, free = shutil.disk_usage(str(data_path))
         
         return {
             "total_gb": total / (1024**3),
             "used_gb": used / (1024**3),
             "free_gb": free / (1024**3),
-            "used_percent": (used / total) * 100
+            "used_percent": (used / total) * 100,
+            "path": str(data_path)
         }
     except Exception as e:
         print(f"Error getting disk usage: {e}")
@@ -94,119 +89,9 @@ def get_disk_usage() -> Dict:
             "total_gb": 0,
             "used_gb": 0,
             "free_gb": 0,
-            "used_percent": 0
+            "used_percent": 0,
+            "path": "unknown"
         }
-
-
-def cleanup_old_jobs_if_needed():
-    """Remove oldest job logs if disk usage exceeds threshold"""
-    disk = get_disk_usage()
-    
-    if disk["used_percent"] < MAX_DISK_USAGE_PERCENT:
-        return
-    
-    print(f"Disk usage at {disk['used_percent']:.1f}%, cleaning up old jobs...")
-    
-    # cleanup failed jobs first
-    failed_jobs = sorted(FAILED_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-    
-    removed_count = 0
-    for job_file in failed_jobs[:len(failed_jobs)//4]:  # remove oldest 25%
-        try:
-            job_file.unlink()
-            removed_count += 1
-        except Exception as e:
-            print(f"Error removing {job_file}: {e}")
-    
-    # cleanup success jobs if still needed
-    disk = get_disk_usage()
-    if disk["used_percent"] >= MAX_DISK_USAGE_PERCENT:
-        success_jobs = sorted(SUCCESS_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
-        
-        for job_file in success_jobs[:len(success_jobs)//4]:
-            try:
-                job_file.unlink()
-                removed_count += 1
-            except Exception as e:
-                print(f"Error removing {job_file}: {e}")
-    
-    print(f"Cleaned up {removed_count} old job files")
-
-
-# ============================================================
-# Job Persistence
-# ============================================================
-
-def save_failed_job(job_id: str, job_data: Dict, logs: str):
-    """Save failed job with logs to disk"""
-    try:
-        cleanup_old_jobs_if_needed()
-        
-        job_file = FAILED_JOBS_DIR / f"{job_id}.json"
-        
-        data = {
-            "job_id": job_id,
-            "saved_at": datetime.now().isoformat(),
-            "job_data": job_data,
-            "logs": logs
-        }
-        
-        with open(job_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"Saved failed job: {job_id}")
-    except Exception as e:
-        print(f"Error saving failed job {job_id}: {e}")
-
-
-def save_success_job(job_id: str, job_data: Dict, metrics: Dict):
-    """Save successful job with metrics"""
-    try:
-        cleanup_old_jobs_if_needed()
-        
-        job_file = SUCCESS_JOBS_DIR / f"{job_id}.json"
-        
-        data = {
-            "job_id": job_id,
-            "saved_at": datetime.now().isoformat(),
-            "job_data": job_data,
-            "metrics": metrics
-        }
-        
-        with open(job_file, 'w') as f:
-            json.dump(data, f, indent=2)
-        
-        print(f"Saved success job: {job_id}")
-    except Exception as e:
-        print(f"Error saving success job {job_id}: {e}")
-
-
-def load_failed_jobs() -> List[Dict]:
-    """Load all failed jobs from disk"""
-    jobs = []
-    
-    for job_file in sorted(FAILED_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            with open(job_file, 'r') as f:
-                jobs.append(json.load(f))
-        except Exception as e:
-            print(f"Error loading {job_file}: {e}")
-    
-    return jobs
-
-
-def load_success_jobs() -> List[Dict]:
-    """Load all success jobs from disk"""
-    jobs = []
-    
-    for job_file in sorted(SUCCESS_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
-        try:
-            with open(job_file, 'r') as f:
-                jobs.append(json.load(f))
-        except Exception as e:
-            print(f"Error loading {job_file}: {e}")
-    
-    return jobs
 
 
 # ============================================================
@@ -270,13 +155,12 @@ async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], Li
         client = get_async_client()
         table_data: List[List[str]] = []
 
-        # fetch all jobs concurrently with timeout
         tasks = [fetch_job_details_async(client, job_id) for job_id in active_job_ids]
         
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=8.0  # overall timeout for all jobs
+                timeout=8.0
             )
         except asyncio.TimeoutError:
             print("Timeout fetching job details, using partial results")
@@ -325,11 +209,6 @@ async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], Li
                     ]
                 )
                 
-                # check if job is completed/failed and save it (non-blocking)
-                job_status = job.get("status", "").lower()
-                if job_status in ["completed", "failed", "timeout", "cancelled"]:
-                    asyncio.create_task(save_completed_job_async(client, job_id, job, job_status))
-                
             except Exception as e:
                 print(f"Error processing job {job_id}: {e}")
                 continue
@@ -343,45 +222,6 @@ async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], Li
 def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
     """Synchronous wrapper"""
     return run_async(get_active_jobs_table_async(status))
-
-
-async def save_completed_job_async(client: httpx.AsyncClient, job_id: str, job: Dict, job_status: str):
-    """Save completed job asynchronously without blocking"""
-    try:
-        if job_status == "completed":
-            # try to get metrics
-            try:
-                metrics_resp = await asyncio.wait_for(
-                    client.get(f"/v1/jobs/{job_id}/metrics"),
-                    timeout=3.0
-                )
-                if metrics_resp.status_code == 200:
-                    metrics = metrics_resp.json().get("metrics", {})
-                    save_success_job(job_id, job, metrics)
-            except asyncio.TimeoutError:
-                print(f"Timeout fetching metrics for {job_id}")
-            except Exception as e:
-                print(f"Could not fetch metrics for {job_id}: {e}")
-        else:
-            # failed job - try to get logs
-            try:
-                logs_resp = await asyncio.wait_for(
-                    client.get(f"/v1/logs/{job_id}/all"),
-                    timeout=3.0
-                )
-                if logs_resp.status_code == 200:
-                    logs_data = logs_resp.json()
-                    logs = "\n".join([
-                        f"[{entry.get('timestamp')}] [{entry.get('phase')}] {entry.get('message')}"
-                        for entry in logs_data.get("entries", [])
-                    ])
-                    save_failed_job(job_id, job, logs)
-            except asyncio.TimeoutError:
-                print(f"Timeout fetching logs for {job_id}")
-            except Exception as e:
-                print(f"Could not fetch logs for {job_id}: {e}")
-    except Exception as e:
-        print(f"Error saving completed job {job_id}: {e}")
 
 
 async def get_job_logs_tail_async(job_id: str, lines: int = 100, phase_filter: str = "all") -> str:
@@ -462,7 +302,6 @@ async def get_all_active_logs_async(
     out.append("=" * 100)
     out.append("")
 
-    # fetch logs concurrently
     tasks = [get_job_logs_tail_async(job_id, lines=60, phase_filter=phase_filter) 
              for job_id in selected_job_ids]
     
@@ -493,6 +332,56 @@ def get_all_active_logs(
 ) -> str:
     """Synchronous wrapper"""
     return run_async(get_all_active_logs_async(selected_job_ids, phase_filter))
+
+
+# ============================================================
+# Completed Jobs API Functions
+# ============================================================
+
+async def fetch_completed_jobs_async(limit: int = 50, offset: int = 0) -> Dict:
+    """Fetch completed jobs from API"""
+    try:
+        client = get_async_client()
+        resp = await asyncio.wait_for(
+            client.get(f"/v1/dashboard/jobs/completed", params={"limit": limit, "offset": offset}),
+            timeout=5.0
+        )
+        
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            print(f"Failed to fetch completed jobs: {resp.status_code}")
+            return {"jobs": [], "total": 0}
+    except Exception as e:
+        print(f"Error fetching completed jobs: {e}")
+        return {"jobs": [], "total": 0}
+
+
+def fetch_completed_jobs(limit: int = 50, offset: int = 0) -> Dict:
+    """Synchronous wrapper"""
+    return run_async(fetch_completed_jobs_async(limit, offset))
+
+
+async def fetch_job_results_async(job_id: str) -> Optional[Dict]:
+    """Fetch detailed results for a job"""
+    try:
+        client = get_async_client()
+        resp = await asyncio.wait_for(
+            client.get(f"/v1/jobs/{job_id}/results"),
+            timeout=3.0
+        )
+        
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except Exception as e:
+        print(f"Error fetching results for {job_id}: {e}")
+        return None
+
+
+def fetch_job_results(job_id: str) -> Optional[Dict]:
+    """Synchronous wrapper"""
+    return run_async(fetch_job_results_async(job_id))
 
 
 # ============================================================
@@ -590,7 +479,7 @@ def create_disk_usage_gauge() -> go.Figure:
             value=disk["used_percent"],
             domain={"x": [0, 1], "y": [0, 1]},
             title={
-                "text": f"Disk Usage<br><sub>{disk['free_gb']:.1f} GB free</sub>",
+                "text": f"Disk Usage ({disk['path']})<br><sub>{disk['free_gb']:.1f} GB free</sub>",
                 "font": {"size": 16},
             },
             number={"suffix": "%", "font": {"size": 22}},
@@ -752,27 +641,41 @@ def refresh_all(phase_filter: str, job_id_filter: str = ""):
 
 
 def refresh_failed_jobs():
-    """Refresh failed jobs page"""
-    failed_jobs = load_failed_jobs()
-    
-    if not failed_jobs:
-        return [], "No failed jobs recorded", create_disk_usage_gauge()
-    
-    table_data = []
-    for job in failed_jobs:
-        job_data = job.get("job_data", {})
-        table_data.append([
-            job.get("job_id", "unknown"),
-            job.get("saved_at", "unknown"),
-            job_data.get("status", "unknown"),
-            job_data.get("current_phase", "unknown"),
-            (job_data.get("miner_hotkey", "") or "")[:12] + "...",
-            job_data.get("error_message", "")[:50] + "..." if job_data.get("error_message") else "N/A"
-        ])
-    
-    summary = f"Total failed jobs: {len(failed_jobs)}"
-    
-    return table_data, summary, create_disk_usage_gauge()
+    """Refresh failed jobs page using API"""
+    try:
+        completed_data = fetch_completed_jobs(limit=100, offset=0)
+        all_jobs = completed_data.get("jobs", [])
+        
+        failed_jobs = [job for job in all_jobs if job.get("status") in ["failed", "timeout", "cancelled"]]
+        
+        if not failed_jobs:
+            return [], "No failed jobs found", create_disk_usage_gauge()
+        
+        table_data = []
+        for job in failed_jobs:
+            completed_at = job.get("completed_at", "unknown")
+            if completed_at and completed_at != "unknown":
+                try:
+                    dt = datetime.fromisoformat(completed_at)
+                    completed_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+            
+            table_data.append([
+                job.get("job_id", "unknown"),
+                completed_at,
+                job.get("status", "unknown"),
+                (job.get("miner_hotkey", "") or "")[:12] + "...",
+                job.get("error_message", "N/A")[:80] + "..." if job.get("error_message") else "N/A"
+            ])
+        
+        summary = f"Total failed jobs: {len(failed_jobs)}"
+        
+        return table_data, summary, create_disk_usage_gauge()
+        
+    except Exception as e:
+        print(f"Error refreshing failed jobs: {e}")
+        return [], f"Error loading failed jobs: {e}", create_disk_usage_gauge()
 
 
 def get_failed_job_logs(evt: gr.SelectData, table_data):
@@ -785,62 +688,86 @@ def get_failed_job_logs(evt: gr.SelectData, table_data):
         else:
             return "Error loading logs"
         
-        job_file = FAILED_JOBS_DIR / f"{job_id}.json"
-        if not job_file.exists():
-            return f"Logs not found for job {job_id}"
+        logs = get_job_logs_tail(job_id, lines=500, phase_filter="all")
         
-        with open(job_file, 'r') as f:
-            job_data = json.load(f)
+        results = fetch_job_results(job_id)
         
-        logs = job_data.get("logs", "No logs available")
-        return f"=== LOGS FOR {job_id} ===\n\n{logs}"
+        output = f"{'='*80}\n"
+        output += f"LOGS FOR JOB: {job_id}\n"
+        output += f"{'='*80}\n\n"
+        
+        if results:
+            output += f"Status: {results.get('status', 'unknown')}\n"
+            output += f"Miner: {results.get('miner_hotkey', 'unknown')}\n"
+            if results.get("completed_at"):
+                output += f"Completed: {results.get('completed_at')}\n"
+            if results.get("execution_time"):
+                output += f"Execution Time: {results.get('execution_time'):.1f}s\n"
+            if results.get("error_message"):
+                output += f"\nError: {results.get('error_message')}\n"
+            output += f"\n{'-'*80}\n\n"
+        
+        output += logs
+        
+        return output
         
     except Exception as e:
         return f"Error loading logs: {e}"
 
 
 def refresh_success_jobs():
-    """Refresh success jobs page"""
-    success_jobs = load_success_jobs()
-    
-    if not success_jobs:
-        return [], "No successful jobs recorded", create_disk_usage_gauge()
-    
-    table_data = []
-    for job in success_jobs:
-        job_data = job.get("job_data", {})
-        metrics = job.get("metrics", {})
+    """Refresh success jobs page using API"""
+    try:
+        completed_data = fetch_completed_jobs(limit=100, offset=0)
+        all_jobs = completed_data.get("jobs", [])
         
-        # calculate execution time
-        started_at = job_data.get("started_at")
-        completed_at = job_data.get("completed_at")
-        exec_time = "N/A"
-        if started_at and completed_at:
-            try:
-                start_dt = datetime.fromisoformat(started_at)
-                end_dt = datetime.fromisoformat(completed_at)
-                exec_time = f"{(end_dt - start_dt).total_seconds():.1f}s"
-            except:
-                pass
+        success_jobs = [job for job in all_jobs if job.get("status") == "completed"]
         
-        exact_match = metrics.get("exact_match", False)
-        partial = metrics.get("partial_correctness", 0.0)
-        similarity = metrics.get("grid_similarity", 0.0)
+        if not success_jobs:
+            return [], "No successful jobs found", create_disk_usage_gauge()
         
-        table_data.append([
-            job.get("job_id", "unknown"),
-            job.get("saved_at", "unknown"),
-            (job_data.get("miner_hotkey", "") or "")[:12] + "...",
-            job_data.get("weight_class", "unknown"),
-            exec_time,
-            "✅" if exact_match else "❌",
-            f"{partial:.3f}",
-            f"{similarity:.3f}"
-        ])
-    
-    summary = f"Total successful jobs: {len(success_jobs)}"
-    
-    return table_data, summary, create_disk_usage_gauge()
+        table_data = []
+        for job in success_jobs:
+            completed_at = job.get("completed_at", "unknown")
+            if completed_at and completed_at != "unknown":
+                try:
+                    dt = datetime.fromisoformat(completed_at)
+                    completed_at = dt.strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+            
+            exec_time = job.get("execution_time", 0)
+            exec_time_str = f"{exec_time:.1f}s" if exec_time else "N/A"
+            
+            has_metrics = job.get("has_metrics", False)
+            metrics = job.get("metrics", {})
+            
+            if has_metrics and metrics:
+                exact_match = "✅" if metrics.get("exact_match", False) else "❌"
+                partial = f"{metrics.get('partial_correctness', 0.0):.3f}"
+                similarity = f"{metrics.get('grid_similarity', 0.0):.3f}"
+            else:
+                exact_match = "N/A"
+                partial = "N/A"
+                similarity = "N/A"
+            
+            table_data.append([
+                job.get("job_id", "unknown"),
+                completed_at,
+                (job.get("miner_hotkey", "") or "")[:12] + "...",
+                exec_time_str,
+                exact_match,
+                partial,
+                similarity
+            ])
+        
+        summary = f"Total successful jobs: {len(success_jobs)}"
+        
+        return table_data, summary, create_disk_usage_gauge()
+        
+    except Exception as e:
+        print(f"Error refreshing success jobs: {e}")
+        return [], f"Error loading success jobs: {e}", create_disk_usage_gauge()
 
 
 def get_success_job_details(evt: gr.SelectData, table_data):
@@ -853,34 +780,62 @@ def get_success_job_details(evt: gr.SelectData, table_data):
         else:
             return "Error loading details"
         
-        job_file = SUCCESS_JOBS_DIR / f"{job_id}.json"
-        if not job_file.exists():
-            return f"Details not found for job {job_id}"
+        results = fetch_job_results(job_id)
         
-        with open(job_file, 'r') as f:
-            job_data = json.load(f)
+        if not results:
+            return f"No results found for job {job_id}"
         
-        metrics = job_data.get("metrics", {})
-        job_info = job_data.get("job_data", {})
+        details = f"{'='*80}\n"
+        details += f"JOB DETAILS: {job_id}\n"
+        details += f"{'='*80}\n\n"
         
-        details = f"=== JOB DETAILS: {job_id} ===\n\n"
-        details += f"Miner Hotkey: {job_info.get('miner_hotkey', 'N/A')}\n"
-        details += f"Weight Class: {job_info.get('weight_class', 'N/A')}\n"
-        details += f"Started: {job_info.get('started_at', 'N/A')}\n"
-        details += f"Completed: {job_info.get('completed_at', 'N/A')}\n\n"
+        details += f"Status: {results.get('status', 'unknown')}\n"
+        details += f"Miner Hotkey: {results.get('miner_hotkey', 'N/A')}\n"
         
-        details += "=== METRICS ===\n\n"
-        details += f"Exact Match: {'✅ Yes' if metrics.get('exact_match') else '❌ No'}\n"
-        details += f"Partial Correctness: {metrics.get('partial_correctness', 0.0):.4f}\n"
-        details += f"Grid Similarity: {metrics.get('grid_similarity', 0.0):.4f}\n"
-        details += f"Efficiency Score: {metrics.get('efficiency_score', 0.0):.4f}\n\n"
+        if results.get("completed_at"):
+            details += f"Completed: {results.get('completed_at')}\n"
         
-        if metrics.get("problem_id"):
-            details += f"Problem ID: {metrics.get('problem_id')}\n"
-        if metrics.get("base_task_num"):
-            details += f"Base Task: {metrics.get('base_task_num')}\n"
-        if metrics.get("chain_length"):
-            details += f"Chain Length: {metrics.get('chain_length')}\n"
+        if results.get("execution_time"):
+            details += f"Execution Time: {results.get('execution_time'):.2f}s\n"
+        
+        details += f"\n{'-'*80}\n"
+        details += "METRICS\n"
+        details += f"{'-'*80}\n\n"
+        
+        metrics = results.get("metrics", {})
+        if metrics:
+            aggregate = metrics.get("aggregate", {})
+            
+            details += f"Total Problems: {aggregate.get('total_problems', 0)}\n"
+            details += f"Solved: {aggregate.get('num_solved', 0)}\n"
+            details += f"Exact Matches: {aggregate.get('num_exact_matches', 0)}\n"
+            details += f"Success Rate: {aggregate.get('success_rate', 0.0):.4f}\n"
+            details += f"Exact Match Rate: {aggregate.get('exact_match_rate', 0.0):.4f}\n"
+            details += f"Avg Partial Correctness: {aggregate.get('avg_partial_correctness', 0.0):.4f}\n"
+            details += f"Avg Grid Similarity: {aggregate.get('avg_grid_similarity', 0.0):.4f}\n"
+            details += f"Shape Match Rate: {aggregate.get('shape_match_rate', 0.0):.4f}\n"
+            
+            per_problem = metrics.get("per_problem", [])
+            if per_problem:
+                details += f"\n{'-'*80}\n"
+                details += "PER-PROBLEM BREAKDOWN\n"
+                details += f"{'-'*80}\n\n"
+                
+                for i, prob in enumerate(per_problem[:10], 1):
+                    details += f"Problem {i}:\n"
+                    details += f"  Exact Match: {'✅ Yes' if prob.get('exact_match') else '❌ No'}\n"
+                    details += f"  Partial Correctness: {prob.get('partial_correctness', 0.0):.4f}\n"
+                    details += f"  Grid Similarity: {prob.get('grid_similarity', 0.0):.4f}\n"
+                    if prob.get('metadata'):
+                        meta = prob['metadata']
+                        if meta.get('problem_id'):
+                            details += f"  Problem ID: {meta['problem_id']}\n"
+                    details += "\n"
+                
+                if len(per_problem) > 10:
+                    details += f"... and {len(per_problem) - 10} more problems\n"
+        else:
+            details += "No metrics available\n"
         
         return details
         
@@ -1032,6 +987,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
         # ===== TAB 2: FAILED JOBS =====
         with gr.Tab("❌ Failed Jobs"):
             gr.Markdown("### Failed Jobs History")
+            gr.Markdown("*Jobs that failed, timed out, or were cancelled*")
             
             with gr.Row():
                 failed_refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
@@ -1044,9 +1000,8 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             failed_jobs_table = gr.Dataframe(
                 headers=[
                     "Job ID",
-                    "Saved At",
+                    "Completed At",
                     "Status",
-                    "Phase",
                     "Miner",
                     "Error"
                 ],
@@ -1055,7 +1010,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
                 wrap=True,
             )
             
-            gr.Markdown("### 📜 Job Logs")
+            gr.Markdown("### 📜 Job Logs & Details")
             gr.Markdown("*Click a row above to view logs*")
             
             failed_logs_output = gr.Textbox(
@@ -1070,6 +1025,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
         # ===== TAB 3: SUCCESS JOBS =====
         with gr.Tab("✅ Success Jobs"):
             gr.Markdown("### Successful Jobs History")
+            gr.Markdown("*Jobs that completed successfully with metrics*")
             
             with gr.Row():
                 success_refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
@@ -1082,9 +1038,8 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             success_jobs_table = gr.Dataframe(
                 headers=[
                     "Job ID",
-                    "Saved At",
+                    "Completed At",
                     "Miner",
-                    "Weight",
                     "Exec Time",
                     "Exact Match",
                     "Partial",
@@ -1095,8 +1050,8 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
                 wrap=True,
             )
             
-            gr.Markdown("### 📊 Job Details")
-            gr.Markdown("*Click a row above to view metrics*")
+            gr.Markdown("### 📊 Job Metrics & Details")
+            gr.Markdown("*Click a row above to view detailed metrics*")
             
             success_details_output = gr.Textbox(
                 label="",

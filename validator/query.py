@@ -312,14 +312,16 @@ async def query_miners_via_sandbox(
         metrics_data = None
         if final_status.get("status") == "completed":
             metrics_data = await sandbox_client.get_job_metrics(job_id)
-        
+
         if metrics_data and metrics_data.get("metrics"):
-            metrics = metrics_data["metrics"]
+            # metrics_data now contains the full response with aggregate metrics
+            aggregate = metrics_data["metrics"].get("aggregate", {})
             
-            exact_match = metrics.get("exact_match", False)
-            partial_correctness = metrics.get("partial_correctness", 0.0)
-            grid_similarity = metrics.get("grid_similarity", 0.0)
-            efficiency_score = metrics.get("efficiency_score", 0.0)
+            # use aggregate metrics from sandbox runner
+            exact_match_rate = aggregate.get("exact_match_rate", 0.0)
+            partial_correctness = aggregate.get("avg_partial_correctness", 0.0)
+            grid_similarity = aggregate.get("avg_grid_similarity", 0.0)
+            efficiency_score = aggregate.get("success_rate", 0.0) # for now - TODO: change to gpu usage & total time 
             
             await db.record_query_result(
                 block=current_block,
@@ -330,15 +332,15 @@ async def query_miners_via_sandbox(
                 error=None,
                 response_time=execution_time,
                 ts=datetime.now(timezone.utc).replace(tzinfo=None),
-                exact_match=exact_match,
+                exact_match=(exact_match_rate == 1.0),
                 partial_correctness=partial_correctness,
                 grid_similarity=grid_similarity,
                 efficiency_score=efficiency_score,
-                problem_id=metrics.get("problem_id"),
-                base_task_num=metrics.get("base_task_num"),
-                chain_length=metrics.get("chain_length"),
-                transformation_chain=metrics.get("transformation_chain"),
-                num_train_examples=metrics.get("num_train_examples"),
+                problem_id=None,  # no longer per-problem
+                base_task_num=None,  # no longer per-problem
+                chain_length=None,  # no longer per-problem
+                transformation_chain=None,  # no longer per-problem
+                num_train_examples=aggregate.get("total_problems", 0),
                 repo_url=info["repo_url"],
                 repo_branch=info.get("repo_branch", "main"),
                 repo_commit=info.get("repo_commit"),
@@ -346,7 +348,7 @@ async def query_miners_via_sandbox(
                 weight_class=info["weight_class"],
                 from_cache=False
             )
-            
+
             await db.save_submission_history(
                 hotkey=hotkey,
                 repo_url=info["repo_url"],
@@ -356,36 +358,36 @@ async def query_miners_via_sandbox(
                 weight_class=info["weight_class"],
                 use_vllm=info.get("use_vllm", False),
                 vllm_config=info.get("vllm_config"),
-                exact_match_rate=1.0 if exact_match else 0.0,
+                exact_match_rate=exact_match_rate,
                 partial_correctness_avg=partial_correctness,
                 grid_similarity_avg=grid_similarity,
                 efficiency_avg=efficiency_score,
-                overall_score=partial_correctness
+                overall_score=partial_correctness  # you may want to calculate this differently
             )
             
             await db.increment_daily_submissions(hotkey)
             
             logger.info(
                 f"UID {uid} | Job {job_id} completed | "
-                f"Exact: {exact_match} | "
+                f"Exact: {exact_match_rate:.2%} | "
                 f"Partial: {partial_correctness:.2f} | "
                 f"Similarity: {grid_similarity:.2f} | "
                 f"Time: {execution_time:.1f}s"
             )
-            
+
             fresh_results[uid] = {
                 "uid": uid,
                 "hotkey": hotkey,
                 "success": True,
                 "from_cache": False,
-                "exact_match_rate": 1.0 if exact_match else 0.0,
+                "exact_match_rate": exact_match_rate,
                 "partial_correctness_avg": partial_correctness,
                 "grid_similarity_avg": grid_similarity,
                 "efficiency_avg": efficiency_score,
                 "execution_time": execution_time,
                 "job_id": job_id
             }
-            
+
             try:
                 telemetry_client.publish(
                     "/validator/sandbox_job_completed",
@@ -396,7 +398,7 @@ async def query_miners_via_sandbox(
                         "job_id": job_id,
                         "execution_time": execution_time,
                         "metrics": {
-                            "exact_match": exact_match,
+                            "exact_match_rate": exact_match_rate,
                             "partial_correctness": partial_correctness,
                             "grid_similarity": grid_similarity,
                             "efficiency_score": efficiency_score,
