@@ -19,7 +19,9 @@ import plotly.graph_objects as go
 import json
 import shutil
 from pathlib import Path
-import threading
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import functools
 
 # ============================================================
 # Configuration
@@ -40,19 +42,35 @@ MAX_DISK_USAGE_PERCENT = 50.0
 _status_cache = {"data": None, "timestamp": 0.0}
 _CACHE_TTL = 1.0
 
-_client: Optional[httpx.Client] = None
+# Async HTTP client with aggressive timeouts
+_async_client: Optional[httpx.AsyncClient] = None
+_client_lock = asyncio.Lock()
+
+# Thread pool for running async operations
+_executor = ThreadPoolExecutor(max_workers=10)
 
 
-def get_client() -> httpx.Client:
-    """Get a shared HTTP client with proper headers."""
-    global _client
-    if _client is None:
-        _client = httpx.Client(
+def get_async_client() -> httpx.AsyncClient:
+    """Get a shared async HTTP client with proper headers and timeouts."""
+    global _async_client
+    if _async_client is None:
+        _async_client = httpx.AsyncClient(
             base_url=API_BASE_URL,
             headers={"X-API-Key": API_KEY},
-            timeout=10.0,
+            timeout=httpx.Timeout(5.0, connect=2.0),  # aggressive timeouts
+            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
         )
-    return _client
+    return _async_client
+
+
+def run_async(coro):
+    """Run async coroutine in thread pool to avoid blocking Gradio"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
 
 
 # ============================================================
@@ -192,11 +210,11 @@ def load_success_jobs() -> List[Dict]:
 
 
 # ============================================================
-# Core API helpers
+# Core API helpers - Async versions with timeouts
 # ============================================================
 
-def get_runner_status(use_cache: bool = True) -> Dict:
-    """Get runner status including active job IDs with caching."""
+async def get_runner_status_async(use_cache: bool = True) -> Dict:
+    """Get runner status including active job IDs with caching - async version."""
     global _status_cache
 
     now = time.time()
@@ -208,43 +226,70 @@ def get_runner_status(use_cache: bool = True) -> Dict:
         return _status_cache["data"]
 
     try:
-        client = get_client()
-        resp = client.get("/v1/status")
+        client = get_async_client()
+        resp = await client.get("/v1/status")
         if resp.status_code == 200:
             data = resp.json()
             _status_cache = {"data": data, "timestamp": now}
             return data
+        return _status_cache.get("data") or {}
+    except (httpx.TimeoutException, httpx.ConnectError) as e:
+        print(f"Timeout/connection error fetching status: {e}")
         return _status_cache.get("data") or {}
     except Exception as e:
         print(f"Error fetching status: {e}")
         return _status_cache.get("data") or {}
 
 
-def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
-    """Get active jobs with proper error handling"""
+def get_runner_status(use_cache: bool = True) -> Dict:
+    """Synchronous wrapper for get_runner_status_async"""
+    return run_async(get_runner_status_async(use_cache))
+
+
+async def fetch_job_details_async(client: httpx.AsyncClient, job_id: str) -> Optional[Dict]:
+    """Fetch single job details with timeout"""
+    try:
+        resp = await client.get(f"/v1/jobs/{job_id}")
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except (httpx.TimeoutException, httpx.ConnectError):
+        return None
+    except Exception as e:
+        print(f"Error fetching job {job_id}: {e}")
+        return None
+
+
+async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], List[str]]:
+    """Get active jobs with proper error handling - async with concurrent fetching"""
     try:
         active_job_ids = status.get("active_job_ids", []) or []
         if not active_job_ids:
             return [], []
 
-        client = get_client()
+        client = get_async_client()
         table_data: List[List[str]] = []
 
-        for job_id in active_job_ids:
-            try:
-                r = client.get(f"/v1/jobs/{job_id}")
-                
-                if r.status_code == 404:
-                    # job no longer exists - might be completed, check if we should save it
-                    continue
-                
-                if r.status_code != 200:
-                    table_data.append(
-                        [job_id, "❌ error", "0%", "unknown", "N/A", "N/A", "error"]
-                    )
-                    continue
+        # fetch all jobs concurrently with timeout
+        tasks = [fetch_job_details_async(client, job_id) for job_id in active_job_ids]
+        
+        try:
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=8.0  # overall timeout for all jobs
+            )
+        except asyncio.TimeoutError:
+            print("Timeout fetching job details, using partial results")
+            results = [None] * len(active_job_ids)
 
-                job = r.json()
+        for job_id, job in zip(active_job_ids, results):
+            if isinstance(job, Exception):
+                continue
+            
+            if job is None:
+                continue
+
+            try:
                 gpus = job.get("assigned_gpus", []) or []
                 gpu_str = f"GPU {','.join(map(str, gpus))}" if gpus else "N/A"
 
@@ -280,56 +325,81 @@ def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
                     ]
                 )
                 
-                # check if job is completed/failed and save it
+                # check if job is completed/failed and save it (non-blocking)
                 job_status = job.get("status", "").lower()
                 if job_status in ["completed", "failed", "timeout", "cancelled"]:
-                    if job_status == "completed":
-                        # try to get metrics
-                        try:
-                            metrics_resp = client.get(f"/v1/jobs/{job_id}/metrics")
-                            if metrics_resp.status_code == 200:
-                                metrics = metrics_resp.json().get("metrics", {})
-                                save_success_job(job_id, job, metrics)
-                        except Exception as e:
-                            print(f"Could not fetch metrics for {job_id}: {e}")
-                    else:
-                        # failed job - try to get logs
-                        try:
-                            logs_resp = client.get(f"/v1/logs/{job_id}/all")
-                            if logs_resp.status_code == 200:
-                                logs_data = logs_resp.json()
-                                logs = "\n".join([
-                                    f"[{entry.get('timestamp')}] [{entry.get('phase')}] {entry.get('message')}"
-                                    for entry in logs_data.get("entries", [])
-                                ])
-                                save_failed_job(job_id, job, logs)
-                        except Exception as e:
-                            print(f"Could not fetch logs for {job_id}: {e}")
+                    asyncio.create_task(save_completed_job_async(client, job_id, job, job_status))
                 
             except Exception as e:
-                print(f"Error fetching job {job_id}: {e}")
-                table_data.append(
-                    [job_id, "❌ error", "0%", "unknown", "N/A", "N/A", "error"]
-                )
+                print(f"Error processing job {job_id}: {e}")
+                continue
 
         return table_data, active_job_ids
     except Exception as e:
-        print(f"Error in get_active_jobs_table: {e}")
+        print(f"Error in get_active_jobs_table_async: {e}")
         return [], []
 
 
-def get_job_logs_tail(job_id: str, lines: int = 100, phase_filter: str = "all") -> str:
-    """Get last N lines of logs for a job using /tail endpoint."""
+def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
+    """Synchronous wrapper"""
+    return run_async(get_active_jobs_table_async(status))
+
+
+async def save_completed_job_async(client: httpx.AsyncClient, job_id: str, job: Dict, job_status: str):
+    """Save completed job asynchronously without blocking"""
+    try:
+        if job_status == "completed":
+            # try to get metrics
+            try:
+                metrics_resp = await asyncio.wait_for(
+                    client.get(f"/v1/jobs/{job_id}/metrics"),
+                    timeout=3.0
+                )
+                if metrics_resp.status_code == 200:
+                    metrics = metrics_resp.json().get("metrics", {})
+                    save_success_job(job_id, job, metrics)
+            except asyncio.TimeoutError:
+                print(f"Timeout fetching metrics for {job_id}")
+            except Exception as e:
+                print(f"Could not fetch metrics for {job_id}: {e}")
+        else:
+            # failed job - try to get logs
+            try:
+                logs_resp = await asyncio.wait_for(
+                    client.get(f"/v1/logs/{job_id}/all"),
+                    timeout=3.0
+                )
+                if logs_resp.status_code == 200:
+                    logs_data = logs_resp.json()
+                    logs = "\n".join([
+                        f"[{entry.get('timestamp')}] [{entry.get('phase')}] {entry.get('message')}"
+                        for entry in logs_data.get("entries", [])
+                    ])
+                    save_failed_job(job_id, job, logs)
+            except asyncio.TimeoutError:
+                print(f"Timeout fetching logs for {job_id}")
+            except Exception as e:
+                print(f"Could not fetch logs for {job_id}: {e}")
+    except Exception as e:
+        print(f"Error saving completed job {job_id}: {e}")
+
+
+async def get_job_logs_tail_async(job_id: str, lines: int = 100, phase_filter: str = "all") -> str:
+    """Get last N lines of logs for a job using /tail endpoint - async."""
     if not job_id:
         return ""
 
     try:
-        client = get_client()
+        client = get_async_client()
         params = {"lines": lines}
         if phase_filter != "all":
             params["phase"] = phase_filter
 
-        resp = client.get(f"/v1/logs/{job_id}/tail", params=params)
+        resp = await asyncio.wait_for(
+            client.get(f"/v1/logs/{job_id}/tail", params=params),
+            timeout=3.0
+        )
+        
         if resp.status_code != 200:
             return f"[{job_id}] Error: Status {resp.status_code}\n"
 
@@ -366,15 +436,22 @@ def get_job_logs_tail(job_id: str, lines: int = 100, phase_filter: str = "all") 
             lines_out.append(f"[{ts_str}] {phase_icon} {level_icon} {message}")
 
         return "\n".join(lines_out)
+    except asyncio.TimeoutError:
+        return f"[{job_id}] Timeout fetching logs\n"
     except Exception as e:
         return f"[{job_id}] Error: {e}\n"
 
 
-def get_all_active_logs(
+def get_job_logs_tail(job_id: str, lines: int = 100, phase_filter: str = "all") -> str:
+    """Synchronous wrapper"""
+    return run_async(get_job_logs_tail_async(job_id, lines, phase_filter))
+
+
+async def get_all_active_logs_async(
     selected_job_ids: List[str],
     phase_filter: str = "all",
 ) -> str:
-    """Get logs for all selected jobs."""
+    """Get logs for all selected jobs - async with concurrent fetching."""
     if not selected_job_ids:
         return "No active jobs selected. Click 'Refresh' to load active jobs."
 
@@ -385,14 +462,37 @@ def get_all_active_logs(
     out.append("=" * 100)
     out.append("")
 
-    for job_id in selected_job_ids:
+    # fetch logs concurrently
+    tasks = [get_job_logs_tail_async(job_id, lines=60, phase_filter=phase_filter) 
+             for job_id in selected_job_ids]
+    
+    try:
+        logs_results = await asyncio.wait_for(
+            asyncio.gather(*tasks, return_exceptions=True),
+            timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        return "Timeout fetching logs for multiple jobs"
+
+    for job_id, logs in zip(selected_job_ids, logs_results):
+        if isinstance(logs, Exception):
+            logs = f"Error fetching logs: {logs}"
+        
         out.append("\n" + "─" * 100)
         out.append(f"📋 JOB: {job_id}")
         out.append("─" * 100 + "\n")
-        out.append(get_job_logs_tail(job_id, lines=60, phase_filter=phase_filter))
+        out.append(logs)
         out.append("")
 
     return "\n".join(out)
+
+
+def get_all_active_logs(
+    selected_job_ids: List[str],
+    phase_filter: str = "all",
+) -> str:
+    """Synchronous wrapper"""
+    return run_async(get_all_active_logs_async(selected_job_ids, phase_filter))
 
 
 # ============================================================
