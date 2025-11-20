@@ -106,3 +106,8 @@ class ValidatorConfig:
     @property
     def idle_sleep_seconds(self) -> int:
         return 2
+    
+    def __post_init__(self):
+        if self.use_mock_chain and self.hotkey is None:
+            # for mock testing
+            self.hotkey = "5MockValidatorHotkey123456789"
