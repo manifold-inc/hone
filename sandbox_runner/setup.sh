@@ -175,11 +175,12 @@ echo "6. Node.js & npm"
 echo "=========================================="
 
 if command_exists npm; then
-    echo -e "${GREEN}✓${NC} npm already installed"
+    NPM_VERSION=$(npm --version 2>/dev/null || echo "unknown")
+    echo -e "${GREEN}✓${NC} npm $NPM_VERSION already installed"
 else
     echo "Installing Node.js and npm..."
-    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
-    apt-get install -y -qq nodejs >/dev/null 2>&1
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+    apt-get install -y -qq nodejs
     echo -e "${GREEN}✓${NC} Node.js and npm installed"
 fi
 
@@ -193,11 +194,18 @@ echo "7. PM2"
 echo "=========================================="
 
 if command_exists pm2; then
-    echo -e "${GREEN}✓${NC} PM2 already installed"
+    PM2_VERSION=$(pm2 --version 2>/dev/null || echo "unknown")
+    echo -e "${GREEN}✓${NC} PM2 $PM2_VERSION already installed"
 else
     echo "Installing PM2..."
-    npm install -g pm2 >/dev/null 2>&1
-    echo -e "${GREEN}✓${NC} PM2 installed"
+    npm install -g pm2
+    
+    if command_exists pm2; then
+        PM2_VERSION=$(pm2 --version 2>/dev/null || echo "unknown")
+        echo -e "${GREEN}✓${NC} PM2 $PM2_VERSION installed"
+    else
+        echo -e "${RED}✗${NC} PM2 installation failed"
+    fi
 fi
 
 echo ""
@@ -356,8 +364,8 @@ python3 --version && echo -e "${GREEN}✓${NC} Python $(python3 --version | awk 
 command_exists nvidia-smi && echo -e "${GREEN}✓${NC} NVIDIA GPUs ($(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l))" || echo -e "${YELLOW}⚠${NC} NVIDIA GPUs"
 command_exists docker && echo -e "${GREEN}✓${NC} Docker" || echo -e "${RED}✗${NC} Docker"
 command_exists runsc && echo -e "${GREEN}✓${NC} gVisor" || echo -e "${YELLOW}⚠${NC} gVisor"
-command_exists npm && echo -e "${GREEN}✓${NC} npm $(npm --version)" || echo -e "${RED}✗${NC} npm"
-command_exists pm2 && echo -e "${GREEN}✓${NC} PM2" || echo -e "${RED}✗${NC} PM2"
+command_exists npm && echo -e "${GREEN}✓${NC} npm $(npm --version 2>/dev/null)" || echo -e "${RED}✗${NC} npm"
+command_exists pm2 && echo -e "${GREEN}✓${NC} PM2 $(pm2 --version 2>/dev/null)" || echo -e "${RED}✗${NC} PM2"
 
 echo ""
 echo "To run:"
