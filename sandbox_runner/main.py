@@ -75,11 +75,6 @@ def apply_cli_overrides(config: Config, args: argparse.Namespace) -> Config:
     if args.execution_mode:
         config.execution.mode = args.execution_mode
     
-    if args.ssl_cert:
-        config.api.ssl_cert_path = args.ssl_cert
-    
-    if args.ssl_key:
-        config.api.ssl_key_path = args.ssl_key
     
     return config
 
@@ -90,14 +85,6 @@ async def startup_checks(config: Config, logger: logging.Logger):
     logger.info(f"Execution mode: {config.execution.mode}")
     logger.info(f"GPU count: {config.hardware.gpu_count}")
     logger.info(f"API port: {config.api.port}")
-    
-    if config.api.ssl_cert_path and not config.api.ssl_cert_path.exists():
-        logger.error(f"SSL certificate not found: {config.api.ssl_cert_path}")
-        sys.exit(1)
-    
-    if config.api.ssl_key_path and not config.api.ssl_key_path.exists():
-        logger.error(f"SSL key not found: {config.api.ssl_key_path}")
-        sys.exit(1)
     
     logger.info("Startup validation completed successfully")
 
@@ -116,17 +103,12 @@ def main():
         asyncio.run(startup_checks(config, logger))
         
         app = create_app(config)
-        
-        ssl_keyfile = str(config.api.ssl_key_path) if config.api.ssl_key_path else None
-        ssl_certfile = str(config.api.ssl_cert_path) if config.api.ssl_cert_path else None
-        
+                
         logger.info(f"Starting HTTPS server on port {config.api.port}")
         uvicorn.run(
             app,
             host="0.0.0.0",
             port=config.api.port,
-            #ssl_keyfile=ssl_keyfile,
-            #ssl_certfile=ssl_certfile,
             log_level=args.log_level.lower(),
             access_log=True,
         )

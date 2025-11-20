@@ -186,10 +186,6 @@ def load_config(config_path: Path) -> Config:
     
     if 'api' in yaml_data:
         api_data = yaml_data['api'].copy()
-        if 'ssl_cert_path' in api_data and api_data['ssl_cert_path']:
-            api_data['ssl_cert_path'] = Path(api_data['ssl_cert_path'])
-        if 'ssl_key_path' in api_data and api_data['ssl_key_path']:
-            api_data['ssl_key_path'] = Path(api_data['ssl_key_path'])
         config.api = APIConfig(**api_data)
     
     if 'hardware' in yaml_data:
@@ -299,11 +295,8 @@ def generate_default_config(output_path: Path):
         },
         'api': {
             'port': 8443,
-            'require_epistula': False,  # testing phase
             'require_api_key': True,
             'rate_limit_per_validator': 3,
-            'ssl_cert_path': '/etc/ssl/certs/runner.crt',
-            'ssl_key_path': '/etc/ssl/private/runner.key'
         },
         'hardware': {
             'gpu_count': 1,  # testing phase
