@@ -161,16 +161,52 @@ apt-get install -y -qq \
     libssl-dev openssl \
     unzip \
     net-tools \
-    htop >/dev/null 2>&1
+    htop \
+    nano >/dev/null 2>&1
 
 echo -e "${GREEN}✓${NC} System dependencies installed"
 echo ""
 
 # =============================================================================
-# 6. gVisor
+# 6. Node.js & npm
 # =============================================================================
 echo "=========================================="
-echo "6. gVisor (Optional)"
+echo "6. Node.js & npm"
+echo "=========================================="
+
+if command_exists npm; then
+    echo -e "${GREEN}✓${NC} npm already installed"
+else
+    echo "Installing Node.js and npm..."
+    curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - >/dev/null 2>&1
+    apt-get install -y -qq nodejs >/dev/null 2>&1
+    echo -e "${GREEN}✓${NC} Node.js and npm installed"
+fi
+
+echo ""
+
+# =============================================================================
+# 7. PM2
+# =============================================================================
+echo "=========================================="
+echo "7. PM2"
+echo "=========================================="
+
+if command_exists pm2; then
+    echo -e "${GREEN}✓${NC} PM2 already installed"
+else
+    echo "Installing PM2..."
+    npm install -g pm2 >/dev/null 2>&1
+    echo -e "${GREEN}✓${NC} PM2 installed"
+fi
+
+echo ""
+
+# =============================================================================
+# 8. gVisor
+# =============================================================================
+echo "=========================================="
+echo "8. gVisor (Optional)"
 echo "=========================================="
 
 if ! command_exists runsc; then
@@ -213,10 +249,10 @@ fi
 echo ""
 
 # =============================================================================
-# 7. Python Environment
+# 9. Python Environment
 # =============================================================================
 echo "=========================================="
-echo "7. Python Environment"
+echo "9. Python Environment"
 echo "=========================================="
 
 if [ ! -d "venv" ]; then
@@ -236,10 +272,10 @@ echo -e "${GREEN}✓${NC} Python packages installed"
 echo ""
 
 # =============================================================================
-# 8. Directories
+# 10. Directories
 # =============================================================================
 echo "=========================================="
-echo "8. Directories"
+echo "10. Directories"
 echo "=========================================="
 
 mkdir -p logs data/inputs data/outputs ssl
@@ -248,10 +284,10 @@ echo -e "${GREEN}✓${NC} Directories created"
 echo ""
 
 # =============================================================================
-# 9. SSL Certificates
+# 11. SSL Certificates
 # =============================================================================
 echo "=========================================="
-echo "9. SSL Certificates"
+echo "11. SSL Certificates"
 echo "=========================================="
 
 if [ ! -f "ssl/runner.crt" ]; then
@@ -273,10 +309,10 @@ fi
 echo ""
 
 # =============================================================================
-# 10. Configuration
+# 12. Configuration
 # =============================================================================
 echo "=========================================="
-echo "10. Configuration"
+echo "12. Configuration"
 echo "=========================================="
 
 if [ ! -f "config.local.yaml" ]; then
@@ -320,6 +356,8 @@ python3 --version && echo -e "${GREEN}✓${NC} Python $(python3 --version | awk 
 command_exists nvidia-smi && echo -e "${GREEN}✓${NC} NVIDIA GPUs ($(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l))" || echo -e "${YELLOW}⚠${NC} NVIDIA GPUs"
 command_exists docker && echo -e "${GREEN}✓${NC} Docker" || echo -e "${RED}✗${NC} Docker"
 command_exists runsc && echo -e "${GREEN}✓${NC} gVisor" || echo -e "${YELLOW}⚠${NC} gVisor"
+command_exists npm && echo -e "${GREEN}✓${NC} npm $(npm --version)" || echo -e "${RED}✗${NC} npm"
+command_exists pm2 && echo -e "${GREEN}✓${NC} PM2" || echo -e "${RED}✗${NC} PM2"
 
 echo ""
 echo "To run:"
