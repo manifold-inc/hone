@@ -338,6 +338,41 @@ class MetaManager:
         
         return False
     
+    async def _detect_gpu_leaks(self):
+        """
+        Periodic check for GPU allocation leaks
+        Detects and fixes cases where GPUs are allocated but job doesn't exist
+        """
+        job_allocations = dict(self.gpu_pool._job_allocations)
+        
+        if not job_allocations:
+            return
+        
+        leaked_jobs = []
+        
+        for job_id, gpu_list in job_allocations.items():
+            in_running = job_id in self._running_jobs
+            in_executor = job_id in self.executor.get_active_jobs()
+            in_queue = await self.job_queue.get_job(job_id) is not None
+            
+            if not (in_running or in_executor or in_queue):
+                leaked_jobs.append((job_id, gpu_list))
+        
+        for job_id, gpu_list in leaked_jobs:
+            logger.error(
+                f"GPU LEAK DETECTED: Job {job_id} has GPUs {gpu_list} allocated "
+                f"but doesn't exist in running_jobs, executor, or queue! "
+                f"Force releasing..."
+            )
+            try:
+                await self.gpu_pool.release_gpus(job_id)
+                logger.info(f"✓ Force released leaked GPUs {gpu_list} from {job_id}")
+            except Exception as e:
+                logger.error(f"✗ Failed to release leaked GPUs: {e}")
+        
+        if leaked_jobs:
+            logger.warning(f"Cleaned up {len(leaked_jobs)} GPU leaks")
+    
     async def get_runner_status(self) -> Dict:
         """
         Get overall status of the sandbox runner
@@ -352,7 +387,27 @@ class MetaManager:
         gpu_stats = await self.gpu_pool.get_allocation_stats()
         queue_stats = await self.job_queue.get_stats()
         
-        active_jobs = self.executor.get_active_jobs()
+        executor_active = self.executor.get_active_jobs()
+        
+        pending_execution = {
+            jid for jid in self._running_jobs
+            if jid not in executor_active
+        }
+        
+        total_active = len(executor_active) + len(pending_execution)
+        active_job_ids = list(executor_active.keys()) + list(pending_execution)
+        
+        expected_allocated = len(self.gpu_pool._job_allocations)
+        actual_allocated = gpu_stats["allocated_gpus"]
+        
+        if expected_allocated != actual_allocated:
+            logger.error(
+                f"GPU allocation mismatch detected! "
+                f"job_allocations: {expected_allocated}, "
+                f"allocated_gpus count: {actual_allocated}. "
+                f"Active jobs: executor={len(executor_active)}, "
+                f"running_jobs={len(self._running_jobs)}"
+            )
 
         queue_breakdown = await self.get_queue_breakdown()
         queue_by_weight = {
@@ -365,12 +420,12 @@ class MetaManager:
             "status": "operational" if self._running else "stopped",
             "gpu_stats": gpu_stats,
             "queue_stats": queue_stats,
-            "active_jobs": len(active_jobs),
+            "active_jobs": total_active,
             "total_submitted": self._total_jobs_submitted,
             "total_completed": self._total_jobs_completed,
             "total_failed": self._total_jobs_failed,
             "execution_mode": self.config.execution.mode,
-            "active_job_ids": list(active_jobs.keys()),
+            "active_job_ids": active_job_ids,
             "queue_stats": {
                 "total_jobs": await self.job_queue.get_total_depth(),
                 "by_weight_class": queue_by_weight
@@ -422,12 +477,21 @@ class MetaManager:
         Background monitoring loop for GPU metrics
         
         Updates GPU utilization metrics every 10 seconds
+        Checks for GPU leaks every 60 seconds
         """
         logger.info("Monitoring loop started")
         
+        leak_check_counter = 0
+        
         while self._running:
             try:
-                await self._update_gpu_metrics()                
+                await self._update_gpu_metrics()
+                
+                leak_check_counter += 1
+                if leak_check_counter >= 6:
+                    await self._detect_gpu_leaks()
+                    leak_check_counter = 0
+                
                 await asyncio.sleep(10.0)
                 
             except asyncio.CancelledError:
@@ -443,19 +507,44 @@ class MetaManager:
         """
         Check for completed jobs and clean them up
         """
-        active_jobs = self.executor.get_active_jobs()
+        executor_active_jobs = self.executor.get_active_jobs()
         
         completed_jobs = []
         
-        for job_id, job in active_jobs.items():
+        # check jobs in executor
+        for job_id, job in executor_active_jobs.items():
             if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, 
                             JobStatus.TIMEOUT, JobStatus.CANCELLED]:
                 completed_jobs.append(job_id)
         
+        for job_id, job in list(self._running_jobs.items()):
+            if job_id not in executor_active_jobs:
+                if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, 
+                                JobStatus.TIMEOUT, JobStatus.CANCELLED]:
+                    if job_id not in completed_jobs:
+                        completed_jobs.append(job_id)
+                        logger.warning(
+                            f"Found orphaned job in _running_jobs: {job_id} "
+                            f"(status={job.status.value})"
+                        )
+        
         for job_id in completed_jobs:
-            job = active_jobs[job_id]
+            job = executor_active_jobs.get(job_id) or self._running_jobs.get(job_id)
             
-            await self.gpu_pool.release_gpus(job_id)
+            if not job:
+                logger.error(f"Cannot find job {job_id} for cleanup!")
+                try:
+                    await self.gpu_pool.release_gpus(job_id)
+                    logger.warning(f"Force-released GPUs for missing job {job_id}")
+                except Exception as e:
+                    logger.error(f"Failed to release GPUs for missing job {job_id}: {e}")
+                continue
+            
+            try:
+                await self.gpu_pool.release_gpus(job_id)
+                logger.debug(f"Released GPUs for job {job_id}")
+            except Exception as e:
+                logger.error(f"Failed to release GPUs for job {job_id}: {e}")
             
             self._store_job_in_history(job)
             
@@ -468,6 +557,7 @@ class MetaManager:
             
             if job_id in self._running_jobs:
                 del self._running_jobs[job_id]
+                logger.debug(f"Removed {job_id} from _running_jobs")
 
     def _store_job_in_history(self, job: Job):
         """
@@ -531,8 +621,12 @@ class MetaManager:
         self.executor._job_tasks[job.job_id] = task
         
         logger.info(
-            f"Scheduled job {job.job_id} on GPUs {gpus} "
-            f"({job.weight_class.value})"
+            f"Scheduled job {job.job_id} on GPUs {gpus} ({job.weight_class.value}). "
+            f"State check: "
+            f"running_jobs={len(self._running_jobs)}, "
+            f"executor_active={len(self.executor.get_active_jobs())}, "
+            f"gpu_allocations={len(self.gpu_pool._job_allocations)}, "
+            f"queue_depth={await self.job_queue.get_total_depth()}"
         )
         
         return True
