@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Enhanced Log Streaming Dashboard using Gradio
+Enhanced Sandbox Runner Dashboard using Gradio
 
 Features:
-- Auto-fetches active jobs from /v1/status endpoint
-- Real-time log streaming with /v1/logs/{job_id}/tail
+- Real-time job monitoring with proper error handling
+- Failed jobs tracking with logs persistence
+- Success jobs metrics page
+- Disk space monitoring
 - Interactive gauges and visualizations
-- Performance optimized with caching + shared HTTP client
-- Multi-job log viewing
-- Phase filtering and auto-refresh
-- GPU, queue, and runner statistics with visualizations
 """
 
 import gradio as gr
@@ -18,6 +16,10 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import time
 import plotly.graph_objects as go
+import json
+import shutil
+from pathlib import Path
+import threading
 
 # ============================================================
 # Configuration
@@ -26,11 +28,18 @@ import plotly.graph_objects as go
 API_BASE_URL = "http://localhost:8080"
 API_KEY = "dev-key-12345"
 
+# Local storage for failed jobs
+FAILED_JOBS_DIR = Path("/tmp/sandbox_failed_jobs")
+SUCCESS_JOBS_DIR = Path("/tmp/sandbox_success_jobs")
+FAILED_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+SUCCESS_JOBS_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_DISK_USAGE_PERCENT = 50.0
+
 # Cache for reducing API calls
 _status_cache = {"data": None, "timestamp": 0.0}
-_CACHE_TTL = 1.0  # seconds
+_CACHE_TTL = 1.0
 
-# Shared HTTP client (connection pooling, fewer bugs / overhead)
 _client: Optional[httpx.Client] = None
 
 
@@ -44,6 +53,142 @@ def get_client() -> httpx.Client:
             timeout=10.0,
         )
     return _client
+
+
+# ============================================================
+# Disk Space Management
+# ============================================================
+
+def get_disk_usage() -> Dict:
+    """Get disk usage statistics"""
+    try:
+        total, used, free = shutil.disk_usage("/tmp")
+        
+        return {
+            "total_gb": total / (1024**3),
+            "used_gb": used / (1024**3),
+            "free_gb": free / (1024**3),
+            "used_percent": (used / total) * 100
+        }
+    except Exception as e:
+        print(f"Error getting disk usage: {e}")
+        return {
+            "total_gb": 0,
+            "used_gb": 0,
+            "free_gb": 0,
+            "used_percent": 0
+        }
+
+
+def cleanup_old_jobs_if_needed():
+    """Remove oldest job logs if disk usage exceeds threshold"""
+    disk = get_disk_usage()
+    
+    if disk["used_percent"] < MAX_DISK_USAGE_PERCENT:
+        return
+    
+    print(f"Disk usage at {disk['used_percent']:.1f}%, cleaning up old jobs...")
+    
+    # cleanup failed jobs first
+    failed_jobs = sorted(FAILED_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+    
+    removed_count = 0
+    for job_file in failed_jobs[:len(failed_jobs)//4]:  # remove oldest 25%
+        try:
+            job_file.unlink()
+            removed_count += 1
+        except Exception as e:
+            print(f"Error removing {job_file}: {e}")
+    
+    # cleanup success jobs if still needed
+    disk = get_disk_usage()
+    if disk["used_percent"] >= MAX_DISK_USAGE_PERCENT:
+        success_jobs = sorted(SUCCESS_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime)
+        
+        for job_file in success_jobs[:len(success_jobs)//4]:
+            try:
+                job_file.unlink()
+                removed_count += 1
+            except Exception as e:
+                print(f"Error removing {job_file}: {e}")
+    
+    print(f"Cleaned up {removed_count} old job files")
+
+
+# ============================================================
+# Job Persistence
+# ============================================================
+
+def save_failed_job(job_id: str, job_data: Dict, logs: str):
+    """Save failed job with logs to disk"""
+    try:
+        cleanup_old_jobs_if_needed()
+        
+        job_file = FAILED_JOBS_DIR / f"{job_id}.json"
+        
+        data = {
+            "job_id": job_id,
+            "saved_at": datetime.now().isoformat(),
+            "job_data": job_data,
+            "logs": logs
+        }
+        
+        with open(job_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"Saved failed job: {job_id}")
+    except Exception as e:
+        print(f"Error saving failed job {job_id}: {e}")
+
+
+def save_success_job(job_id: str, job_data: Dict, metrics: Dict):
+    """Save successful job with metrics"""
+    try:
+        cleanup_old_jobs_if_needed()
+        
+        job_file = SUCCESS_JOBS_DIR / f"{job_id}.json"
+        
+        data = {
+            "job_id": job_id,
+            "saved_at": datetime.now().isoformat(),
+            "job_data": job_data,
+            "metrics": metrics
+        }
+        
+        with open(job_file, 'w') as f:
+            json.dump(data, f, indent=2)
+        
+        print(f"Saved success job: {job_id}")
+    except Exception as e:
+        print(f"Error saving success job {job_id}: {e}")
+
+
+def load_failed_jobs() -> List[Dict]:
+    """Load all failed jobs from disk"""
+    jobs = []
+    
+    for job_file in sorted(FAILED_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(job_file, 'r') as f:
+                jobs.append(json.load(f))
+        except Exception as e:
+            print(f"Error loading {job_file}: {e}")
+    
+    return jobs
+
+
+def load_success_jobs() -> List[Dict]:
+    """Load all success jobs from disk"""
+    jobs = []
+    
+    for job_file in sorted(SUCCESS_JOBS_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(job_file, 'r') as f:
+                jobs.append(json.load(f))
+        except Exception as e:
+            print(f"Error loading {job_file}: {e}")
+    
+    return jobs
 
 
 # ============================================================
@@ -76,10 +221,7 @@ def get_runner_status(use_cache: bool = True) -> Dict:
 
 
 def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
-    """
-    Get active jobs (based on status) and return table_data + job_ids.
-    Uses /v1/jobs/{job_id} for richer details.
-    """
+    """Get active jobs with proper error handling"""
     try:
         active_job_ids = status.get("active_job_ids", []) or []
         if not active_job_ids:
@@ -91,6 +233,11 @@ def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
         for job_id in active_job_ids:
             try:
                 r = client.get(f"/v1/jobs/{job_id}")
+                
+                if r.status_code == 404:
+                    # job no longer exists - might be completed, check if we should save it
+                    continue
+                
                 if r.status_code != 200:
                     table_data.append(
                         [job_id, "❌ error", "0%", "unknown", "N/A", "N/A", "error"]
@@ -117,6 +264,7 @@ def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
                     "prep": "📦",
                     "inference": "🧠",
                     "vllm": "🚀",
+                    "vllm_pipeline": "🚀",
                 }
                 phase_display = f"{phase_emoji.get(phase, '📝')} {phase}"
 
@@ -131,6 +279,33 @@ def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
                         (job.get("miner_hotkey") or "")[:12] + "...",
                     ]
                 )
+                
+                # check if job is completed/failed and save it
+                job_status = job.get("status", "").lower()
+                if job_status in ["completed", "failed", "timeout", "cancelled"]:
+                    if job_status == "completed":
+                        # try to get metrics
+                        try:
+                            metrics_resp = client.get(f"/v1/jobs/{job_id}/metrics")
+                            if metrics_resp.status_code == 200:
+                                metrics = metrics_resp.json().get("metrics", {})
+                                save_success_job(job_id, job, metrics)
+                        except Exception as e:
+                            print(f"Could not fetch metrics for {job_id}: {e}")
+                    else:
+                        # failed job - try to get logs
+                        try:
+                            logs_resp = client.get(f"/v1/logs/{job_id}/all")
+                            if logs_resp.status_code == 200:
+                                logs_data = logs_resp.json()
+                                logs = "\n".join([
+                                    f"[{entry.get('timestamp')}] [{entry.get('phase')}] {entry.get('message')}"
+                                    for entry in logs_data.get("entries", [])
+                                ])
+                                save_failed_job(job_id, job, logs)
+                        except Exception as e:
+                            print(f"Could not fetch logs for {job_id}: {e}")
+                
             except Exception as e:
                 print(f"Error fetching job {job_id}: {e}")
                 table_data.append(
@@ -181,6 +356,7 @@ def get_job_logs_tail(job_id: str, lines: int = 100, phase_filter: str = "all") 
                 "prep": "📦",
                 "inference": "🧠",
                 "vllm": "🚀",
+                "vllm_pipeline": "🚀",
             }
             level_emoji = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}
 
@@ -304,6 +480,49 @@ def create_job_stats_chart(
     return fig
 
 
+def create_disk_usage_gauge() -> go.Figure:
+    """Gauge chart for disk usage."""
+    disk = get_disk_usage()
+    
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=disk["used_percent"],
+            domain={"x": [0, 1], "y": [0, 1]},
+            title={
+                "text": f"Disk Usage<br><sub>{disk['free_gb']:.1f} GB free</sub>",
+                "font": {"size": 16},
+            },
+            number={"suffix": "%", "font": {"size": 22}},
+            gauge={
+                "axis": {"range": [0, 100], "tickwidth": 1},
+                "bar": {"color": "#4299e1"},
+                "bgcolor": "rgba(15, 23, 42, 1)",
+                "borderwidth": 0,
+                "steps": [
+                    {"range": [0, 50], "color": "rgba(16, 185, 129, 0.2)"},
+                    {"range": [50, 75], "color": "rgba(250, 204, 21, 0.25)"},
+                    {"range": [75, 100], "color": "rgba(248, 113, 113, 0.25)"},
+                ],
+                "threshold": {
+                    "line": {"color": "red", "width": 3},
+                    "thickness": 0.6,
+                    "value": 90,
+                },
+            },
+        )
+    )
+
+    fig.update_layout(
+        height=200,
+        margin=dict(l=10, r=10, t=40, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#e2e8f0"},
+    )
+    return fig
+
+
 def create_runner_info_fig(status: Dict) -> Tuple[go.Figure, str]:
     """Create a small donut chart for success vs failed + summary text."""
     total_submitted = status.get("total_submitted", 0) or 0
@@ -351,7 +570,7 @@ def create_queue_fig(status: Dict) -> Tuple[go.Figure, str]:
     """Create a gauge or bar showing queue depth."""
     queue_depth = status.get("queue_depth", 0) or 0
     active_jobs = status.get("active_jobs", 0) or 0
-    max_depth = max(queue_depth, 1) * 2  # simple dynamic max
+    max_depth = max(queue_depth, 1) * 2
 
     fig = go.Figure(
         go.Indicator(
@@ -417,6 +636,7 @@ def refresh_all(phase_filter: str, job_id_filter: str = ""):
 
     runner_fig, runner_summary = create_runner_info_fig(status)
     queue_fig, queue_summary = create_queue_fig(status)
+    disk_gauge = create_disk_usage_gauge()
 
     return (
         table_data,
@@ -427,7 +647,145 @@ def refresh_all(phase_filter: str, job_id_filter: str = ""):
         runner_summary,
         queue_fig,
         queue_summary,
+        disk_gauge,
     )
+
+
+def refresh_failed_jobs():
+    """Refresh failed jobs page"""
+    failed_jobs = load_failed_jobs()
+    
+    if not failed_jobs:
+        return [], "No failed jobs recorded", create_disk_usage_gauge()
+    
+    table_data = []
+    for job in failed_jobs:
+        job_data = job.get("job_data", {})
+        table_data.append([
+            job.get("job_id", "unknown"),
+            job.get("saved_at", "unknown"),
+            job_data.get("status", "unknown"),
+            job_data.get("current_phase", "unknown"),
+            (job_data.get("miner_hotkey", "") or "")[:12] + "...",
+            job_data.get("error_message", "")[:50] + "..." if job_data.get("error_message") else "N/A"
+        ])
+    
+    summary = f"Total failed jobs: {len(failed_jobs)}"
+    
+    return table_data, summary, create_disk_usage_gauge()
+
+
+def get_failed_job_logs(evt: gr.SelectData, table_data):
+    """Get logs for selected failed job"""
+    try:
+        if hasattr(table_data, "iloc"):
+            job_id = str(table_data.iloc[evt.index[0], 0])
+        elif isinstance(table_data, list) and evt.index[0] < len(table_data):
+            job_id = str(table_data[evt.index[0]][0])
+        else:
+            return "Error loading logs"
+        
+        job_file = FAILED_JOBS_DIR / f"{job_id}.json"
+        if not job_file.exists():
+            return f"Logs not found for job {job_id}"
+        
+        with open(job_file, 'r') as f:
+            job_data = json.load(f)
+        
+        logs = job_data.get("logs", "No logs available")
+        return f"=== LOGS FOR {job_id} ===\n\n{logs}"
+        
+    except Exception as e:
+        return f"Error loading logs: {e}"
+
+
+def refresh_success_jobs():
+    """Refresh success jobs page"""
+    success_jobs = load_success_jobs()
+    
+    if not success_jobs:
+        return [], "No successful jobs recorded", create_disk_usage_gauge()
+    
+    table_data = []
+    for job in success_jobs:
+        job_data = job.get("job_data", {})
+        metrics = job.get("metrics", {})
+        
+        # calculate execution time
+        started_at = job_data.get("started_at")
+        completed_at = job_data.get("completed_at")
+        exec_time = "N/A"
+        if started_at and completed_at:
+            try:
+                start_dt = datetime.fromisoformat(started_at)
+                end_dt = datetime.fromisoformat(completed_at)
+                exec_time = f"{(end_dt - start_dt).total_seconds():.1f}s"
+            except:
+                pass
+        
+        exact_match = metrics.get("exact_match", False)
+        partial = metrics.get("partial_correctness", 0.0)
+        similarity = metrics.get("grid_similarity", 0.0)
+        
+        table_data.append([
+            job.get("job_id", "unknown"),
+            job.get("saved_at", "unknown"),
+            (job_data.get("miner_hotkey", "") or "")[:12] + "...",
+            job_data.get("weight_class", "unknown"),
+            exec_time,
+            "✅" if exact_match else "❌",
+            f"{partial:.3f}",
+            f"{similarity:.3f}"
+        ])
+    
+    summary = f"Total successful jobs: {len(success_jobs)}"
+    
+    return table_data, summary, create_disk_usage_gauge()
+
+
+def get_success_job_details(evt: gr.SelectData, table_data):
+    """Get detailed metrics for selected success job"""
+    try:
+        if hasattr(table_data, "iloc"):
+            job_id = str(table_data.iloc[evt.index[0], 0])
+        elif isinstance(table_data, list) and evt.index[0] < len(table_data):
+            job_id = str(table_data[evt.index[0]][0])
+        else:
+            return "Error loading details"
+        
+        job_file = SUCCESS_JOBS_DIR / f"{job_id}.json"
+        if not job_file.exists():
+            return f"Details not found for job {job_id}"
+        
+        with open(job_file, 'r') as f:
+            job_data = json.load(f)
+        
+        metrics = job_data.get("metrics", {})
+        job_info = job_data.get("job_data", {})
+        
+        details = f"=== JOB DETAILS: {job_id} ===\n\n"
+        details += f"Miner Hotkey: {job_info.get('miner_hotkey', 'N/A')}\n"
+        details += f"Weight Class: {job_info.get('weight_class', 'N/A')}\n"
+        details += f"Started: {job_info.get('started_at', 'N/A')}\n"
+        details += f"Completed: {job_info.get('completed_at', 'N/A')}\n\n"
+        
+        details += "=== METRICS ===\n\n"
+        details += f"Exact Match: {'✅ Yes' if metrics.get('exact_match') else '❌ No'}\n"
+        details += f"Partial Correctness: {metrics.get('partial_correctness', 0.0):.4f}\n"
+        details += f"Grid Similarity: {metrics.get('grid_similarity', 0.0):.4f}\n"
+        details += f"Efficiency Score: {metrics.get('efficiency_score', 0.0):.4f}\n\n"
+        
+        if metrics.get("problem_id"):
+            details += f"Problem ID: {metrics.get('problem_id')}\n"
+        if metrics.get("base_task_num"):
+            details += f"Base Task: {metrics.get('base_task_num')}\n"
+        if metrics.get("chain_length"):
+            details += f"Chain Length: {metrics.get('chain_length')}\n"
+        
+        return details
+        
+    except Exception as e:
+        return f"Error loading details: {e}"
 
 
 def clear_job_filter():
@@ -478,94 +836,178 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
         """
     )
 
-    with gr.Row():
-        # LEFT COLUMN: Jobs & Logs
-        with gr.Column(scale=3):
+    with gr.Tabs():
+        # ===== TAB 1: MAIN DASHBOARD =====
+        with gr.Tab("📊 Main Dashboard"):
             with gr.Row():
+                # LEFT COLUMN: Jobs & Logs
                 with gr.Column(scale=3):
-                    gr.Markdown("### 📋 Active Jobs")
-                with gr.Column(scale=2):
                     with gr.Row():
-                        refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
-                        auto_refresh = gr.Checkbox(label="Auto", value=False)
-                        refresh_interval = gr.Radio(
-                            choices=[2, 5],
-                            value=5,
-                            show_label=False,
-                        )
+                        with gr.Column(scale=3):
+                            gr.Markdown("### 📋 Active Jobs")
+                        with gr.Column(scale=2):
+                            with gr.Row():
+                                refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
+                                auto_refresh = gr.Checkbox(label="Auto", value=False)
+                                refresh_interval = gr.Radio(
+                                    choices=[2, 5],
+                                    value=5,
+                                    show_label=False,
+                                )
 
-            jobs_table = gr.Dataframe(
+                    jobs_table = gr.Dataframe(
+                        headers=[
+                            "Job ID",
+                            "Phase",
+                            "Progress",
+                            "Weight",
+                            "GPUs",
+                            "Started",
+                            "Miner",
+                        ],
+                        value=[],
+                        interactive=False,
+                        wrap=True,
+                        column_widths=["22%", "14%", "10%", "12%", "10%", "10%", "22%"],
+                    )
+
+                    gr.Markdown("### ⚙️ Filters")
+                    with gr.Row():
+                        job_id_filter = gr.Textbox(
+                            label="Job ID",
+                            placeholder="Click a job row or enter ID…",
+                            scale=3,
+                        )
+                        phase_filter = gr.Dropdown(
+                            label="Phase",
+                            choices=["all", "build", "prep", "inference", "vllm", "vllm_pipeline"],
+                            value="all",
+                            scale=2,
+                        )
+                        clear_filter_btn = gr.Button("✕", scale=1, size="sm")
+
+                    gr.Markdown("### 📜 Live Logs")
+                    log_output = gr.Textbox(
+                        label="",
+                        lines=25,
+                        max_lines=40,
+                        show_label=False,
+                        show_copy_button=True,
+                        interactive=False,
+                        container=True,
+                        elem_id="srd-log-output",
+                    )
+
+                # RIGHT COLUMN: Stats & Visuals
+                with gr.Column(scale=2):
+                    gr.Markdown("### 📊 System Overview")
+
+                    with gr.Row():
+                        gpu_gauge_plot = gr.Plot(label="GPU Allocation")
+
+                    with gr.Row():
+                        job_stats_plot = gr.Plot(label="Job Statistics")
+                    
+                    with gr.Row():
+                        disk_gauge_plot = gr.Plot(label="Disk Usage")
+
+                    gr.Markdown("### 📈 Runner & Queue")
+
+                    with gr.Row():
+                        with gr.Column():
+                            with gr.Accordion("🖥️ Runner Info", open=True):
+                                runner_fig_plot = gr.Plot(show_label=False)
+                                runner_info_output = gr.Markdown(
+                                    value="",
+                                    elem_id="runner-summary",
+                                )
+                        with gr.Column():
+                            with gr.Accordion("📊 Queue Status", open=True):
+                                queue_fig_plot = gr.Plot(show_label=False)
+                                queue_info_output = gr.Markdown(
+                                    value="",
+                                    elem_id="queue-summary",
+                                )
+
+        # ===== TAB 2: FAILED JOBS =====
+        with gr.Tab("❌ Failed Jobs"):
+            gr.Markdown("### Failed Jobs History")
+            
+            with gr.Row():
+                failed_refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
+            
+            with gr.Row():
+                failed_disk_gauge = gr.Plot(label="Disk Usage")
+            
+            failed_summary = gr.Markdown(value="")
+            
+            failed_jobs_table = gr.Dataframe(
                 headers=[
                     "Job ID",
+                    "Saved At",
+                    "Status",
                     "Phase",
-                    "Progress",
-                    "Weight",
-                    "GPUs",
-                    "Started",
                     "Miner",
+                    "Error"
                 ],
                 value=[],
                 interactive=False,
                 wrap=True,
-                column_widths=["22%", "14%", "10%", "12%", "10%", "10%", "22%"],
             )
-
-            gr.Markdown("### ⚙️ Filters")
-            with gr.Row():
-                job_id_filter = gr.Textbox(
-                    label="Job ID",
-                    placeholder="Click a job row or enter ID…",
-                    scale=3,
-                )
-                phase_filter = gr.Dropdown(
-                    label="Phase",
-                    choices=["all", "build", "prep", "inference", "vllm"],
-                    value="all",
-                    scale=2,
-                )
-                clear_filter_btn = gr.Button("✕", scale=1, size="sm")
-
-            gr.Markdown("### 📜 Live Logs")
-            log_output = gr.Textbox(
+            
+            gr.Markdown("### 📜 Job Logs")
+            gr.Markdown("*Click a row above to view logs*")
+            
+            failed_logs_output = gr.Textbox(
                 label="",
-                lines=25,
-                max_lines=40,
+                lines=30,
+                max_lines=50,
                 show_label=False,
                 show_copy_button=True,
                 interactive=False,
-                container=True,
-                elem_id="srd-log-output",
             )
 
-        # RIGHT COLUMN: Stats & Visuals
-        with gr.Column(scale=2):
-            gr.Markdown("### 📊 System Overview")
-
+        # ===== TAB 3: SUCCESS JOBS =====
+        with gr.Tab("✅ Success Jobs"):
+            gr.Markdown("### Successful Jobs History")
+            
             with gr.Row():
-                gpu_gauge_plot = gr.Plot(label="GPU Allocation")
-
+                success_refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
+            
             with gr.Row():
-                job_stats_plot = gr.Plot(label="Job Statistics")
+                success_disk_gauge = gr.Plot(label="Disk Usage")
+            
+            success_summary = gr.Markdown(value="")
+            
+            success_jobs_table = gr.Dataframe(
+                headers=[
+                    "Job ID",
+                    "Saved At",
+                    "Miner",
+                    "Weight",
+                    "Exec Time",
+                    "Exact Match",
+                    "Partial",
+                    "Similarity"
+                ],
+                value=[],
+                interactive=False,
+                wrap=True,
+            )
+            
+            gr.Markdown("### 📊 Job Details")
+            gr.Markdown("*Click a row above to view metrics*")
+            
+            success_details_output = gr.Textbox(
+                label="",
+                lines=30,
+                max_lines=50,
+                show_label=False,
+                show_copy_button=True,
+                interactive=False,
+            )
 
-            gr.Markdown("### 📈 Runner & Queue")
-
-            with gr.Row():
-                with gr.Column():
-                    with gr.Accordion("🖥️ Runner Info", open=True):
-                        runner_fig_plot = gr.Plot(show_label=False)
-                        runner_info_output = gr.Markdown(
-                            value="",
-                            elem_id="runner-summary",
-                        )
-                with gr.Column():
-                    with gr.Accordion("📊 Queue Status", open=True):
-                        queue_fig_plot = gr.Plot(show_label=False)
-                        queue_info_output = gr.Markdown(
-                            value="",
-                            elem_id="queue-summary",
-                        )
-
-    # Events
+    # ===== MAIN DASHBOARD EVENTS =====
     refresh_btn.click(
         fn=lambda pf, jf: refresh_all(pf, jf),
         inputs=[phase_filter, job_id_filter],
@@ -578,6 +1020,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             runner_info_output,
             queue_fig_plot,
             queue_info_output,
+            disk_gauge_plot,
         ],
     )
 
@@ -593,6 +1036,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             runner_info_output,
             queue_fig_plot,
             queue_info_output,
+            disk_gauge_plot,
         ],
     )
 
@@ -608,6 +1052,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             runner_info_output,
             queue_fig_plot,
             queue_info_output,
+            disk_gauge_plot,
         ],
     )
 
@@ -650,7 +1095,32 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             runner_info_output,
             queue_fig_plot,
             queue_info_output,
+            disk_gauge_plot,
         ],
+    )
+
+    # ===== FAILED JOBS EVENTS =====
+    failed_refresh_btn.click(
+        fn=refresh_failed_jobs,
+        outputs=[failed_jobs_table, failed_summary, failed_disk_gauge]
+    )
+    
+    failed_jobs_table.select(
+        fn=get_failed_job_logs,
+        inputs=[failed_jobs_table],
+        outputs=[failed_logs_output]
+    )
+
+    # ===== SUCCESS JOBS EVENTS =====
+    success_refresh_btn.click(
+        fn=refresh_success_jobs,
+        outputs=[success_jobs_table, success_summary, success_disk_gauge]
+    )
+    
+    success_jobs_table.select(
+        fn=get_success_job_details,
+        inputs=[success_jobs_table],
+        outputs=[success_details_output]
     )
 
     # Initial load
@@ -666,6 +1136,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
             runner_info_output,
             queue_fig_plot,
             queue_info_output,
+            disk_gauge_plot,
         ],
     )
 
@@ -673,7 +1144,6 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
     app.css = """
     body { background: radial-gradient(circle at top, #0f172a 0, #020617 55%, #000 100%); }
 
-    /* Log output styling */
     #srd-log-output textarea {
         font-family: 'SF Mono', 'Monaco', 'Menlo', 'Ubuntu Mono', 'Consolas', monospace !important;
         background-color: #0b1120 !important;
@@ -684,7 +1154,6 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
         border: 1px solid #1e293b !important;
     }
 
-    /* Dataframe styling */
     .dataframe {
         font-size: 13px !important;
         font-family: 'SF Mono', 'Monaco', 'Menlo', monospace !important;
@@ -715,7 +1184,6 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
         transition: background-color 0.15s ease-out !important;
     }
 
-    /* Primary button styling */
     .gr-button-primary {
         background: linear-gradient(90deg, #4299e1 0%, #667eea 100%) !important;
         border: none !important;
@@ -727,14 +1195,12 @@ with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
         box-shadow: 0 4px 14px rgba(56, 189, 248, 0.45) !important;
     }
 
-    /* Accordions */
     .gr-accordion {
         border-radius: 10px !important;
         border: 1px solid #1f2933 !important;
         background-color: rgba(15, 23, 42, 0.7) !important;
     }
 
-    /* Plots */
     .plotly {
         border-radius: 10px !important;
         border: 1px solid #1f2933 !important;
