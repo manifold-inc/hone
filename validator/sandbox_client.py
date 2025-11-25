@@ -63,7 +63,8 @@ class SandboxRunnerClient:
         payload = {k: v for k, v in payload.items() if v is not None}
         
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(
                     url,
                     json=payload,
@@ -101,7 +102,8 @@ class SandboxRunnerClient:
         url = f"{self.endpoint}/v1/jobs/{job_id}"
         
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
                     url,
                     headers=self._get_headers(),
@@ -147,7 +149,8 @@ class SandboxRunnerClient:
         url = f"{self.endpoint}/v1/jobs/{job_id}/metrics"
         
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
                     url,
                     headers=self._get_headers(),
@@ -242,7 +245,8 @@ class SandboxRunnerClient:
         url = f"{self.endpoint}/v1/jobs/{job_id}"
         
         try:
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.delete(
                     url,
                     headers=self._get_headers(),

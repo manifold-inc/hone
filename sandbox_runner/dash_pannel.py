@@ -872,7 +872,7 @@ def update_timer(enabled: bool, interval: int):
 # Gradio UI
 # ============================================================
 
-with gr.Blocks(title="Sandbox Runner Dashboard", theme=gr.themes.Soft()) as app:
+with gr.Blocks(title="Sandbox Runner Dashboard") as app:
     gr.HTML(
         """
         <div style="text-align: center; padding: 18px 0 10px;">
