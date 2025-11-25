@@ -1,26 +1,20 @@
 """
 Log Streaming API Routes
 
-Provides endpoints for retrieving and streaming job execution logs.
+Provides endpoints for retrieving and streaming job execution logs
 """
 
-from typing import Optional, Dict, List
-from datetime import datetime
-
+from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 import logging
 
-from api.auth import AuthenticationManager
-from api.routes import authenticate_request, get_meta_manager
+from api.routes import authenticate_request
 from core.log_manager import get_log_manager, initialize_log_manager
+
 
 logger = logging.getLogger(__name__)
 
-
-# ============================================================================
-# Request/Response Models
-# ============================================================================
 
 class LogEntry(BaseModel):
     """Single log entry"""
@@ -50,16 +44,11 @@ class LogStatsResponse(BaseModel):
     active_jobs: List[str]
 
 
-# ============================================================================
-# Helper function to ensure log manager is available
-# ============================================================================
-
 def ensure_log_manager():
     """Ensure log manager is initialized and available"""
     try:
         return get_log_manager()
     except RuntimeError:
-        # Try to initialize with default settings
         try:
             return initialize_log_manager(retention_hours=1)
         except:
@@ -69,85 +58,9 @@ def ensure_log_manager():
             )
 
 
-# ============================================================================
-# Router Creation
-# ============================================================================
-
 def create_logs_router() -> APIRouter:
     """Create logs API router."""
     router = APIRouter(tags=["logs"])
-    
-    @router.get(
-        "/logs/{job_id}",
-        response_model=LogStreamResponse,
-        summary="Get logs for a job"
-    )
-    async def get_job_logs(
-        job_id: str,
-        cursor_id: Optional[str] = Query(None, description="Cursor for incremental fetching"),
-        limit: int = Query(1000, ge=1, le=10000, description="Maximum number of entries to return"),
-        phase: Optional[str] = Query(None, description="Filter by phase (build, prep, inference, vllm)"),
-        auth: tuple = Depends(authenticate_request)
-    ):
-        """
-        Get logs for a specific job with cursor support.
-        
-        This endpoint supports incremental fetching using cursors:
-        - First call: Don't provide cursor_id, returns initial logs and a cursor
-        - Subsequent calls: Use the cursor_id to get only new logs
-        
-        Args:
-            job_id: Job identifier
-            cursor_id: Optional cursor for incremental fetching
-            limit: Maximum number of log entries to return (1-10000)
-            phase: Optional phase filter
-        """
-        log_manager = ensure_log_manager()
-        result = log_manager.get_logs(
-            job_id=job_id,
-            cursor_id=cursor_id,
-            limit=limit,
-            phase=phase
-        )
-        
-        if "error" in result:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=result["error"]
-            )
-        
-        return LogStreamResponse(**result)
-    
-    @router.get(
-        "/logs/{job_id}/all",
-        response_model=LogStreamResponse,
-        summary="Get all logs for a job"
-    )
-    async def get_all_job_logs(
-        job_id: str,
-        phase: Optional[str] = Query(None, description="Filter by phase"),
-        auth: tuple = Depends(authenticate_request)
-    ):
-        """
-        Get all logs for a job (no cursor/pagination).
-        
-        Warning: This can return a large amount of data for long-running jobs.
-        Consider using the cursor-based endpoint for large logs.
-        
-        Args:
-            job_id: Job identifier
-            phase: Optional phase filter
-        """
-        log_manager = ensure_log_manager()
-        result = log_manager.get_all_logs(job_id=job_id, phase=phase)
-        
-        if "error" in result:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=result["error"]
-            )
-        
-        return LogStreamResponse(**result)
     
     @router.get(
         "/logs/{job_id}/tail",
@@ -185,93 +98,3 @@ def create_logs_router() -> APIRouter:
             result["entries"] = entries[-lines:]
         
         return LogStreamResponse(**result)
-    
-    @router.delete(
-        "/logs/{job_id}",
-        summary="Clear logs for a job"
-    )
-    async def clear_job_logs(
-        job_id: str,
-        auth: tuple = Depends(authenticate_request)
-    ):
-        """
-        Clear all logs for a specific job.
-        
-        Args:
-            job_id: Job identifier
-        """
-        log_manager = ensure_log_manager()
-        log_manager.clear_job_logs(job_id)
-        
-        return {
-            "message": f"Logs cleared for job {job_id}",
-            "job_id": job_id
-        }
-    
-    @router.get(
-        "/logs/stats",
-        response_model=LogStatsResponse,
-        summary="Get log service statistics"
-    )
-    async def get_log_stats(
-        auth: tuple = Depends(authenticate_request)
-    ):
-        """Get statistics about the log service."""
-        log_manager = ensure_log_manager()
-        stats = log_manager.get_stats()
-        
-        return LogStatsResponse(**stats)
-    
-    @router.get(
-        "/logs/active",
-        summary="Get list of jobs with active logs"
-    )
-    async def get_active_log_jobs(
-        auth: tuple = Depends(authenticate_request)
-    ):
-        """Get list of job IDs that have active log streams."""
-        log_manager = ensure_log_manager()
-        active_jobs = log_manager.get_active_jobs()
-        
-        return {
-            "active_jobs": active_jobs,
-            "count": len(active_jobs)
-        }
-    
-    @router.get(
-        "/logs/{job_id}/phases",
-        summary="Get available phases for a job"
-    )
-    async def get_job_phases(
-        job_id: str,
-        auth: tuple = Depends(authenticate_request)
-    ):
-        """
-        Get list of phases that have logs for a specific job.
-        
-        Args:
-            job_id: Job identifier
-        """
-        log_manager = ensure_log_manager()
-        
-        # Get all logs to determine available phases
-        result = log_manager.get_all_logs(job_id=job_id)
-        
-        if "error" in result:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=result["error"]
-            )
-        
-        # Extract unique phases
-        phases = set()
-        for entry in result.get("entries", []):
-            phases.add(entry.get("phase"))
-        
-        return {
-            "job_id": job_id,
-            "phases": sorted(list(phases)),
-            "count": len(phases)
-        }
-    
-    return router
