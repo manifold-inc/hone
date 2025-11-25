@@ -98,3 +98,5 @@ def create_logs_router() -> APIRouter:
             result["entries"] = entries[-lines:]
         
         return LogStreamResponse(**result)
+    
+    return router
