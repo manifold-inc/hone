@@ -140,38 +140,28 @@ class Database:
         weight_class: str,
         use_vllm: bool,
         vllm_config: Optional[Dict],
-        exact_match_rate: float,
-        partial_correctness_avg: float,
-        grid_similarity_avg: float,
-        efficiency_avg: float,
-        overall_score: float
+        exact_match_rate: float
     ):
-        """Save or update submission history with metrics"""
+        """Save or update submission history with exact_match_rate"""
         async with self.pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO submission_history (
                     hotkey, repo_url, repo_branch, repo_commit, repo_path, weight_class,
                     use_vllm, vllm_config,
-                    exact_match_rate, partial_correctness_avg, grid_similarity_avg, 
-                    efficiency_avg, overall_score,
+                    exact_match_rate,
                     first_submitted_at, last_evaluated_at, evaluation_count
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, NOW(), NOW(), 1)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, NOW(), NOW(), 1)
                 ON CONFLICT (hotkey, repo_url, repo_branch, COALESCE(repo_commit, ''), repo_path, weight_class)
                 DO UPDATE SET
                     exact_match_rate = EXCLUDED.exact_match_rate,
-                    partial_correctness_avg = EXCLUDED.partial_correctness_avg,
-                    grid_similarity_avg = EXCLUDED.grid_similarity_avg,
-                    efficiency_avg = EXCLUDED.efficiency_avg,
-                    overall_score = EXCLUDED.overall_score,
                     last_evaluated_at = NOW(),
                     evaluation_count = submission_history.evaluation_count + 1
                 """,
-                hotkey, repo_url, repo_branch, repo_commit, repo_path, weight_class,
+                hotkey, repo_url, repo_branch, repo_commit or '', repo_path, weight_class,
                 use_vllm, json.dumps(vllm_config) if vllm_config else None,
-                exact_match_rate, partial_correctness_avg, grid_similarity_avg,
-                efficiency_avg, overall_score
+                exact_match_rate
             )
 
     async def record_query_result(
@@ -184,15 +174,7 @@ class Database:
         error: Optional[str], 
         response_time: Optional[float], 
         ts: datetime,
-        exact_match: bool = False,
-        partial_correctness: float = 0.0,
-        grid_similarity: float = 0.0,
-        efficiency_score: float = 0.0,
-        problem_id: Optional[str] = None,
-        base_task_num: Optional[int] = None,
-        chain_length: Optional[int] = None,
-        transformation_chain: Optional[List[Dict]] = None,
-        num_train_examples: Optional[int] = None,
+        exact_match_rate: float = 0.0,
         repo_url: Optional[str] = None,
         repo_branch: Optional[str] = None,
         repo_commit: Optional[str] = None,
@@ -202,21 +184,18 @@ class Database:
     ):
         async with self.pool.acquire() as conn:
             response_json = json.dumps(response) if response else None
-            chain_json = json.dumps(transformation_chain) if transformation_chain else None
             
             await conn.execute(
                 """
                 INSERT INTO query_results (
                     block, uid, hotkey, success, response, error, response_time, timestamp,
-                    exact_match, partial_correctness, grid_similarity, efficiency_score,
-                    problem_id, base_task_num, chain_length, transformation_chain, num_train_examples,
+                    exact_match_rate,
                     repo_url, repo_branch, repo_commit, repo_path, weight_class, from_cache
                 )
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17, $18, $19, $20, $21, $22, $23)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 """,
                 block, uid, hotkey, success, response_json, error, response_time, ts,
-                exact_match, partial_correctness, grid_similarity, efficiency_score,
-                problem_id, base_task_num, chain_length, chain_json, num_train_examples,
+                exact_match_rate,
                 repo_url, repo_branch, repo_commit, repo_path, weight_class, from_cache
             )
 
@@ -228,7 +207,7 @@ class Database:
             return await conn.fetch(
                 """
                 SELECT * FROM leaderboard
-                ORDER BY overall_score DESC
+                ORDER BY exact_match_rate DESC
                 LIMIT $1
                 """,
                 limit
@@ -238,11 +217,7 @@ class Database:
         self,
         hotkey: str,
         uid: int,
-        overall_score: float,
         exact_match_rate: float,
-        partial_correctness_avg: float,
-        grid_similarity_avg: float,
-        efficiency_avg: float,
         repo_url: str,
         repo_branch: str,
         repo_commit: Optional[str],
@@ -253,18 +228,14 @@ class Database:
             await conn.execute(
                 """
                 INSERT INTO leaderboard (
-                    hotkey, uid, overall_score, exact_match_rate, partial_correctness_avg,
-                    grid_similarity_avg, efficiency_avg, repo_url, repo_branch, repo_commit,
-                    repo_path, first_achieved_at, last_updated_at, evaluation_count
+                    hotkey, uid, exact_match_rate,
+                    repo_url, repo_branch, repo_commit, repo_path,
+                    first_achieved_at, last_updated_at, evaluation_count
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW(), NOW(), 1)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW(), 1)
                 ON CONFLICT (hotkey) DO UPDATE SET
                     uid = EXCLUDED.uid,
-                    overall_score = EXCLUDED.overall_score,
                     exact_match_rate = EXCLUDED.exact_match_rate,
-                    partial_correctness_avg = EXCLUDED.partial_correctness_avg,
-                    grid_similarity_avg = EXCLUDED.grid_similarity_avg,
-                    efficiency_avg = EXCLUDED.efficiency_avg,
                     repo_url = EXCLUDED.repo_url,
                     repo_branch = EXCLUDED.repo_branch,
                     repo_commit = EXCLUDED.repo_commit,
@@ -272,8 +243,7 @@ class Database:
                     last_updated_at = NOW(),
                     evaluation_count = leaderboard.evaluation_count + 1
                 """,
-                hotkey, uid, overall_score, exact_match_rate, partial_correctness_avg,
-                grid_similarity_avg, efficiency_avg, repo_url, repo_branch, repo_commit, repo_path
+                hotkey, uid, exact_match_rate, repo_url, repo_branch, repo_commit, repo_path
             )
 
     async def remove_from_leaderboard(self, hotkey: str):
@@ -296,34 +266,25 @@ class Database:
                 min_block
             )
 
-    async def save_scores(self, scores: Dict[int, Dict[str, float]], hotkey_map: Dict[int, str]):
+    async def save_scores(self, scores: Dict[int, float], hotkey_map: Dict[int, str]):
         """
-        Save scores with detailed metrics
-        scores format: {uid: {"score": float, "exact_match_rate": float, ...}}
+        Save scores (exact_match_rate based)
+        scores format: {uid: exact_match_rate}
         hotkey_map: {uid: hotkey}
         """
         ts = datetime.now(timezone.utc).replace(tzinfo=None)
         async with self.pool.acquire() as conn:
-            for uid, metrics in scores.items():
+            for uid, exact_match_rate in scores.items():
                 hotkey = hotkey_map.get(uid)
                 if not hotkey:
                     continue
                     
                 await conn.execute(
                     """
-                    INSERT INTO scores (
-                        uid, hotkey, score, exact_match_rate, partial_correctness_avg, 
-                        efficiency_avg, timestamp
-                    ) 
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    INSERT INTO scores (uid, hotkey, exact_match_rate, timestamp) 
+                    VALUES ($1, $2, $3, $4)
                     """,
-                    uid,
-                    hotkey,
-                    float(metrics.get("score", 0.0)),
-                    float(metrics.get("exact_match_rate", 0.0)),
-                    float(metrics.get("partial_correctness_avg", 0.0)),
-                    float(metrics.get("efficiency_avg", 0.0)),
-                    ts
+                    uid, hotkey, float(exact_match_rate), ts
                 )
 
     async def get_scores_last_hours(self, hours: int = 24) -> List[asyncpg.Record]:
@@ -335,20 +296,18 @@ class Database:
             return rows
 
     async def get_miner_performance_stats(self, uid: int, window_blocks: int, current_block: int) -> Dict:
-        """Get detailed performance statistics for a specific miner"""
+        """Get performance statistics for a specific miner"""
         min_block = max(0, current_block - window_blocks)
         async with self.pool.acquire() as conn:
             stats = await conn.fetchrow(
                 """
                 SELECT 
                     COUNT(*) as total_queries,
-                    SUM(CASE WHEN exact_match THEN 1 ELSE 0 END)::float / NULLIF(COUNT(*), 0) as exact_match_rate,
-                    AVG(partial_correctness) as avg_partial_correctness,
-                    AVG(grid_similarity) as avg_grid_similarity,
-                    AVG(efficiency_score) as avg_efficiency,
+                    AVG(exact_match_rate) as avg_exact_match_rate,
+                    MAX(exact_match_rate) as max_exact_match_rate,
                     AVG(response_time) as avg_response_time
                 FROM query_results
-                WHERE uid = $1 AND block >= $2
+                WHERE uid = $1 AND block >= $2 AND success = true
                 """,
                 uid, min_block
             )
@@ -373,53 +332,5 @@ class Database:
                 str(retention_days)
             )
             
-            # clean up old daily submissions
-            
-            #await conn.execute(
-            #    """
-            #    DELETE FROM daily_submissions
-            #    WHERE submission_date < CURRENT_DATE - INTERVAL '90 days'
-            #    """
-            #)
-            
             logger.info(f"Cleaned up data older than {retention_days} days")
             return deleted_queries, deleted_scores
-
-    async def get_performance_by_task_type(self, uid: int, window_blocks: int, current_block: int) -> Dict:
-        """Analyze miner performance by task characteristics to detect overfitting"""
-        min_block = max(0, current_block - window_blocks)
-        async with self.pool.acquire() as conn:
-            by_task = await conn.fetch(
-                """
-                SELECT 
-                    base_task_num,
-                    COUNT(*) as attempts,
-                    AVG(CASE WHEN exact_match THEN 1.0 ELSE 0.0 END) as exact_match_rate,
-                    AVG(partial_correctness) as avg_partial
-                FROM query_results
-                WHERE uid = $1 AND block >= $2 AND base_task_num IS NOT NULL
-                GROUP BY base_task_num
-                ORDER BY attempts DESC
-                """,
-                uid, min_block
-            )
-            
-            by_chain = await conn.fetch(
-                """
-                SELECT 
-                    chain_length,
-                    COUNT(*) as attempts,
-                    AVG(CASE WHEN exact_match THEN 1.0 ELSE 0.0 END) as exact_match_rate,
-                    AVG(partial_correctness) as avg_partial
-                FROM query_results
-                WHERE uid = $1 AND block >= $2 AND chain_length IS NOT NULL
-                GROUP BY chain_length
-                ORDER BY chain_length
-                """,
-                uid, min_block
-            )
-            
-            return {
-                'by_base_task': [dict(row) for row in by_task],
-                'by_chain_length': [dict(row) for row in by_chain]
-            }
