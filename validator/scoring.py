@@ -8,12 +8,12 @@ import math
 
 async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, Dict]) -> Tuple[Dict[int, float], Dict[int, str]]:
     """
-    NEW INCENTIVE MECHANISM:
+    Calculate scores based on exact_match_rate only
     
-    1. Calculate aggregate metrics for all REGISTERED miners from recent query results
-    2. Filter miners meeting minimum accuracy floor (default 20%)
+    1. Get aggregate exact_match_rate for all REGISTERED miners from recent query results
+    2. Filter miners meeting minimum accuracy floor
     3. Update leaderboard with current top performers
-    4. Return exponentially distributed rewards for top 5 miners
+    4. Return exponentially distributed rewards for top N miners
     
     Returns:
         (scores: Dict[uid -> weight], hotkey_map: Dict[uid -> hotkey])
@@ -31,42 +31,39 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
     logger.info(f"  Window: {window_blocks} blocks")
     logger.info(f"=" * 80)
 
-    # get recent results
     rows = await db.get_recent_results(window_blocks=window_blocks, current_block=current_block)
     
-    # aggregate metrics per hotkey (only for registered miners)
     registered_hotkeys = {miner.get("hotkey") for miner in miners.values() if miner.get("hotkey")}
     
     miner_stats: Dict[str, Dict] = {}
     
     for r in rows:
-        hotkey = r.get('hotkey')
+        hotkey = r.get('hotkey') if hasattr(r, 'get') else r['hotkey']
         if not hotkey or hotkey not in registered_hotkeys:
             continue
             
         if hotkey not in miner_stats:
             miner_stats[hotkey] = {
                 'count': 0,
-                'exact_matches': 0,
-                'partial_sum': 0.0,
-                'similarity_sum': 0.0,
-                'efficiency_sum': 0.0,
+                'exact_match_rate_sum': 0.0,
                 'successful_responses': 0,
-                'uid': r.get('uid')
+                'uid': r.get('uid') if hasattr(r, 'get') else r['uid']
             }
         
         stats = miner_stats[hotkey]
         stats['count'] += 1
         
-        if r['success']:
+        success = r.get('success') if hasattr(r, 'get') else r['success']
+        if success:
             stats['successful_responses'] += 1
-            stats['exact_matches'] += 1 if r.get('exact_match', False) else 0
-            stats['partial_sum'] += float(r.get('partial_correctness', 0.0))
-            stats['similarity_sum'] += float(r.get('grid_similarity', 0.0))
-            stats['efficiency_sum'] += float(r.get('efficiency_score', 0.0))
+            
+            exact_match_rate = r.get('exact_match_rate') if hasattr(r, 'get') else r['exact_match_rate']
+            if exact_match_rate is not None:
+                stats['exact_match_rate_sum'] += float(exact_match_rate)
+            
+        logger.debug(f"Hotkey {hotkey[:12]}... - Stats: {stats}")
     
-    # calculate overall scores and filter by floor
-    qualifying_miners: List[Tuple[str, int, Dict]] = []
+    qualifying_miners: List[Tuple[str, int, float]] = []
     
     for hotkey, stats in miner_stats.items():
         if stats['count'] < min_responses:
@@ -74,47 +71,20 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
             continue
         
         if stats['successful_responses'] == 0:
+            logger.debug(f"Hotkey {hotkey[:12]}...: no successful responses")
             continue
         
-        exact_rate = stats['exact_matches'] / stats['count']
-        partial_avg = stats['partial_sum'] / stats['successful_responses']
-        similarity_avg = stats['similarity_sum'] / stats['successful_responses']
-        efficiency_avg = stats['efficiency_sum'] / stats['successful_responses']
+        avg_exact_match_rate = stats['exact_match_rate_sum'] / stats['successful_responses']
         
-        # check floor requirement - exact match rate must be >= floor
-        if exact_rate < min_accuracy_floor:
-            logger.debug(f"Hotkey {hotkey[:12]}...: Below floor ({exact_rate*100:.1f}% < {min_accuracy_floor*100:.1f}%)")
+        if avg_exact_match_rate < min_accuracy_floor:
+            logger.debug(f"Hotkey {hotkey[:12]}...: Below floor ({avg_exact_match_rate*100:.1f}% < {min_accuracy_floor*100:.1f}%)")
             continue
         
-        # calculate overall score using same weights as before
-        weights = {
-            'exact_match': 0.4,
-            'partial': 0.3,
-            'similarity': 0.2,
-            'efficiency': 0.1
-        }
-        
-        overall_score = (
-            weights['exact_match'] * exact_rate +
-            weights['partial'] * partial_avg +
-            weights['similarity'] * similarity_avg +
-            weights['efficiency'] * efficiency_avg
-        )
-        
-        metrics = {
-            "overall_score": overall_score,
-            "exact_match_rate": exact_rate,
-            "partial_correctness_avg": partial_avg,
-            "grid_similarity_avg": similarity_avg,
-            "efficiency_avg": efficiency_avg
-        }
-        
-        qualifying_miners.append((hotkey, stats['uid'], metrics))
+        qualifying_miners.append((hotkey, stats['uid'], avg_exact_match_rate))
         
         logger.info(
-            f"Hotkey {hotkey[:12]}... | Score: {overall_score:.3f} | "
-            f"Exact: {exact_rate*100:.1f}% | Partial: {partial_avg:.2f} | "
-            f"Similarity: {similarity_avg:.2f} | Efficiency: {efficiency_avg:.2f}"
+            f"Hotkey {hotkey[:12]}... | Exact Match Rate: {avg_exact_match_rate*100:.2f}% | "
+            f"Responses: {stats['successful_responses']}"
         )
     
     logger.info(f"Found {len(qualifying_miners)} miners meeting floor requirement")
@@ -123,20 +93,20 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
         logger.warning("No miners meet minimum accuracy floor")
         return {}, {}
     
-    # sort by overall score (descending)
-    qualifying_miners.sort(key=lambda x: x[2]["overall_score"], reverse=True)
+    # sort by exact_match_rate (descending)
+    qualifying_miners.sort(key=lambda x: x[2], reverse=True)
     
     top_miners = qualifying_miners[:top_miners_count]
     
-    for hotkey, uid, metrics in top_miners:
-        # get repo info from most recent submission
+    for hotkey, uid, exact_match_rate in top_miners:
         miner = await db.get_miner_by_hotkey(hotkey)
         if miner:
-            # find most recent query result for this hotkey to get repo info
             recent_results = await db.get_recent_results(window_blocks=window_blocks, current_block=current_block)
             repo_info = None
             for r in recent_results:
-                if r.get('hotkey') == hotkey and r.get('repo_url'):
+                r_hotkey = r.get('hotkey') if hasattr(r, 'get') else r['hotkey']
+                r_repo_url = r.get('repo_url') if hasattr(r, 'get') else r['repo_url']
+                if r_hotkey == hotkey and r_repo_url:
                     repo_info = r
                     break
             
@@ -144,19 +114,15 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
                 await db.update_leaderboard(
                     hotkey=hotkey,
                     uid=uid,
-                    overall_score=metrics["overall_score"],
-                    exact_match_rate=metrics["exact_match_rate"],
-                    partial_correctness_avg=metrics["partial_correctness_avg"],
-                    grid_similarity_avg=metrics["grid_similarity_avg"],
-                    efficiency_avg=metrics["efficiency_avg"],
-                    repo_url=repo_info.get('repo_url'),
-                    repo_branch=repo_info.get('repo_branch', 'main'),
-                    repo_commit=repo_info.get('repo_commit'),
-                    repo_path=repo_info.get('repo_path', '')
+                    exact_match_rate=exact_match_rate,
+                    repo_url=repo_info.get('repo_url') if hasattr(repo_info, 'get') else repo_info['repo_url'],
+                    repo_branch=repo_info.get('repo_branch', 'main') if hasattr(repo_info, 'get') else repo_info['repo_branch'] or 'main',
+                    repo_commit=repo_info.get('repo_commit') if hasattr(repo_info, 'get') else repo_info['repo_commit'],
+                    repo_path=repo_info.get('repo_path', '') if hasattr(repo_info, 'get') else repo_info['repo_path'] or ''
                 )
     
     # remove miners from leaderboard who are no longer in top N
-    current_leaderboard = await db.get_leaderboard(limit=100)  # get all
+    current_leaderboard = await db.get_leaderboard(limit=100)
     leaderboard_hotkeys = {entry['hotkey'] for entry in current_leaderboard}
     top_hotkeys = {hotkey for hotkey, _, _ in top_miners}
     
@@ -164,7 +130,7 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
         logger.info(f"Removing {hotkey[:12]}... from leaderboard (no longer in top {top_miners_count})")
         await db.remove_from_leaderboard(hotkey)
         
-    decay_factor = 0.8  # (higher = more concentrated)
+    decay_factor = 0.8
     
     exponential_weights = []
     for rank in range(len(top_miners)):
@@ -173,27 +139,25 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
     total_weight = sum(exponential_weights)
     normalized_weights = [w / total_weight for w in exponential_weights]
     
-    # create final weight dictionary
     final_scores = {}
     hotkey_map = {}
     
-    for i, (hotkey, uid, metrics) in enumerate(top_miners):
+    for i, (hotkey, uid, exact_match_rate) in enumerate(top_miners):
         weight = normalized_weights[i]
         final_scores[uid] = weight
         hotkey_map[uid] = hotkey
         
         logger.info(
             f"#{i+1} | UID {uid} | Hotkey {hotkey[:12]}... | "
-            f"Score: {metrics['overall_score']:.3f} | "
+            f"Exact Match Rate: {exact_match_rate*100:.2f}% | "
             f"Weight: {weight*100:.2f}%"
         )
     
-    # save detailed scores to database
-    scores_with_metrics = {}
-    for hotkey, uid, metrics in qualifying_miners:
-        scores_with_metrics[uid] = metrics
+    # save scores to database
+    scores_for_db = {uid: exact_match_rate for hotkey, uid, exact_match_rate in qualifying_miners}
+    hotkey_map_for_db = {uid: hotkey for hotkey, uid, _ in qualifying_miners}
     
-    await db.save_scores(scores_with_metrics, {uid: hk for hk, uid, _ in qualifying_miners})
+    await db.save_scores(scores_for_db, hotkey_map_for_db)
     
     logger.info(f"=" * 80)
     logger.info(f"Leaderboard updated: {len(top_miners)} miners in top {top_miners_count}")
@@ -238,7 +202,6 @@ async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
         logger.info(f"Weights: {BURN_PERCENTAGE*100:.0f}% burn + {MINER_PERCENTAGE*100:.0f}% to top miners")
     
     if not scores or sum(scores.values()) <= 0:
-        # no qualifying miners - burn everything
         logger.warning("No qualifying miners found - burning 100% to burn UID")
         all_weights[BURN_UID] = 1.0
         
@@ -247,14 +210,12 @@ async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
         logger.info(f"  UID {BURN_UID:>3} - Weight: 100.00%")
         logger.info("=" * 60)
     else:
-        # distribute according to exponential weights
         for uid, weight in scores.items():
             if uid < total_uids:
                 all_weights[uid] = weight
             else:
                 logger.warning(f"UID {uid} out of range (max: {total_uids-1})")
         
-        # normalize to ensure sum = 1.0
         weight_sum = sum(all_weights)
         if weight_sum > 0:
             all_weights = [w / weight_sum for w in all_weights]
