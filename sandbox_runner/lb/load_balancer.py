@@ -1051,7 +1051,7 @@ def create_app(config: Config) -> FastAPI:
         """Health check endpoint v1 (no auth required)"""
         return await health_check()
     
-    @app.post("/v1/jobs/submit", dependencies=[Depends(verify_api_key)])
+    @app.post("/v1/jobs/submit", dependencies=[Depends(verify_api_key)], status_code=201)
     async def submit_job(request: JobSubmitRequest, api_key: str = Depends(verify_api_key)):
         """Submit a job for execution"""
         return await lb.submit_job(request, api_key)
