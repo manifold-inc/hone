@@ -582,6 +582,7 @@ class APIKeyManager:
     
     def validate(self, api_key: str) -> bool:
         """Validate an API key"""
+        print(api_key, self.valid_keys)
         return api_key in self.valid_keys
     
     def add_key(self, api_key: str):
