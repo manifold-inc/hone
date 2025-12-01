@@ -33,7 +33,7 @@ A Bittensor subnet where **validators** evaluate **miners** on their ability to 
 - **Metric**: `exact_match_rate` — percentage of ARC problems solved correctly
 - **Minimum floor**: 20% accuracy required to qualify
 - **Top 5** miners above floor receive rewards
-- **Exponential distribution**: Rank 1 gets most weight, decaying by factor 0.8 per rank
+- **No qualifiers**: If no miners meet the floor, 100% is burned
 
 ### Key Features
 
