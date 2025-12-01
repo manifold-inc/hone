@@ -8,7 +8,6 @@ from common.chain import ChainInterface
 from validator.config import ValidatorConfig
 from validator.db import Database
 from validator import cycle
-from validator.synthetics.arcgen.arc_agi2_generator import ARC2Generator
 from validator.telemetry import TelemetryClient
 
 class Validator:
@@ -44,16 +43,21 @@ class Validator:
             'last_weights_block': None
         }
 
-        self.synthetic_generator = ARC2Generator(max_chain_length=6)
+        # REMOVED: self.synthetic_generator = ARC2Generator(max_chain_length=6)
+        # synthetic generation now handled by sandbox runner
         
-
-        self.telemetry_client  = TelemetryClient(
+        self.telemetry_client = TelemetryClient(
             endpoint_base_url=os.getenv("TELEMETRY_ENDPOINT", ""),
             max_queue_size=1000,
             request_timeout_s=5.0,
         )
 
         self.last_cleanup_time = None
+        
+        logger.info(f"Validator initialized")
+        logger.info(f"  Hotkey: {config.hotkey}")
+        logger.info(f"  Sandbox endpoint: {config.sandbox_runner_endpoint}")
+        logger.info(f"  Sandbox timeout: {config.sandbox_runner_timeout_hours}h")
     
     async def start(self):
         await self.db.connect()
@@ -64,7 +68,7 @@ class Validator:
                 lambda s=sig: asyncio.create_task(self.shutdown(s))
             )
         
-        logger.info("Validator started")
+        logger.info("Validator started successfully")
     
     async def shutdown(self, sig):
         logger.info(f"Received exit signal {sig.name}...")

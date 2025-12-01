@@ -386,8 +386,6 @@ class ChainInterface:
         self,
         uids: List[int],
         weights: List[float],
-        wait_for_inclusion: bool = True,
-        wait_for_finalization: bool = True
     ) -> Optional[str]:
         """
         Set weights for specified UIDs.

@@ -46,12 +46,14 @@ services:
       
       DB_URL: postgresql://postgres:postgres@db:5432/hone_test
       
-      CYCLE_DURATION: 5  
+      CYCLE_DURATION: 5000
       
       WALLET_NAME: validator
       WALLET_HOTKEY: validator
       
       LOG_LEVEL: INFO
+      SANDBOX_RUNNER_ENDPOINT: 
+      SANDBOX_RUNNER_API_KEY: 
     depends_on:
       db:
         condition: service_healthy
