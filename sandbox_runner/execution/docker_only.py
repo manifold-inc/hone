@@ -1034,8 +1034,9 @@ class DockerOnlyExecutor:
             command.extend(['--max-model-len', str(max_model_len)])
 
         extra_args = vllm_config.get("extra_args", {})
-        for key, value in extra_args.items():
-            command.extend([f'--{key.replace("_", "-")}', str(value)])
+        if extra_args:
+            for key, value in extra_args.items():
+                command.extend([f'--{key.replace("_", "-")}', str(value)])
         
         logger.info(color_job_id(
             f"Starting vLLM container: {container_name} on network {network_name}",

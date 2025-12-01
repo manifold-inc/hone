@@ -35,7 +35,7 @@ async def get_miner_info(request: Request) -> Dict[str, Any]:
 
     miner_info = {
         "repo_url": os.getenv("MINER_REPO_URL", "https://github.com/manifold-inc/hone"),
-        "repo_branch": os.getenv("MINER_REPO_BRANCH", "feature/sandbox-runner"),
+        "repo_branch": os.getenv("MINER_REPO_BRANCH", "main"),
         "repo_commit": os.getenv("MINER_REPO_COMMIT"),  # optional - None means use latest
         "repo_path": os.getenv("MINER_REPO_PATH", "miner-solution-example"),  # optional subdirectory within repo
         "weight_class": os.getenv("MINER_WEIGHT_CLASS", "1xH200"),  # how many GPUs needed, use 1xH200 up to 8xH200
