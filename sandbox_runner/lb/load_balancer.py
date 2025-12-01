@@ -6,6 +6,7 @@ Routes validator requests to multiple sandbox runners with:
 - Sticky routing (job_id -> runner)
 - Health checks and failover
 - Persistent cache (memory + SQLite)
+- In-flight request deduplication
 
 Usage:
     pm2 start load_balancer.py --interpreter python3 --name sandbox-lb -- \
@@ -23,8 +24,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Set
-import subprocess
-import re
+import os
 
 import aiohttp
 from fastapi import FastAPI, HTTPException, Header, Depends
@@ -42,6 +42,7 @@ class Config:
         cache_ttl_days: int = 7,
         health_check_interval: int = 30,
         github_timeout: int = 10,
+        runner_api_key: str = None,
     ):
         self.runner_urls = [url.rstrip('/') for url in runner_urls]
         self.port = port
@@ -50,6 +51,7 @@ class Config:
         self.cache_ttl_seconds = cache_ttl_days * 24 * 3600
         self.health_check_interval = health_check_interval
         self.github_timeout = github_timeout
+        self.runner_api_key = runner_api_key or os.environ.get("RUNNER_API_KEY")
         
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -95,6 +97,19 @@ class CachedMetrics(BaseModel):
     metrics: Dict[str, Any]
     cached_at: str
     expires_at: str
+
+
+def make_cache_key(
+    repo_url: str,
+    repo_branch: str,
+    repo_commit: str,
+    repo_path: str,
+    weight_class: str
+) -> str:
+    """Generate deterministic cache key"""
+    normalized_url = repo_url.lower().rstrip('/').rstrip('.git')
+    key_data = f"{normalized_url}|{repo_branch}|{repo_commit}|{repo_path}|{weight_class}"
+    return hashlib.sha256(key_data.encode()).hexdigest()
 
 
 class CacheManager:
@@ -173,19 +188,6 @@ class CacheManager:
         conn.close()
         logger.info(f"Loaded {loaded} cached entries to memory")
     
-    def _make_cache_key(
-        self, 
-        repo_url: str, 
-        repo_branch: str, 
-        repo_commit: str, 
-        repo_path: str,
-        weight_class: str
-    ) -> str:
-        """Generate deterministic cache key"""
-        normalized_url = repo_url.lower().rstrip('/').rstrip('.git')
-        key_data = f"{normalized_url}|{repo_branch}|{repo_commit}|{repo_path}|{weight_class}"
-        return hashlib.sha256(key_data.encode()).hexdigest()
-    
     def get(
         self,
         repo_url: str,
@@ -195,7 +197,7 @@ class CacheManager:
         weight_class: str
     ) -> Optional[Dict[str, Any]]:
         """Get cached metrics if available and not expired"""
-        cache_key = self._make_cache_key(repo_url, repo_branch, repo_commit, repo_path, weight_class)
+        cache_key = make_cache_key(repo_url, repo_branch, repo_commit, repo_path, weight_class)
         
         # check memory first
         if cache_key in self.memory_cache:
@@ -252,7 +254,7 @@ class CacheManager:
         metrics: Dict[str, Any]
     ):
         """Store metrics in cache"""
-        cache_key = self._make_cache_key(repo_url, repo_branch, repo_commit, repo_path, weight_class)
+        cache_key = make_cache_key(repo_url, repo_branch, repo_commit, repo_path, weight_class)
         now = time.time()
         expires_at = now + self.config.cache_ttl_seconds
         
@@ -399,9 +401,10 @@ class GitHubResolver:
 class RunnerHealthManager:
     """Track health status of sandbox runners"""
     
-    def __init__(self, runner_urls: List[str], check_interval: int = 30):
+    def __init__(self, runner_urls: List[str], check_interval: int = 30, runner_api_key: str = None):
         self.runner_urls = runner_urls
         self.check_interval = check_interval
+        self.runner_api_key = runner_api_key
         self.health_status: Dict[str, Dict[str, Any]] = {
             url: {"healthy": True, "last_check": 0, "error": None, "queue_depth": 0}
             for url in runner_urls
@@ -457,18 +460,19 @@ class RunnerHealthManager:
                     }
                     
                     # try to get queue depth from status endpoint
-                    try:
-                        async with session.get(
-                            f"{runner_url}/v1/status",
-                            headers={"X-API-Key": "dev-key-12345"},  # TODO: change 
-                            timeout=aiohttp.ClientTimeout(total=5)
-                        ) as status_resp:
-                            if status_resp.status == 200:
-                                data = await status_resp.json()
-                                self.health_status[runner_url]["queue_depth"] = data.get("queue_depth", 0)
-                                self.health_status[runner_url]["active_jobs"] = data.get("active_jobs", 0)
-                    except:
-                        pass
+                    if self.runner_api_key:
+                        try:
+                            async with session.get(
+                                f"{runner_url}/v1/status",
+                                headers={"X-API-Key": self.runner_api_key},
+                                timeout=aiohttp.ClientTimeout(total=5)
+                            ) as status_resp:
+                                if status_resp.status == 200:
+                                    data = await status_resp.json()
+                                    self.health_status[runner_url]["queue_depth"] = data.get("queue_depth", 0)
+                                    self.health_status[runner_url]["active_jobs"] = data.get("active_jobs", 0)
+                        except:
+                            pass
                 else:
                     self.health_status[runner_url] = {
                         "healthy": False,
@@ -565,10 +569,11 @@ class APIKeyManager:
                 data = json.load(f)
                 self.valid_keys = set(data.get("keys", []))
         else:
-            # TODO : change
-            default_key = "lb-dev-key-12345"
-            self.valid_keys = {default_key}
-            self._save_keys()
+            env_keys = os.environ.get("LB_API_KEYS", "")
+            if env_keys:
+                self.valid_keys = set(key.strip() for key in env_keys.split(",") if key.strip())
+            if self.valid_keys:
+                self._save_keys()
     
     def _save_keys(self):
         """Save API keys to file"""
@@ -598,6 +603,7 @@ class StatsTracker:
         self.total_requests = 0
         self.cache_hits = 0
         self.cache_misses = 0
+        self.inflight_hits = 0
         self.jobs_submitted = 0
         self.jobs_completed = 0
         self.jobs_failed = 0
@@ -609,6 +615,10 @@ class StatsTracker:
     
     def record_cache_miss(self):
         self.cache_misses += 1
+        self.total_requests += 1
+    
+    def record_inflight_hit(self):
+        self.inflight_hits += 1
         self.total_requests += 1
     
     def record_job_submitted(self):
@@ -625,14 +635,15 @@ class StatsTracker:
     
     def get_stats(self) -> Dict[str, Any]:
         uptime = time.time() - self.started_at
-        cache_total = self.cache_hits + self.cache_misses
-        hit_rate = (self.cache_hits / cache_total * 100) if cache_total > 0 else 0
+        cache_total = self.cache_hits + self.cache_misses + self.inflight_hits
+        hit_rate = ((self.cache_hits + self.inflight_hits) / cache_total * 100) if cache_total > 0 else 0
         
         return {
             "uptime_seconds": uptime,
             "uptime_human": f"{uptime / 3600:.1f} hours",
             "total_requests": self.total_requests,
             "cache_hits": self.cache_hits,
+            "inflight_hits": self.inflight_hits,
             "cache_misses": self.cache_misses,
             "cache_hit_rate_percent": round(hit_rate, 2),
             "jobs_submitted": self.jobs_submitted,
@@ -642,6 +653,23 @@ class StatsTracker:
         }
 
 
+class InflightJob:
+    """Tracks an in-flight job submission"""
+    
+    def __init__(
+        self,
+        job_id: str,
+        runner_url: str,
+        response: Dict[str, Any],
+        submitted_at: float
+    ):
+        self.job_id = job_id
+        self.runner_url = runner_url
+        self.response = response
+        self.submitted_at = submitted_at
+        self.subscriber_count = 1
+
+
 class LoadBalancer:
     """Main load balancer orchestrator"""
     
@@ -649,13 +677,27 @@ class LoadBalancer:
         self.config = config
         self.cache = CacheManager(config)
         self.github = GitHubResolver(timeout=config.github_timeout)
-        self.health_manager = RunnerHealthManager(config.runner_urls, config.health_check_interval)
+        self.health_manager = RunnerHealthManager(
+            config.runner_urls,
+            config.health_check_interval,
+            runner_api_key=config.runner_api_key
+        )
         self.router = JobRouter(self.health_manager)
         self.api_keys = APIKeyManager(config)
         self.stats = StatsTracker()
         
         # job_id -> {runner_url, metrics cached after completion}
         self.pending_jobs: Dict[str, Dict[str, Any]] = {}
+        
+        # cache_key -> InflightJob (for deduplication)
+        self.inflight_jobs: Dict[str, InflightJob] = {}
+        self._inflight_lock = asyncio.Lock()
+    
+    def _get_runner_headers(self) -> Dict[str, str]:
+        """Get headers for runner requests"""
+        if self.config.runner_api_key:
+            return {"X-API-Key": self.config.runner_api_key}
+        return {}
     
     async def start(self):
         """Start background tasks"""
@@ -663,6 +705,9 @@ class LoadBalancer:
         
         # start cache cleanup task
         asyncio.create_task(self._cache_cleanup_loop())
+        
+        # start inflight cleanup task
+        asyncio.create_task(self._inflight_cleanup_loop())
         
         logger.info(f"Load balancer started with {len(self.config.runner_urls)} runners")
     
@@ -681,8 +726,36 @@ class LoadBalancer:
             except Exception as e:
                 logger.error(f"Cache cleanup error: {e}")
     
+    async def _inflight_cleanup_loop(self):
+        """Periodically cleanup stale inflight entries (jobs that never completed)"""
+        while True:
+            try:
+                await asyncio.sleep(300)  # every 5 minutes
+                await self._cleanup_stale_inflight()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Inflight cleanup error: {e}")
+    
+    async def _cleanup_stale_inflight(self):
+        """Remove inflight entries older than 1 hour (stale/abandoned jobs)"""
+        async with self._inflight_lock:
+            now = time.time()
+            stale_timeout = 3600  # 1 hour
+            
+            stale_keys = [
+                key for key, inflight in self.inflight_jobs.items()
+                if now - inflight.submitted_at > stale_timeout
+            ]
+            
+            for key in stale_keys:
+                del self.inflight_jobs[key]
+            
+            if stale_keys:
+                logger.info(f"Cleaned up {len(stale_keys)} stale inflight job entries")
+    
     async def submit_job(self, request: JobSubmitRequest, api_key: str) -> Dict[str, Any]:
-        """Submit a job - check cache first, then route to runner"""
+        """Submit a job - check cache first, then inflight, then route to runner"""
         
         # resolve commit if not provided
         repo_commit = request.repo_commit
@@ -693,6 +766,15 @@ class LoadBalancer:
                     status_code=400,
                     detail=f"Could not resolve commit for {request.repo_url}@{request.repo_branch}"
                 )
+        
+        # compute cache key for deduplication
+        cache_key = make_cache_key(
+            request.repo_url,
+            request.repo_branch,
+            repo_commit,
+            request.repo_path,
+            request.weight_class
+        )
         
         # check cache
         cached = self.cache.get(
@@ -714,7 +796,8 @@ class LoadBalancer:
                 "from_cache": True,
                 "metrics": cached["metrics"],
                 "repo_commit": repo_commit,
-                "status": "completed"
+                "status": "completed",
+                "cache_key": cache_key
             }
             
             logger.info(f"Cache HIT for {request.repo_url}@{repo_commit[:8]}... -> {cache_job_id}")
@@ -727,6 +810,25 @@ class LoadBalancer:
                 "cache_hit": True,
                 "resolved_commit": repo_commit
             }
+        
+        # check if job is already in-flight
+        async with self._inflight_lock:
+            if cache_key in self.inflight_jobs:
+                inflight = self.inflight_jobs[cache_key]
+                inflight.subscriber_count += 1
+                
+                self.stats.record_inflight_hit()
+                
+                logger.info(
+                    f"Inflight HIT for {request.repo_url}@{repo_commit[:8]}... -> {inflight.job_id} "
+                    f"(subscribers: {inflight.subscriber_count})"
+                )
+                
+                # return the same response as the original submission
+                response = inflight.response.copy()
+                response["deduplicated"] = True
+                response["original_job_id"] = inflight.job_id
+                return response
         
         self.stats.record_cache_miss()
         
@@ -771,7 +873,7 @@ class LoadBalancer:
                 async with session.post(
                     f"{runner_url}/v1/jobs/submit",
                     json=payload,
-                    headers={"X-API-Key": "dev-key-12345"},  # TODO: change
+                    headers=self._get_runner_headers(),
                     timeout=aiohttp.ClientTimeout(total=30)
                 ) as resp:
                     if resp.status != 201:
@@ -807,14 +909,12 @@ class LoadBalancer:
             "repo_path": request.repo_path,
             "weight_class": request.weight_class,
             "miner_hotkey": request.miner_hotkey,
-            "status": "pending"
+            "status": "pending",
+            "cache_key": cache_key
         }
         
-        self.stats.record_job_submitted()
-        
-        logger.info(f"Submitted job {job_id} to {runner_url} for {request.repo_url}@{repo_commit[:8]}...")
-        
-        return {
+        # build response
+        response = {
             "job_id": job_id,
             "status": result.get("status", "pending"),
             "queue_position": result.get("queue_position", 0),
@@ -824,6 +924,21 @@ class LoadBalancer:
             "resolved_commit": repo_commit,
             "assigned_runner": runner_url
         }
+        
+        # register as inflight for deduplication
+        async with self._inflight_lock:
+            self.inflight_jobs[cache_key] = InflightJob(
+                job_id=job_id,
+                runner_url=runner_url,
+                response=response,
+                submitted_at=time.time()
+            )
+        
+        self.stats.record_job_submitted()
+        
+        logger.info(f"Submitted job {job_id} to {runner_url} for {request.repo_url}@{repo_commit[:8]}...")
+        
+        return response
     
     async def get_job_status(self, job_id: str) -> Dict[str, Any]:
         """Get job status - from cache or forward to runner"""
@@ -858,7 +973,7 @@ class LoadBalancer:
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
                     f"{runner_url}/v1/jobs/{job_id}",
-                    headers={"X-API-Key": "dev-key-12345"}, # TODO : change
+                    headers=self._get_runner_headers(),
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 404:
@@ -911,7 +1026,7 @@ class LoadBalancer:
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.get(
                     f"{runner_url}/v1/jobs/{job_id}/metrics",
-                    headers={"X-API-Key": "dev-key-12345"},
+                    headers=self._get_runner_headers(),
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 404:
@@ -948,6 +1063,13 @@ class LoadBalancer:
                 
                 self.stats.record_job_completed()
                 
+                # remove from inflight tracking
+                cache_key = job_info.get("cache_key")
+                if cache_key:
+                    async with self._inflight_lock:
+                        if cache_key in self.inflight_jobs:
+                            del self.inflight_jobs[cache_key]
+                
                 # cleanup
                 self.router.release_job(job_id)
                 if job_id in self.pending_jobs:
@@ -977,7 +1099,7 @@ class LoadBalancer:
             async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.delete(
                     f"{runner_url}/v1/jobs/{job_id}",
-                    headers={"X-API-Key": "dev-key-12345"},
+                    headers=self._get_runner_headers(),
                     timeout=aiohttp.ClientTimeout(total=10)
                 ) as resp:
                     if resp.status == 404:
@@ -987,6 +1109,14 @@ class LoadBalancer:
         
         except aiohttp.ClientError as e:
             raise HTTPException(status_code=503, detail=f"Failed to connect to sandbox runner: {e}")
+        
+        # remove from inflight tracking
+        job_info = self.pending_jobs.get(job_id, {})
+        cache_key = job_info.get("cache_key")
+        if cache_key:
+            async with self._inflight_lock:
+                if cache_key in self.inflight_jobs:
+                    del self.inflight_jobs[cache_key]
         
         # cleanup
         self.router.release_job(job_id)
@@ -1080,7 +1210,8 @@ def create_app(config: Config) -> FastAPI:
             "runners": lb.health_manager.health_status,
             "routing": lb.router.get_stats(),
             "cache": lb.cache.get_stats(),
-            "stats": lb.stats.get_stats()
+            "stats": lb.stats.get_stats(),
+            "inflight_jobs": len(lb.inflight_jobs)
         }
     
     @app.get("/v1/stats", dependencies=[Depends(verify_api_key)])
@@ -1090,6 +1221,18 @@ def create_app(config: Config) -> FastAPI:
             "load_balancer": lb.stats.get_stats(),
             "cache": lb.cache.get_stats(),
             "routing": lb.router.get_stats(),
+            "inflight": {
+                "count": len(lb.inflight_jobs),
+                "jobs": [
+                    {
+                        "job_id": inflight.job_id,
+                        "runner_url": inflight.runner_url,
+                        "subscribers": inflight.subscriber_count,
+                        "age_seconds": round(time.time() - inflight.submitted_at, 1)
+                    }
+                    for inflight in lb.inflight_jobs.values()
+                ]
+            },
             "runners": {
                 url: {
                     **status,
