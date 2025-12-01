@@ -34,7 +34,6 @@ A Bittensor subnet where **validators** evaluate **miners** on their ability to 
 - **Minimum floor**: 20% accuracy required to qualify
 - **Top 5** miners above floor receive rewards
 - **Exponential distribution**: Rank 1 gets most weight, decaying by factor 0.8 per rank
-- **Burn mechanism**: If no miners qualify, 95% of emissions burn
 
 ### Key Features
 
