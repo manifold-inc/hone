@@ -203,8 +203,8 @@ async def authenticate_request(
     auth_method = "none"
     
     if auth_manager.config.require_api_key:
-        api_key = await auth_manager.verify_api_key()
-        validator_id = api_key
+        api_key = request.headers.get(auth_manager.config.api_key_header)
+        validator_id = await auth_manager.verify_api_key(api_key)
         auth_method = "api_key"
     
     if validator_id:

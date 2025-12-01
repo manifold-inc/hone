@@ -37,7 +37,7 @@ class AuthenticationManager:
     
     async def verify_api_key(
         self,
-        api_key: Optional[str] = Header(None, alias="X-API-Key")
+        api_key: Optional[str] = None
     ) -> str:
         """
         Verify API key from request headers
