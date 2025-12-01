@@ -1159,7 +1159,7 @@ def create_app(config: Config) -> FastAPI:
         lifespan=lifespan
     )
     
-    async def verify_api_key(x_api_key: str = Header(..., alias="X-API-Key")):
+    async def verify_api_key(x_api_key: str):
         if not lb.api_keys.validate(x_api_key):
             raise HTTPException(status_code=401, detail="Invalid API key")
         return x_api_key
