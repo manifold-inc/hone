@@ -169,7 +169,11 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
 
 async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
     """
-    Set weights on chain    
+    Set weights on chain
+    
+    Distribution:
+    - If miners qualify: 95% burn + 5% distributed to top miners (exponential)
+    - If no miners qualify: 100% burn
     """
     
     BURN_UID = int(os.getenv("BURN_UID", "251"))
@@ -181,51 +185,35 @@ async def set_weights(chain, config, scores: Dict[int, float]) -> bool:
     
     nodes = chain.get_nodes()
     total_uids = len(nodes)
-    all_uids = list(range(total_uids))
-    array_size = max(len(nodes), BURN_UID + 1)
-    all_weights = [0.0] * array_size
+    all_uids = list(range(max(total_uids, BURN_UID + 1)))
+    all_weights = [0.0] * len(all_uids)
     
-    if not scores or sum(scores.values()) <= 0:
-        all_weights[BURN_UID] = 1.0
-        logger.warning("No qualifying miners - burning 100%")
-    else:
-        all_weights[BURN_UID] = BURN_PERCENTAGE
-        
-        for uid, weight in scores.items():
-            if uid < total_uids:
-                all_weights[uid] = weight * MINER_PERCENTAGE
-        
-        weight_sum = sum(all_weights)
-        if weight_sum > 0:
-            all_weights = [w / weight_sum for w in all_weights]
-        
-        logger.info(f"Weights: {BURN_PERCENTAGE*100:.0f}% burn + {MINER_PERCENTAGE*100:.0f}% to top miners")
+    has_qualifying_miners = scores and sum(scores.values()) > 0
     
-    if not scores or sum(scores.values()) <= 0:
-        logger.warning("No qualifying miners found - burning 100% to burn UID")
+    if not has_qualifying_miners:
         all_weights[BURN_UID] = 1.0
         
         logger.info("=" * 60)
         logger.info("BURN MODE - No miners meet minimum requirements")
-        logger.info(f"  UID {BURN_UID:>3} - Weight: 100.00%")
+        logger.info(f"  UID {BURN_UID:>3} - Weight: 100.00% (burn)")
         logger.info("=" * 60)
     else:
+        all_weights[BURN_UID] = BURN_PERCENTAGE
+        
+        miner_weight_sum = sum(scores.values())
         for uid, weight in scores.items():
             if uid < total_uids:
-                all_weights[uid] = weight
+                normalized_miner_weight = (weight / miner_weight_sum) * MINER_PERCENTAGE
+                all_weights[uid] = normalized_miner_weight
             else:
                 logger.warning(f"UID {uid} out of range (max: {total_uids-1})")
         
-        weight_sum = sum(all_weights)
-        if weight_sum > 0:
-            all_weights = [w / weight_sum for w in all_weights]
-        
         logger.info("=" * 60)
-        logger.info("Exponential distribution for top miners:")
-        for uid, weight in enumerate(all_weights):
-            if weight > 0:
-                percentage = weight * 100
-                logger.info(f"  UID {uid:>3} - Weight: {percentage:>6.2f}%")
+        logger.info(f"Weight distribution: {BURN_PERCENTAGE*100:.0f}% burn + {MINER_PERCENTAGE*100:.0f}% to miners")
+        logger.info(f"  UID {BURN_UID:>3} - Weight: {BURN_PERCENTAGE*100:>6.2f}% (burn)")
+        for uid in sorted(scores.keys()):
+            if all_weights[uid] > 0:
+                logger.info(f"  UID {uid:>3} - Weight: {all_weights[uid]*100:>6.2f}%")
         logger.info("=" * 60)
     
     weight_sum = sum(all_weights)
