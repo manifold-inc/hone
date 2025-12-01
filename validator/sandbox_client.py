@@ -13,10 +13,13 @@ class SandboxRunnerClient:
         self.api_key = api_key
         
     def _get_headers(self) -> Dict[str, str]:
-        headers = {"Content-Type": "application/json"}
+        return {"Content-Type": "application/json"}
+    
+    def _build_url(self, path: str) -> str:
+        url = f"{self.endpoint}{path}"
         if self.api_key:
-            headers["X-API-Key"] = self.api_key
-        return headers
+            url = f"{url}?x_api_key={self.api_key}"
+        return url
     
     async def submit_job(
         self,
@@ -43,7 +46,7 @@ class SandboxRunnerClient:
                 "estimated_start_time": str (ISO)
             }
         """
-        url = f"{self.endpoint}/v1/jobs/submit"
+        url = self._build_url("/v1/jobs/submit")
         
         payload = {
             "repo_url": repo_url,
@@ -59,7 +62,6 @@ class SandboxRunnerClient:
             "custom_env_vars": custom_env_vars or {}
         }
         
-        # remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
         
         try:
@@ -99,7 +101,7 @@ class SandboxRunnerClient:
                 "error_message": str
             }
         """
-        url = f"{self.endpoint}/v1/jobs/{job_id}"
+        url = self._build_url(f"/v1/jobs/{job_id}")
         
         try:
             connector = aiohttp.TCPConnector(ssl=False)
@@ -146,7 +148,7 @@ class SandboxRunnerClient:
                 "completed_at": str
             }
         """
-        url = f"{self.endpoint}/v1/jobs/{job_id}/metrics"
+        url = self._build_url(f"/v1/jobs/{job_id}/metrics")
         
         try:
             connector = aiohttp.TCPConnector(ssl=False)
@@ -209,7 +211,6 @@ class SandboxRunnerClient:
             current_status = status_data.get("status")
             current_phase = status_data.get("current_phase")
             
-            # log status or phase changes
             if current_status != last_status or current_phase != last_phase:
                 progress = status_data.get("progress_percentage", 0)
                 logger.info(
@@ -225,14 +226,12 @@ class SandboxRunnerClient:
                 last_status = current_status
                 last_phase = current_phase
             
-            # terminal states
             if current_status in ["completed", "failed", "timeout", "cancelled"]:
                 logger.info(f"Job {job_id} finished with status: {current_status}")
                 return status_data
             
             await asyncio.sleep(poll_interval)
         
-        # polling timeout
         logger.error(f"Job {job_id} polling timed out after {max_attempts} attempts ({max_attempts * poll_interval}s)")
         return {
             "job_id": job_id,
@@ -242,7 +241,7 @@ class SandboxRunnerClient:
     
     async def cancel_job(self, job_id: str) -> bool:
         """Cancel a pending or running job"""
-        url = f"{self.endpoint}/v1/jobs/{job_id}"
+        url = self._build_url(f"/v1/jobs/{job_id}")
         
         try:
             connector = aiohttp.TCPConnector(ssl=False)
