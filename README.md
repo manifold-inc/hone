@@ -33,6 +33,7 @@ A Bittensor subnet where **validators** evaluate **miners** on their ability to 
 - **Metric**: `exact_match_rate` — percentage of ARC problems solved correctly
 - **Minimum floor**: 20% accuracy required to qualify
 - **Top 5** miners above floor receive rewards
+- **Miner rewards**: Rewards distributed via exponential decay (factor 0.8 per rank)
 - **No qualifiers**: If no miners meet the floor, 100% is burned
 
 ### Key Features
@@ -64,31 +65,26 @@ A Bittensor subnet where **validators** evaluate **miners** on their ability to 
           │ • Set wts   │      │             │      │             │
           └──────┬──────┘      └─────────────┘      └─────────────┘
                  │
-                 │ Submit jobs via API
-                 ▼
-          ┌─────────────────────────────────────────────────────┐
-          │                  SANDBOX RUNNER                      │
-          │                                                      │
-          │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
-          │  │ H200 #0 │  │ H200 #1 │  │ H200 #2 │  │ H200 #3 │ │
-          │  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │
-          │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
-          │  │ H200 #4 │  │ H200 #5 │  │ H200 #6 │  │ H200 #7 │ │
-          │  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │
-          │                                                      │
-          │  • Clone repo → Build image → Run prep → Run infer  │
-          │  • Calculate exact_match_rate against held-out data │
-          └─────────────────────────────────────────────────────┘
-                 │
-                 │ Fetch /info
-                 ▼
-          ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-          │   MINER 1   │      │   MINER 2   │      │   MINER N   │
-          │             │      │             │      │             │
-          │  /info →    │      │  /info →    │      │  /info →    │
-          │  repo_url   │      │  repo_url   │      │  repo_url   │
-          │  weight_cls │      │  weight_cls │      │  weight_cls │
-          └─────────────┘      └─────────────┘      └─────────────┘
+        ┌────────┴────────┐
+        │                 │
+        │ Fetch /info     │ Submit jobs via API
+        ▼                 ▼
+  ┌───────────┐    ┌─────────────────────────────────────────────────────┐
+  │  MINERS   │    │                  SANDBOX RUNNER                      │
+  │           │    │                                                      │
+  │ ┌───────┐ │    │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
+  │ │ M1    │ │    │  │ H200 #0 │  │ H200 #1 │  │ H200 #2 │  │ H200 #3 │ │
+  │ │/info  │ │    │  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │
+  │ └───────┘ │    │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
+  │ ┌───────┐ │    │  │ H200 #4 │  │ H200 #5 │  │ H200 #6 │  │ H200 #7 │ │
+  │ │ M2    │ │    │  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │
+  │ │/info  │ │    │                                                      │
+  │ └───────┘ │    │  • Clone repo → Build image → Run prep → Run infer  │
+  │ ┌───────┐ │    │  • Calculate exact_match_rate against held-out data │
+  │ │ M_N   │ │    └─────────────────────────────────────────────────────┘
+  │ │/info  │ │
+  │ └───────┘ │
+  └───────────┘
 ```
 
 ---
@@ -161,6 +157,8 @@ SANDBOX_RUNNER_TIMEOUT_HOURS=3
 MAX_SUBMISSIONS_PER_DAY=1
 MIN_ACCURACY_FLOOR=0.20
 TOP_MINERS_COUNT=5
+BURN_UID=251
+BURN_PERCENTAGE=0.95
 
 # cycle timing
 CYCLE_DURATION=30
@@ -570,10 +568,16 @@ curl http://localhost:8000/v1/jobs/{job_id}/metrics ...
 | `SANDBOX_RUNNER_API_KEY` | - | API key for sandbox |
 | `SANDBOX_RUNNER_TIMEOUT_HOURS` | `3` | Max job execution time |
 | `SANDBOX_POLL_INTERVAL` | `30` | Seconds between status polls |
+| `SANDBOX_MAX_POLL_ATTEMPTS` | `360` | Max polling attempts (360 × 30s = 3h) |
 | `MAX_SUBMISSIONS_PER_DAY` | `1` | Submissions per miner per day |
-| `MIN_ACCURACY_FLOOR` | `0.20` | Minimum exact_match_rate |
+| `MIN_ACCURACY_FLOOR` | `0.20` | Minimum exact_match_rate to qualify |
 | `TOP_MINERS_COUNT` | `5` | Number of miners to reward |
+| `BURN_UID` | `251` | UID to receive burn weight |
+| `BURN_PERCENTAGE` | `0.95` | Percentage of emissions to burn |
 | `CYCLE_DURATION` | `30` | Blocks per query cycle |
+| `MINER_INFO_TIMEOUT` | `5` | Timeout for /info endpoint (seconds) |
+| `RETENTION_DAYS` | `30` | Days to keep query results in DB |
+| `CLEANUP_INTERVAL_HOURS` | `24` | Hours between DB cleanup runs |
 
 ### Miner Environment Variables
 
