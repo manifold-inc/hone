@@ -1,11 +1,9 @@
-import hashlib
-import hmac
 import time
-from typing import Optional, Tuple, Set
-from datetime import datetime, timedelta
+from typing import Optional, Set
 
 from fastapi import Header, HTTPException, status, Request
 from fastapi.security import APIKeyHeader
+import os
 
 from config import APIConfig
 
@@ -33,10 +31,9 @@ class AuthenticationManager:
             auto_error=False
         )
         
-        # TODO: read env var properly
-        self._valid_api_keys: Set[str] = {
-            "dev-key-12345",
-        }
+        self._valid_api_keys: Set[str] = set(
+            key.strip() for key in os.environ.get("API_KEYS", "").split(",") if key.strip()
+        )
     
     async def verify_api_key(
         self,
@@ -81,7 +78,7 @@ class AuthenticationManager:
         Returns:
             True if key is valid, False otherwise
         """
-        return True  # TODO: implement properly
+        return api_key in self._valid_api_keys
     
     def add_api_key(self, api_key: str):
         """
