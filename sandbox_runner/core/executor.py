@@ -211,10 +211,6 @@ class Executor:
                 work_dir_path = repo_path
                 logger.info(f"Using repo root: {work_dir_path}")
 
-            work_dir_path = repo_path / job.repo_path if job.repo_path else repo_path
-            if job.repo_path and not work_dir_path.exists():
-                raise ExecutorError(f"Specified repo path does not exist: {job.repo_path}")
-
             # Validate repository
             self.validator.validate_all(work_dir_path, job.repo_url)
             
@@ -223,7 +219,7 @@ class Executor:
             job.current_phase = "building"
             job.progress_percentage = 30.0
             image_id = await self._build_docker_image(job, work_dir_path)
-
+            
             if isinstance(self.network_policy, IptablesNetworkPolicy):
                 # start monitoring in background
                 monitor_task = asyncio.create_task(

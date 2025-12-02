@@ -120,6 +120,28 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
                     repo_commit=repo_info.get('repo_commit') if hasattr(repo_info, 'get') else repo_info['repo_commit'],
                     repo_path=repo_info.get('repo_path', '') if hasattr(repo_info, 'get') else repo_info['repo_path'] or ''
                 )
+            else:
+                # Fallback: Try to get repo info from submission history
+                logger.warning(f"No recent repo_url for {hotkey[:12]}..., checking submission history")
+                history = await db.get_latest_submission_by_hotkey(hotkey)
+                
+                if history:
+                    await db.update_leaderboard(
+                        hotkey=hotkey,
+                        uid=uid,
+                        exact_match_rate=exact_match_rate,
+                        repo_url=history['repo_url'],
+                        repo_branch=history['repo_branch'] or 'main',
+                        repo_commit=history['repo_commit'],
+                        repo_path=history['repo_path'] or ''
+                    )
+                    logger.info(f"Updated leaderboard for {hotkey[:12]}... using submission history")
+                else:
+                    logger.error(
+                        f"Cannot update leaderboard for {hotkey[:12]}... (UID {uid}) - "
+                        f"no repo info in recent results or submission history. "
+                        f"Miner will still receive rewards but won't appear on leaderboard."
+                    )
     
     # remove miners from leaderboard who are no longer in top N
     current_leaderboard = await db.get_leaderboard(limit=100)

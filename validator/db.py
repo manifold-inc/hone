@@ -129,6 +129,22 @@ class Database:
                 """,
                 hotkey, repo_url, repo_branch, repo_commit, repo_path, weight_class
             )
+    
+    async def get_latest_submission_by_hotkey(self, hotkey: str) -> Optional[asyncpg.Record]:
+        """
+        Get the most recent submission history for a hotkey
+        Used as fallback when recent query results lack repo_url
+        """
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT * FROM submission_history
+                WHERE hotkey = $1
+                ORDER BY last_evaluated_at DESC
+                LIMIT 1
+                """,
+                hotkey
+            )
 
     async def save_submission_history(
         self,
