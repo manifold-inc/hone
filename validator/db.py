@@ -40,6 +40,12 @@ class Database:
 
     async def upsert_miner(self, uid: int, hotkey: str, ip: Optional[str], port: Optional[int], stake: Optional[float], last_update_block: Optional[int]):
         async with self.pool.acquire() as conn:
+            # remove any stale entry where a different uid has this hotkey
+            await conn.execute(
+                "DELETE FROM miners WHERE hotkey = $1 AND uid != $2",
+                hotkey, uid
+            )
+            
             await conn.execute(
                 """
                 INSERT INTO miners (uid, hotkey, ip, port, stake, last_update_block, updated_at)
