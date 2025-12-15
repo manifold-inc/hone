@@ -33,19 +33,16 @@ async def get_miner_info(request: Request) -> Dict[str, Any]:
     
     # read from environment variables or config
 
+    use_vllm = os.getenv("MINER_USE_VLLM", "true").lower() == "true"
+    
     miner_info = {
         "repo_url": os.getenv("MINER_REPO_URL", "https://github.com/manifold-inc/hone"),
         "repo_branch": os.getenv("MINER_REPO_BRANCH", "main"),
         "repo_commit": os.getenv("MINER_REPO_COMMIT"),  # optional - None means use latest
         "repo_path": os.getenv("MINER_REPO_PATH", "miner-solution-example"),  # optional subdirectory within repo
         "weight_class": os.getenv("MINER_WEIGHT_CLASS", "1xH200"),  # how many GPUs needed, use 1xH200 up to 8xH200
-        "use_vllm": os.getenv("MINER_USE_VLLM", "true").lower() == "true",
-        "vllm_config": {
-                "dtype": "half",
-                "gpu_memory_utilization": 0.8,
-                "max_model_len": 12000,
-                "model": "unsloth/Meta-Llama-3.1-8B-Instruct"
-            },
+        "use_vllm": use_vllm,
+        "vllm_config": _get_vllm_config() if use_vllm else None,
         "custom_env_vars": _get_custom_env_vars(),
         "version": os.getenv("MINER_VERSION", "1.0.0"),
         "hotkey": request.app.state.cfg.hotkey if hasattr(request.app.state, 'cfg') else None

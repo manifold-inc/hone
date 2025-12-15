@@ -15,12 +15,20 @@ class Database:
         self.pool: Optional[asyncpg.Pool] = None
 
     async def connect(self):
+        """
+        Connect to the database with exponential backoff retry logic.
+        
+        Raises:
+            asyncpg.PostgresError: If connection fails after all retry attempts
+        """
         if self.pool:
             return
         attempts = 0
         delay = 0.5
+        max_attempts = 10
         last_exc = None
-        while attempts < 10:
+        
+        while attempts < max_attempts:
             try:
                 self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
                 logger.info("Connected to Postgres.")
@@ -28,10 +36,16 @@ class Database:
             except Exception as e:
                 last_exc = e
                 attempts += 1
-                logger.warning(f"DB connect attempt {attempts}/10 failed ({e}); retrying in {delay:.1f}s")
+                logger.warning(f"DB connect attempt {attempts}/{max_attempts} failed ({e}); retrying in {delay:.1f}s")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 5.0)
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
+        
+        # All retry attempts exhausted - raise the last exception with context
+        logger.error(f"Failed to connect to database after {max_attempts} attempts")
+        raise ConnectionError(
+            f"Could not connect to database after {max_attempts} attempts. "
+            f"Last error: {last_exc}"
+        ) from last_exc
 
     async def close(self):
         if self.pool:

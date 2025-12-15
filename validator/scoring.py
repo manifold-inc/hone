@@ -98,18 +98,19 @@ async def calculate_scores_and_update_leaderboard(db, config, miners: Dict[int, 
     
     top_miners = qualifying_miners[:top_miners_count]
     
+    # Build a lookup map from the already-fetched rows to avoid duplicate DB query
+    # (rows was fetched at line 34, reuse it instead of calling get_recent_results again)
+    hotkey_to_repo_info: Dict[str, Dict] = {}
+    for r in rows:
+        r_hotkey = r.get('hotkey') if hasattr(r, 'get') else r['hotkey']
+        r_repo_url = r.get('repo_url') if hasattr(r, 'get') else r['repo_url']
+        if r_hotkey and r_repo_url and r_hotkey not in hotkey_to_repo_info:
+            hotkey_to_repo_info[r_hotkey] = r
+    
     for hotkey, uid, exact_match_rate in top_miners:
         miner = await db.get_miner_by_hotkey(hotkey)
         if miner:
-            recent_results = await db.get_recent_results(window_blocks=window_blocks, current_block=current_block)
-            repo_info = None
-            for r in recent_results:
-                r_hotkey = r.get('hotkey') if hasattr(r, 'get') else r['hotkey']
-                r_repo_url = r.get('repo_url') if hasattr(r, 'get') else r['repo_url']
-                if r_hotkey == hotkey and r_repo_url:
-                    repo_info = r
-                    break
-            
+            repo_info = hotkey_to_repo_info.get(hotkey)
             if repo_info:
                 await db.update_leaderboard(
                     hotkey=hotkey,
