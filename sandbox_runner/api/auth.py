@@ -110,8 +110,14 @@ class AuthenticationManager:
 
 class RateLimiter:
     """
-    Simple in-memory rate limiter for API endpoints    
+    Simple in-memory rate limiter for API endpoints.
+    
+    Uses a sliding window algorithm to track requests per identifier
+    and enforces configurable rate limits.
     """
+    
+    # Cleanup stale identifiers after this many seconds of inactivity
+    _CLEANUP_THRESHOLD_SECONDS = 300  # 5 minutes
     
     def __init__(self, requests_per_minute: int):
         """
@@ -121,27 +127,79 @@ class RateLimiter:
             requests_per_minute: Maximum requests allowed per minute per identifier
         """
         self.requests_per_minute = requests_per_minute
-        self._request_log = {}
+        self._request_log: dict[str, list[float]] = {}
+        self._last_cleanup = time.time()
     
     async def check_rate_limit(self, identifier: str):
         """
-        Check if request is within rate limit
+        Check if request is within rate limit.
         
         Args:
-            identifier: Unique identifier (API key)
+            identifier: Unique identifier (API key or validator ID)
             
         Raises:
-            HTTPException: If rate limit is exceeded
+            HTTPException: 429 Too Many Requests if rate limit is exceeded
         """
         current_time = time.time()
-        window_start = current_time - 60  # 1 minute window
+        window_start = current_time - 60  # 1 minute sliding window
         
+        # Periodically cleanup stale identifiers to prevent memory leak
+        if current_time - self._last_cleanup > self._CLEANUP_THRESHOLD_SECONDS:
+            self._cleanup_stale_identifiers(window_start)
+            self._last_cleanup = current_time
+        
+        # Initialize request log for new identifiers
         if identifier not in self._request_log:
             self._request_log[identifier] = []
         
+        # Remove timestamps outside the current window
         self._request_log[identifier] = [
             timestamp for timestamp in self._request_log[identifier]
             if timestamp > window_start
         ]
         
+        # Check if rate limit would be exceeded
+        if len(self._request_log[identifier]) >= self.requests_per_minute:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail=f"Rate limit exceeded. Maximum {self.requests_per_minute} requests per minute.",
+                headers={"Retry-After": "60"}
+            )
+        
+        # Record this request
         self._request_log[identifier].append(current_time)
+    
+    def _cleanup_stale_identifiers(self, window_start: float):
+        """
+        Remove identifiers with no recent requests to prevent memory leak.
+        
+        Args:
+            window_start: Timestamp marking the start of the current window
+        """
+        stale_identifiers = [
+            identifier for identifier, timestamps in self._request_log.items()
+            if not timestamps or all(ts <= window_start for ts in timestamps)
+        ]
+        for identifier in stale_identifiers:
+            del self._request_log[identifier]
+    
+    def get_remaining_requests(self, identifier: str) -> int:
+        """
+        Get the number of remaining requests for an identifier.
+        
+        Args:
+            identifier: Unique identifier (API key or validator ID)
+            
+        Returns:
+            Number of requests remaining in the current window
+        """
+        current_time = time.time()
+        window_start = current_time - 60
+        
+        if identifier not in self._request_log:
+            return self.requests_per_minute
+        
+        recent_requests = sum(
+            1 for ts in self._request_log[identifier] if ts > window_start
+        )
+        return max(0, self.requests_per_minute - recent_requests)
