@@ -67,15 +67,37 @@ def generate(width=None, height=None, rows=None, cols=None, colors=None,
     # Choose the positions of the mega-sprites, making sure they don't overlap.
     num_sprites = common.randint(3, 4)
     megarotates = [common.randint(0, 3) for _ in range(num_sprites)]
+    
+    # --- FIX START: Prevent Infinite Loop ---
+    attempts = 0
+    max_placement_attempts = 100
+    
     while True:
+      attempts += 1
+      if attempts > max_placement_attempts:
+          # Raising an error allows the dataset_manager to catch it and retry 
+          # generating the task with fresh parameters.
+          raise ValueError(f"Task 76: Could not place {num_sprites} sprites without overlap after {max_placement_attempts} attempts.")
+
       megarows, megacols, megawides, megatalls = [], [], [], []
+      configuration_possible = True
+
       for megarotate in megarotates:
         w, t = (tall, wide) if megarotate == 1 else (wide, tall)
+        
+        # Check if sprite fits in the grid to avoid randint errors
+        if height - t < 0 or width - w < 0:
+            configuration_possible = False
+            break
+            
         megarows.append(common.randint(0, height - t))
         megacols.append(common.randint(0, width - w))
         megawides.append(w)
         megatalls.append(t)
-      if not common.overlaps(megarows, megacols, megawides, megatalls, 1): break
+      
+      if configuration_possible and not common.overlaps(megarows, megacols, megawides, megatalls, 1): 
+          break
+    # --- FIX END ---
 
   grid, output = common.grids(width, height)
   wide, tall = max(cols) + 1, max(rows) + 1
