@@ -61,15 +61,12 @@ class MockChainInterface(ChainInterface):
             incentive=1.0,
             netuid=self.netuid,
             stake=1000.0,
-            trust=1.0,
             vtrust=1.0,
-            consensus=1.0,
             last_updated=self.mock_block - 10,
             last_update=self.mock_block - 10,
             ip="127.0.0.1",
             ip_type=4,
             port=8092,
-            protocol=4,
             is_validator=True,
         )
         nodes.append(validator_node)
@@ -87,9 +84,7 @@ class MockChainInterface(ChainInterface):
                 incentive=random.uniform(0.1, 0.3),
                 netuid=self.netuid,
                 stake=random.uniform(10, 100),
-                trust=random.uniform(0.5, 1.0),
                 vtrust=random.uniform(0.5, 1.0),
-                consensus=random.uniform(0.5, 1.0),
                 last_updated=self.mock_block - random.randint(5, 50),
                 last_update=self.mock_block - random.randint(5, 50),
                 ip=f"miner{i}",
@@ -99,7 +94,6 @@ class MockChainInterface(ChainInterface):
                 else (
                     8092 if i == 2 else 8093
                 ),  # for now only support 3 test mock miners
-                protocol=4,
                 is_validator=False,
             )
             nodes.append(miner_node)
