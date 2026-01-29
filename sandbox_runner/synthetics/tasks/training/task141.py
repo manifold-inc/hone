@@ -18,37 +18,38 @@ from synthetics import common
 
 
 def generate(size=None, row=None, col=None, color=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    size: the width and height of the (square) grid
-    row: an integer with the pixel's row
-    col: an integer with the pixel's column
-    color: a digit representing the color of the pixel
-  """
-  if size is None:
-    size = 2 * common.randint(2, 10) + 1
-    row = common.randint(1, size - 2)
-    col = common.randint(1, size - 2)
-    color = common.random_color()
+    Args:
+      size: the width and height of the (square) grid
+      row: an integer with the pixel's row
+      col: an integer with the pixel's column
+      color: a digit representing the color of the pixel
+    """
+    if size is None:
+        size = 2 * common.randint(2, 10) + 1
+        row = common.randint(1, size - 2)
+        col = common.randint(1, size - 2)
+        color = common.random_color()
 
-  grid, output = common.grids(size, size)
-  output[row][col] = grid[row][col] = color
-  for c in range(size):
-    for r in range(size):
-      if r + c != row + col and r - c != row - col: continue
-      output[r][c] = color
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    output[row][col] = grid[row][col] = color
+    for c in range(size):
+        for r in range(size):
+            if r + c != row + col and r - c != row - col:
+                continue
+            output[r][c] = color
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(size=15, row=3, col=3, color=2),
-      generate(size=15, row=5, col=11, color=7),
-      generate(size=7, row=3, col=2, color=8),
-  ]
-  test = [
-      generate(size=17, row=7, col=12, color=6),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(size=15, row=3, col=3, color=2),
+        generate(size=15, row=5, col=11, color=7),
+        generate(size=7, row=3, col=2, color=8),
+    ]
+    test = [
+        generate(size=17, row=7, col=12, color=6),
+    ]
+    return {"train": train, "test": test}

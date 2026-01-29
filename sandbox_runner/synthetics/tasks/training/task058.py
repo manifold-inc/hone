@@ -18,50 +18,52 @@ from synthetics import common
 
 
 def generate(size=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    size: the width and height of the (square) grid
-  """
-  if size is None:
-    size = common.randint(5, 20)
+    Args:
+      size: the width and height of the (square) grid
+    """
+    if size is None:
+        size = common.randint(5, 20)
 
-  grid, output = common.grids(size, size)
-  r, c, rdir, cdir = 0, 0, 0, 1
-  while True:
-    if output[r][c] == common.green(): break
-    if r + rdir >= 0 and r + rdir < size and c + cdir >= 0 and c + cdir < size:
-      if output[r + rdir][c + cdir] == common.green(): break
-    output[r][c] = common.green()
-    if cdir == 1 and c + 1 == size:
-      rdir, cdir = 1, 0
-    if cdir == 1 and c + 2 < size and output[r][c + 2] == common.green():
-      rdir, cdir = 1, 0
-    elif rdir == 1 and r + 1 == size:
-      rdir, cdir = 0, -1
-    elif rdir == 1 and r + 2 < size and output[r + 2][c] == common.green():
-      rdir, cdir = 0, -1
-    elif cdir == -1 and c == 0:
-      rdir, cdir = -1, 0
-    elif cdir == -1 and c - 2 >= 0 and output[r][c - 2] == common.green():
-      rdir, cdir = -1, 0
-    elif rdir == -1 and output[r - 2][c] == common.green():
-      rdir, cdir = 0, 1
-    c += cdir
-    r += rdir
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    r, c, rdir, cdir = 0, 0, 0, 1
+    while True:
+        if output[r][c] == common.green():
+            break
+        if r + rdir >= 0 and r + rdir < size and c + cdir >= 0 and c + cdir < size:
+            if output[r + rdir][c + cdir] == common.green():
+                break
+        output[r][c] = common.green()
+        if cdir == 1 and c + 1 == size:
+            rdir, cdir = 1, 0
+        if cdir == 1 and c + 2 < size and output[r][c + 2] == common.green():
+            rdir, cdir = 1, 0
+        elif rdir == 1 and r + 1 == size:
+            rdir, cdir = 0, -1
+        elif rdir == 1 and r + 2 < size and output[r + 2][c] == common.green():
+            rdir, cdir = 0, -1
+        elif cdir == -1 and c == 0:
+            rdir, cdir = -1, 0
+        elif cdir == -1 and c - 2 >= 0 and output[r][c - 2] == common.green():
+            rdir, cdir = -1, 0
+        elif rdir == -1 and output[r - 2][c] == common.green():
+            rdir, cdir = 0, 1
+        c += cdir
+        r += rdir
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(size=6),
-      generate(size=8),
-      generate(size=15),
-      generate(size=13),
-      generate(size=10),
-  ]
-  test = [
-      generate(size=18),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(size=6),
+        generate(size=8),
+        generate(size=15),
+        generate(size=13),
+        generate(size=10),
+    ]
+    test = [
+        generate(size=18),
+    ]
+    return {"train": train, "test": test}

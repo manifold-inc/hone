@@ -18,33 +18,33 @@ from synthetics import common
 
 
 def generate(size=None, color=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    size: the width and height of the (square) grid
-    color: a digit representing the left column color
-  """
-  if size is None:
-    size = common.randint(3, 21)
-    color = common.randint(1, 9)
+    Args:
+      size: the width and height of the (square) grid
+      color: a digit representing the left column color
+    """
+    if size is None:
+        size = common.randint(3, 21)
+        color = common.randint(1, 9)
 
-  grid, output = common.grids(size, size)
-  for r in range(size):
-    output[r][0] = grid[r][0] = color
-  for c in range(1, size):
-    output[size - 1][c] = common.yellow()
-    output[size - 1 - c][c] = common.red()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    for r in range(size):
+        output[r][0] = grid[r][0] = color
+    for c in range(1, size):
+        output[size - 1][c] = common.yellow()
+        output[size - 1 - c][c] = common.red()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(size=15, color=6),
-      generate(size=3, color=5),
-      generate(size=7, color=8),
-  ]
-  test = [
-      generate(size=10, color=3),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(size=15, color=6),
+        generate(size=3, color=5),
+        generate(size=7, color=8),
+    ]
+    test = [
+        generate(size=10, color=3),
+    ]
+    return {"train": train, "test": test}

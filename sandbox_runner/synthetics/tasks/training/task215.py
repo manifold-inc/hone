@@ -26,52 +26,73 @@ def generate(
     color=None,
     flip=None,
 ):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the input grid
-    height: the height of the input grid
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    offset: the offset of the pattern
-    color: a digit representing a color to be used
-    flip: whether to flip the pattern
-  """
-  if rows is None:
-    # TODO: make sure the pattern is 3 pixels tall, or at least flips?
-    # TODO: Make sure the flat L-tetris piece is possible?
-    width, height = common.randint(10, 20), common.randint(10, 20)
-    rows, cols = common.conway_sprite(common.randint(2, 3), 3)
-    offset = common.randint(3, 4)
-    color = common.random_color()
-    flip = common.randint(0, 1)
+    Args:
+      width: the width of the input grid
+      height: the height of the input grid
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      offset: the offset of the pattern
+      color: a digit representing a color to be used
+      flip: whether to flip the pattern
+    """
+    if rows is None:
+        # TODO: make sure the pattern is 3 pixels tall, or at least flips?
+        # TODO: Make sure the flat L-tetris piece is possible?
+        width, height = common.randint(10, 20), common.randint(10, 20)
+        rows, cols = common.conway_sprite(common.randint(2, 3), 3)
+        offset = common.randint(3, 4)
+        color = common.random_color()
+        flip = common.randint(0, 1)
 
-  grid, output = common.grids(width, height)
-  wide = max(cols) + 1
-  for i in range(0, width, wide):
-    for row, col in zip(rows, cols):
-      r = offset + (row if not flip or i % 2 == 0 else 2 - row)
-      c = col + i
-      common.draw(grid, r, c, color)
-  for j in range(-6, height, 3):
+    grid, output = common.grids(width, height)
+    wide = max(cols) + 1
     for i in range(0, width, wide):
-      for row, col in zip(rows, cols):
-        r = offset + (row if not flip or i % 2 == 0 else 2 - row) + j
-        c = col + i
-        common.draw(output, r, c, color)
-  return {"input": grid, "output": output}
+        for row, col in zip(rows, cols):
+            r = offset + (row if not flip or i % 2 == 0 else 2 - row)
+            c = col + i
+            common.draw(grid, r, c, color)
+    for j in range(-6, height, 3):
+        for i in range(0, width, wide):
+            for row, col in zip(rows, cols):
+                r = offset + (row if not flip or i % 2 == 0 else 2 - row) + j
+                c = col + i
+                common.draw(output, r, c, color)
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=19, height=15, rows=[0, 1, 1, 1], cols=[2, 0, 1, 2],
-               offset=4, color=8, flip=1),
-      generate(width=12, height=10, rows=[0, 1, 1, 2], cols=[0, 0, 1, 0],
-               offset=3, color=2, flip=0),
-  ]
-  test = [
-      generate(width=13, height=14, rows=[0, 1, 1, 2, 2], cols=[1, 0, 2, 0, 2],
-               offset=3, color=1, flip=0),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(
+            width=19,
+            height=15,
+            rows=[0, 1, 1, 1],
+            cols=[2, 0, 1, 2],
+            offset=4,
+            color=8,
+            flip=1,
+        ),
+        generate(
+            width=12,
+            height=10,
+            rows=[0, 1, 1, 2],
+            cols=[0, 0, 1, 0],
+            offset=3,
+            color=2,
+            flip=0,
+        ),
+    ]
+    test = [
+        generate(
+            width=13,
+            height=14,
+            rows=[0, 1, 1, 2, 2],
+            cols=[1, 0, 2, 0, 2],
+            offset=3,
+            color=1,
+            flip=0,
+        ),
+    ]
+    return {"train": train, "test": test}

@@ -18,50 +18,63 @@ from synthetics import common
 
 
 def generate(rows=None, cols=None, colors=None, size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    colors: a digit representing different colors to be used
-    size: the width and height of the (square) grid
-  """
-  if rows is None:
-    rows, cols, colors = [], [], []
-    for color in [4, 3]:
-      while True:
-        pixels = common.random_pixels(size, size)
-        if pixels: break
-      rows.extend([p[0] for p in pixels])
-      cols.extend([p[1] for p in pixels])
-      colors.extend([color] * len(pixels))
+    Args:
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      colors: a digit representing different colors to be used
+      size: the width and height of the (square) grid
+    """
+    if rows is None:
+        rows, cols, colors = [], [], []
+        for color in [4, 3]:
+            while True:
+                pixels = common.random_pixels(size, size)
+                if pixels:
+                    break
+            rows.extend([p[0] for p in pixels])
+            cols.extend([p[1] for p in pixels])
+            colors.extend([color] * len(pixels))
 
-  grid, output = common.grid(2 * size, size), common.grid(size, size)
-  for r, c, color in zip(rows, cols, colors):
-    grid[r][c if color == 4 else c + size] = color
-    output[r][c] = common.pink()
-  return {"input": grid, "output": output}
+    grid, output = common.grid(2 * size, size), common.grid(size, size)
+    for r, c, color in zip(rows, cols, colors):
+        grid[r][c if color == 4 else c + size] = color
+        output[r][c] = common.pink()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[0, 0, 1, 0, 0, 1, 2], cols=[0, 1, 0, 0, 1, 0, 2],
-               colors=[4, 4, 4, 3, 3, 3, 3]),
-      generate(rows=[0, 0, 1, 2, 0, 0, 1, 2], cols=[0, 2, 0, 2, 0, 1, 0, 0],
-               colors=[4, 4, 4, 4, 3, 3, 3, 3]),
-      generate(rows=[0, 1, 1, 2, 2, 0, 1, 1, 2],
-               cols=[2, 1, 2, 0, 1, 1, 0, 2, 2],
-               colors=[4, 4, 4, 4, 4, 3, 3, 3, 3]),
-      generate(rows=[0, 0, 2, 0, 1], cols=[0, 1, 0, 0, 2],
-               colors=[4, 4, 4, 3, 3]),
-      generate(rows=[1, 2, 0, 2, 2], cols=[0, 2, 1, 0, 1],
-               colors=[4, 4, 3, 3, 3]),
-  ]
-  test = [
-      generate(rows=[0, 0, 1, 2, 0, 1, 1, 2], cols=[1, 2, 0, 1, 0, 0, 1, 0],
-               colors=[4, 4, 4, 4, 3, 3, 3, 3]),
-      generate(rows=[0, 1, 2, 0, 1, 1, 1, 2], cols=[2, 1, 0, 1, 0, 1, 2, 0],
-               colors=[4, 4, 4, 3, 3, 3, 3, 3]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(
+            rows=[0, 0, 1, 0, 0, 1, 2],
+            cols=[0, 1, 0, 0, 1, 0, 2],
+            colors=[4, 4, 4, 3, 3, 3, 3],
+        ),
+        generate(
+            rows=[0, 0, 1, 2, 0, 0, 1, 2],
+            cols=[0, 2, 0, 2, 0, 1, 0, 0],
+            colors=[4, 4, 4, 4, 3, 3, 3, 3],
+        ),
+        generate(
+            rows=[0, 1, 1, 2, 2, 0, 1, 1, 2],
+            cols=[2, 1, 2, 0, 1, 1, 0, 2, 2],
+            colors=[4, 4, 4, 4, 4, 3, 3, 3, 3],
+        ),
+        generate(rows=[0, 0, 2, 0, 1], cols=[0, 1, 0, 0, 2], colors=[4, 4, 4, 3, 3]),
+        generate(rows=[1, 2, 0, 2, 2], cols=[0, 2, 1, 0, 1], colors=[4, 4, 3, 3, 3]),
+    ]
+    test = [
+        generate(
+            rows=[0, 0, 1, 2, 0, 1, 1, 2],
+            cols=[1, 2, 0, 1, 0, 0, 1, 0],
+            colors=[4, 4, 4, 4, 3, 3, 3, 3],
+        ),
+        generate(
+            rows=[0, 1, 2, 0, 1, 1, 1, 2],
+            cols=[2, 1, 0, 1, 0, 1, 2, 0],
+            colors=[4, 4, 4, 3, 3, 3, 3, 3],
+        ),
+    ]
+    return {"train": train, "test": test}

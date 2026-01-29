@@ -17,41 +17,40 @@
 from synthetics import common
 
 
-def generate(rows=None, left_colors=None, right_colors=None, width=11,
-             height=5):
-  """Returns input and output grids according to the given parameters.
+def generate(rows=None, left_colors=None, right_colors=None, width=11, height=5):
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where lines sholud be placed
-    left_colors: which colors to use for the left side
-    right_colors: which colors to use for the right side
-    width: the width of the grid
-    height: the height of the grid
-  """
-  if rows is None:
-    num = common.randint(1, 2)
-    rows = common.sample(range(height), num)
-    colors = list(range(1, 10))
-    colors.remove(common.gray())
-    colors = common.shuffle(colors)
-    left_colors, right_colors = colors[0:num], colors[num:2*num]
+    Args:
+      rows: a list of vertical coordinates where lines sholud be placed
+      left_colors: which colors to use for the left side
+      right_colors: which colors to use for the right side
+      width: the width of the grid
+      height: the height of the grid
+    """
+    if rows is None:
+        num = common.randint(1, 2)
+        rows = common.sample(range(height), num)
+        colors = list(range(1, 10))
+        colors.remove(common.gray())
+        colors = common.shuffle(colors)
+        left_colors, right_colors = colors[0:num], colors[num : 2 * num]
 
-  grid, output = common.grids(width, height)
-  for r, left_color, right_color in zip(rows, left_colors, right_colors):
-    grid[r][0], grid[r][-1] = left_color, right_color
-    for c in range(width // 2):
-      output[r][c], output[r][width - 1 - c] = left_color, right_color
-    output[r][width // 2] = common.gray()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(width, height)
+    for r, left_color, right_color in zip(rows, left_colors, right_colors):
+        grid[r][0], grid[r][-1] = left_color, right_color
+        for c in range(width // 2):
+            output[r][c], output[r][width - 1 - c] = left_color, right_color
+        output[r][width // 2] = common.gray()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[1], left_colors=[1], right_colors=[2]),
-      generate(rows=[3], left_colors=[3], right_colors=[7]),
-  ]
-  test = [
-      generate(rows=[1, 4], left_colors=[4, 6], right_colors=[8, 9]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(rows=[1], left_colors=[1], right_colors=[2]),
+        generate(rows=[3], left_colors=[3], right_colors=[7]),
+    ]
+    test = [
+        generate(rows=[1, 4], left_colors=[4, 6], right_colors=[8, 9]),
+    ]
+    return {"train": train, "test": test}

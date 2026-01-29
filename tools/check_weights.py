@@ -16,7 +16,9 @@ def read_weights_by_uid(substrate: SubstrateInterface, netuid: int, uid: int):
     return [(int(dest), int(w)) for dest, w in vals]
 
 
-def get_last_update_block(substrate: SubstrateInterface, netuid: int, uid: int) -> int | None:
+def get_last_update_block(
+    substrate: SubstrateInterface, netuid: int, uid: int
+) -> int | None:
     """
     Reads SubtensorModule::LastUpdate(netuid) -> Vec<BlockNumber>
     and returns entry for 'uid' if present.
@@ -42,23 +44,27 @@ def get_block_timestamp(substrate: SubstrateInterface, block_number: int) -> int
     """
     if block_number is None:
         return None
-    
+
     try:
         block_hash = substrate.get_block_hash(block_number)
         if block_hash is None:
             return None
-        
+
         ts_q = substrate.query("Timestamp", "Now", block_hash=block_hash)
         ts = ts_q.value  # milliseconds
         return int(ts) if ts is not None else None
-    
+
     except Exception as e:
-        print(f"\nWarning: Could not retrieve timestamp for block {block_number}. The block state may have been pruned.")
+        print(
+            f"\nWarning: Could not retrieve timestamp for block {block_number}. The block state may have been pruned."
+        )
         print(f"Error details: {str(e)}")
         return None
 
 
-def get_current_block_and_timestamp(substrate: SubstrateInterface) -> tuple[int | None, int | None]:
+def get_current_block_and_timestamp(
+    substrate: SubstrateInterface,
+) -> tuple[int | None, int | None]:
     """
     Returns (current_block_number, current_timestamp_ms)
     """
@@ -93,26 +99,36 @@ def human_delta(ms_then: int | None, ms_now: int | None) -> str:
     hours, mins = divmod(mins, 60)
     days, hours = divmod(hours, 24)
     parts = []
-    if days: parts.append(f"{days}d")
-    if hours: parts.append(f"{hours}h")
-    if mins: parts.append(f"{mins}m")
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if mins:
+        parts.append(f"{mins}m")
     parts.append(f"{secs}s")
     return " ".join(parts)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Read latest Bittensor weights and last set time")
-    parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT, help="Subtensor websocket endpoint")
+    parser = argparse.ArgumentParser(
+        description="Read latest Bittensor weights and last set time"
+    )
+    parser.add_argument(
+        "--endpoint", default=DEFAULT_ENDPOINT, help="Subtensor websocket endpoint"
+    )
     parser.add_argument("--netuid", type=int, default=5, help="Subnet netuid")
-    parser.add_argument("--uid", type=int, required=True, help="Validator UID (e.g., 251)")
+    parser.add_argument(
+        "--uid", type=int, required=True, help="Validator UID (e.g., 251)"
+    )
     parser.add_argument("--top", type=int, default=25, help="Show top N entries")
     args = parser.parse_args()
 
     print(f"Connecting to: {args.endpoint}")
-    substrate = SubstrateInterface(url=args.endpoint, ss58_format=SS58_FORMAT, use_remote_preset=True)
+    substrate = SubstrateInterface(
+        url=args.endpoint, ss58_format=SS58_FORMAT, use_remote_preset=True
+    )
 
     current_block, current_ts = get_current_block_and_timestamp(substrate)
-
 
     print(f"NetUID: {args.netuid}  |  Validator UID: {args.uid}")
     min_allowed = substrate.query("SubtensorModule", "MinAllowedWeights", [args.netuid])
@@ -134,23 +150,27 @@ def main():
         print(f"\nEntries: {len(weights_sorted)}")
         print(f"Raw sum (uint16 ticks): {total} (target ≈ {U16_MAX})\n")
 
-        top_n = weights_sorted[:args.top]
+        top_n = weights_sorted[: args.top]
         print(f"Top {len(top_n)} destinations:")
         print(f"{'UID':>6}  {'Ticks':>8}  {'Share (sum=1)':>14}  {'Percent':>9}")
         print("-" * 44)
         for dest_uid, w in top_n:
             share = (w / total) if total > 0 else 0.0
-            print(f"{dest_uid:>6}  {w:>8}  {share:>14.8f}  {share*100:>8.4f}%")
+            print(f"{dest_uid:>6}  {w:>8}  {share:>14.8f}  {share * 100:>8.4f}%")
 
         if len(weights_sorted) > len(top_n):
-            tail_sum = sum(w for _, w in weights_sorted[args.top:])
+            tail_sum = sum(w for _, w in weights_sorted[args.top :])
             tail_share = tail_sum / total if total > 0 else 0.0
             print("-" * 44)
-            print(f"{'...':>6}  {tail_sum:>8}  {tail_share:>14.8f}  {tail_share*100:>8.4f}%")
+            print(
+                f"{'...':>6}  {tail_sum:>8}  {tail_share:>14.8f}  {tail_share * 100:>8.4f}%"
+            )
 
         if len(weights_sorted) == 1 and weights_sorted[0][1] == U16_MAX:
             only_uid = weights_sorted[0][0]
-            print("\nℹ️  Only one weight at 65535 ticks (all to UID {}).".format(only_uid))
+            print(
+                "\nℹ️  Only one weight at 65535 ticks (all to UID {}).".format(only_uid)
+            )
 
     last_block = get_last_update_block(substrate, args.netuid, args.uid)
     if last_block is None:

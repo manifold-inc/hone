@@ -18,37 +18,35 @@ from synthetics import common
 
 
 def generate(colors=None, size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    colors: a list of digits representing the colors to be used
-    size: the width and height of the (square) grid
-  """
-  if colors is None:
-    color_list = common.random_colors(
-        common.randint(2, 4), exclude=[common.gray()]
-    )
-    colors = common.square_with_unique_max_color(size, color_list)
+    Args:
+      colors: a list of digits representing the colors to be used
+      size: the width and height of the (square) grid
+    """
+    if colors is None:
+        color_list = common.random_colors(common.randint(2, 4), exclude=[common.gray()])
+        colors = common.square_with_unique_max_color(size, color_list)
 
-  grid, output = common.grids(size, size)
-  mode = max(set(colors), key=colors.count)
-  for r in range(size):
-    for c in range(size):
-      color = colors[r * size + c]
-      grid[r][c] = color
-      output[r][c] = color if color == mode else common.gray()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    mode = max(set(colors), key=colors.count)
+    for r in range(size):
+        for c in range(size):
+            color = colors[r * size + c]
+            grid[r][c] = color
+            output[r][c] = color if color == mode else common.gray()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(colors=[2, 2, 2, 2, 1, 8, 2, 8, 8]),
-      generate(colors=[1, 1, 1, 8, 1, 3, 8, 2, 2]),
-      generate(colors=[2, 2, 2, 8, 8, 2, 2, 2, 2]),
-      generate(colors=[3, 3, 8, 4, 4, 4, 8, 1, 1]),
-  ]
-  test = [
-      generate(colors=[1, 3, 2, 3, 3, 2, 1, 3, 2]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(colors=[2, 2, 2, 2, 1, 8, 2, 8, 8]),
+        generate(colors=[1, 1, 1, 8, 1, 3, 8, 2, 2]),
+        generate(colors=[2, 2, 2, 8, 8, 2, 2, 2, 2]),
+        generate(colors=[3, 3, 8, 4, 4, 4, 8, 1, 1]),
+    ]
+    test = [
+        generate(colors=[1, 3, 2, 3, 3, 2, 1, 3, 2]),
+    ]
+    return {"train": train, "test": test}

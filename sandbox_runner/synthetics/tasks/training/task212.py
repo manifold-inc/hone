@@ -18,53 +18,66 @@ from synthetics import common
 
 
 def generate(rows=None, cols=None, idxs=None, horizon=None, size=10):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    idxs: a list of 0/1 values (for blue/red pixels, respectively)
-    horizon: the placement of the grey horizon
-    size: the width and height of the (square) grid
-  """
-  if rows is None:
-    horizon = common.randint(3, 6)
-    rows, cols = [], []
-    for c in range(size):
-      if common.randint(0, 1) == 0: continue
-      rows.append(common.randint(0, horizon - 2))
-      cols.append(c)
-    for c in range(size):
-      if common.randint(0, 1) == 0: continue
-      rows.append(common.randint(horizon + 2, size - 1))
-      cols.append(c)
-    idxs = [common.randint(0, 1) for _ in range(len(rows))]
+    Args:
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      idxs: a list of 0/1 values (for blue/red pixels, respectively)
+      horizon: the placement of the grey horizon
+      size: the width and height of the (square) grid
+    """
+    if rows is None:
+        horizon = common.randint(3, 6)
+        rows, cols = [], []
+        for c in range(size):
+            if common.randint(0, 1) == 0:
+                continue
+            rows.append(common.randint(0, horizon - 2))
+            cols.append(c)
+        for c in range(size):
+            if common.randint(0, 1) == 0:
+                continue
+            rows.append(common.randint(horizon + 2, size - 1))
+            cols.append(c)
+        idxs = [common.randint(0, 1) for _ in range(len(rows))]
 
-  grid, output = common.grids(size, size)
-  for c in range(size):
-    output[horizon][c] = grid[horizon][c] = common.gray()
-  for r, c, idx in zip(rows, cols, idxs):
-    grid[r][c] = idx + 1
-    dr = -1 if idx == 0 else 1
-    dr = dr if r < horizon else -dr
-    while True:
-      if r < 0 or r >= size or output[r][c]:
-        break
-      output[r][c], r = idx + 1, r + dr
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    for c in range(size):
+        output[horizon][c] = grid[horizon][c] = common.gray()
+    for r, c, idx in zip(rows, cols, idxs):
+        grid[r][c] = idx + 1
+        dr = -1 if idx == 0 else 1
+        dr = dr if r < horizon else -dr
+        while True:
+            if r < 0 or r >= size or output[r][c]:
+                break
+            output[r][c], r = idx + 1, r + dr
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[0, 1, 2, 2, 8, 8, 8], cols=[2, 6, 1, 9, 1, 5, 8],
-               idxs=[0, 0, 1, 1, 0, 1, 0], horizon=5),
-      generate(rows=[0, 0, 1, 1, 5, 5, 6, 8, 8, 8],
-               cols=[1, 3, 5, 7, 1, 9, 4, 2, 6, 8],
-               idxs=[1, 0, 1, 0, 1, 1, 0, 0, 1, 0], horizon=3),
-  ]
-  test = [
-      generate(rows=[1, 1, 1, 2, 7, 7, 8, 9], cols=[1, 3, 8, 6, 2, 5, 0, 8],
-               idxs=[1, 0, 1, 0, 0, 1, 1, 0], horizon=4),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(
+            rows=[0, 1, 2, 2, 8, 8, 8],
+            cols=[2, 6, 1, 9, 1, 5, 8],
+            idxs=[0, 0, 1, 1, 0, 1, 0],
+            horizon=5,
+        ),
+        generate(
+            rows=[0, 0, 1, 1, 5, 5, 6, 8, 8, 8],
+            cols=[1, 3, 5, 7, 1, 9, 4, 2, 6, 8],
+            idxs=[1, 0, 1, 0, 1, 1, 0, 0, 1, 0],
+            horizon=3,
+        ),
+    ]
+    test = [
+        generate(
+            rows=[1, 1, 1, 2, 7, 7, 8, 9],
+            cols=[1, 3, 8, 6, 2, 5, 0, 8],
+            idxs=[1, 0, 1, 0, 0, 1, 1, 0],
+            horizon=4,
+        ),
+    ]
+    return {"train": train, "test": test}

@@ -20,7 +20,7 @@ SCORING_WEIGHTS = {
     "exact_match": 0.5,
     "partial_correctness": 0.3,
     "grid_similarity": 0.15,
-    "efficiency": 0.05
+    "efficiency": 0.05,
 }
 
 # Minimum requirements
