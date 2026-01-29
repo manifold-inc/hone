@@ -22,8 +22,13 @@ THIS FILE IS JUST AN EXAMPLE SOLVER:
 
 import json
 import os
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, TYPE_CHECKING
 
+if TYPE_CHECKING:
+    try:
+        import openai
+    except ImportError:
+        pass
 
 # This is the model *downloaded in prep phase* by default
 # The prep-phase script imports this name
@@ -31,6 +36,11 @@ model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
 
 
 class ARCSolver:
+    use_vllm: bool
+    vllm_available: bool
+    vllm_client: "openai.OpenAI" | None
+    vllm_model_name: Optional[str]
+
     """
     ARC solver with optional vLLM backend and rule-based fallback strategies
 
@@ -161,6 +171,10 @@ class ARCSolver:
         test_input: List[List[int]],
     ) -> Optional[List[List[int]]]:
         """Use vLLM to solve the ARC problem"""
+        if not self.vllm_available or not self.vllm_client or not self.vllm_model_name:
+            print("    ⚠ vLLM not available")
+            return None
+
         prompt = self._create_arc_prompt(train_examples, test_input)
 
         try:
@@ -182,7 +196,11 @@ class ARCSolver:
                 max_tokens=2000,
             )
 
-            content = response.choices[0].message.content.strip()
+            content_ = response.choices[0].message.content
+            if content_ is None:
+                print("    ⚠ vLLM returned no content")
+                return None
+            content = content_.strip()
 
             # extract JSON from markdown code blocks if present
             if "```json" in content:

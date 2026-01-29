@@ -1,13 +1,10 @@
-from typing import List, Dict
-from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends
 import logging
 
 from config import Config
-from api.routes import authenticate_request, get_meta_manager, get_config
+from api.routes import authenticate_request, get_meta_manager
 
 logger = logging.getLogger("api.dashboard")
 

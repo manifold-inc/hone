@@ -9,7 +9,6 @@ Validates miner repositories before execution:
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import List, Optional
 
@@ -30,9 +29,9 @@ class RepositoryValidator:
     obvious security issues.
     """
 
-    BLACKLISTED_PACKAGES = {}
+    BLACKLISTED_PACKAGES: set[str] = set()
 
-    SUSPICIOUS_PACKAGES = {
+    SUSPICIOUS_PACKAGES: set[str] = {
         "eval",
         "exec",
         "compile",

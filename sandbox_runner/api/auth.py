@@ -1,7 +1,7 @@
 import time
 from typing import Optional, Set
 
-from fastapi import Header, HTTPException, status, Request
+from fastapi import HTTPException, status
 from fastapi.security import APIKeyHeader
 import os
 
@@ -107,6 +107,8 @@ class RateLimiter:
     """
     Simple in-memory rate limiter for API endpoints
     """
+
+    _request_log: dict[str, list[float]]
 
     def __init__(self, requests_per_minute: int):
         """

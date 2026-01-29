@@ -151,7 +151,7 @@ class DirectExecutor:
                 },
             )
 
-            return exit_code, stdout, stderr
+            return exit_code if exit_code is not None else -1, stdout, stderr
 
         except asyncio.TimeoutError:
             logger.error(
@@ -246,7 +246,7 @@ class DirectExecutor:
         stdout_file: Path,
         stderr_file: Path,
         timeout_seconds: int,
-    ) -> subprocess.CompletedProcess:
+    ) -> asyncio.subprocess.Process:
         """
         Run process with isolation (namespaces, cgroups, etc)
 
@@ -326,7 +326,7 @@ class DirectExecutor:
         except Exception as e:
             logger.warning(f"Failed to drop privileges: {e}")
 
-    def _kill_process(self, process: subprocess.CompletedProcess):
+    def _kill_process(self, process: asyncio.subprocess.Process):
         """
         Kill a running process
 
@@ -399,7 +399,7 @@ class DirectExecutor:
         return f"direct-{job_id}"
 
     async def build_image_from_requirements(
-        self, repo_path: Path, job_id: str, base_image: str = None
+        self, repo_path: Path, job_id: str, base_image: str | None = None
     ) -> str:
         """
         Build from requirements (same as build_image in direct mode)

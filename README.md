@@ -418,7 +418,7 @@ response = client.chat.completions.create(
 
 ### Example Solver
 
-See `miner-solution-example/` for a complete reference implementation with:
+See `miner_solution_example/` for a complete reference implementation with:
 - HuggingFace model download in prep phase
 - vLLM-based inference with fallback heuristics
 - Proper error handling and logging
@@ -707,7 +707,7 @@ docker network rm sandbox-job-xyz
 hone/
 ├── common/                 # shared utilities (chain, epistula, etc.)
 ├── miner/                  # miner HTTP server
-├── miner-solution-example/ # reference solver implementation
+├── miner_solution_example/ # reference solver implementation
 ├── sandbox_runner/         # GPU execution service
 │   ├── api/                # REST API routes
 │   ├── core/               # job queue, GPU pool, scheduler, executor

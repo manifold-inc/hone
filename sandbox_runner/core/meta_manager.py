@@ -21,7 +21,6 @@ import uuid
 import json
 from datetime import datetime
 from typing import Optional, Dict, List
-from dataclasses import asdict
 from pathlib import Path
 
 from core.job_queue import Job, JobQueue, JobStatus, WeightClass

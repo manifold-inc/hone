@@ -146,7 +146,7 @@ async def run_weights_cycle(validator, state):
     logger.info(f"Weights cycle complete")
 
 
-async def run_continuous(validator, stop_event: asyncio.Event = None):
+async def run_continuous(validator, stop_event: asyncio.Event | None = None):
     """
     Main loop that runs query and weights cycles continuously
     """

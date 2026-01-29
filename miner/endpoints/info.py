@@ -41,7 +41,7 @@ async def get_miner_info(request: Request) -> Dict[str, Any]:
             "MINER_REPO_COMMIT"
         ),  # optional - None means use latest
         "repo_path": os.getenv(
-            "MINER_REPO_PATH", "miner-solution-example"
+            "MINER_REPO_PATH", "miner_solution_example"
         ),  # optional subdirectory within repo
         "weight_class": os.getenv(
             "MINER_WEIGHT_CLASS", "1xH200"

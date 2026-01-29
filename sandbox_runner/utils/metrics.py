@@ -81,7 +81,7 @@ def calculate_partial_correctness(
 def calculate_metrics_for_prediction(
     predicted_output: Optional[List[List[int]]],
     expected_output: List[List[int]],
-    metadata: Dict = None,
+    metadata: Dict | None = None,
 ) -> Dict:
     """
     Calculate all metrics for a single prediction

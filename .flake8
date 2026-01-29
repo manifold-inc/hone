@@ -1,0 +1,5 @@
+# MIT License - https://github.com/opentensor/bittensor/blob/d7cc9510e3b8a8107c4c2b64bcf24c95c5f83ad7/.flake8
+[flake8]
+max-line-length = 120
+exclude = .git,__pycache__, __init__.py,venv,.venv
+select = E9,F63,F7,F82,F401

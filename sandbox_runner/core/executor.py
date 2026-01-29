@@ -27,9 +27,8 @@ import tempfile
 from core.job_queue import Job, JobStatus
 from core.gpu_pool import GPUPoolManager
 from config import Config
-from utils.s3 import S3Manager, S3TransferError
+from utils.s3 import S3Manager
 from utils.validation import RepositoryValidator, ValidationError
-from utils.metrics import calculate_detailed_metrics
 from security.network import NetworkPolicy, IptablesNetworkPolicy
 from synthetics.dataset_manager import DatasetManager
 from execution.docker_gvisor import DockerGVisorExecutor

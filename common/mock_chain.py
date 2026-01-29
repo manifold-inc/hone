@@ -13,6 +13,8 @@ class MockChainInterface(ChainInterface):
     Mock implementation of ChainInterface for local testing without Bittensor
     """
 
+    weight_history: List[Dict]
+
     def __init__(
         self,
         endpoint: str = "mock://localhost",

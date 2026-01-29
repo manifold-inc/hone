@@ -1,0 +1,66 @@
+# MIT License - https://github.com/opentensor/bittensor/blob/d7cc9510e3b8a8107c4c2b64bcf24c95c5f83ad7/.github/workflows/flake8-and-mypy.yml
+name: Flake8 and Mypy - linter check
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+jobs:
+  setup:
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: false
+
+      - name: Cache uv and .venv
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: uv-${{ runner.os }}-${{ runner.arch }}-py3.10-${{ hashFiles('pyproject.toml') }}
+          restore-keys: uv-${{ runner.os }}-${{ runner.arch }}-py3.10-
+
+      - name: Sync dev deps
+        run: |
+            uv pip install -r requirements.dev.txt
+    
+  flake8:
+    needs: setup
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Flake8
+        run: uv run flake8 --count
+
+  # mypy:
+  #   needs: setup
+  #   runs-on: ubuntu-latest
+    
+  #   strategy:
+  #     fail-fast: false
+  #     max-parallel: 5
+  #     matrix:
+  #       subdir: ["validator", "miner_solution_example", "sandbox_runner", "miner", "common", "tools"]
+
+  #   steps:
+  #     - name: Install subdir deps
+  #       if: hashFiles(format('{0}/requirements.txt', matrix.subdir)) != '' 
+  #       run: uv pip install -r ${{ matrix.subdir }}/requirements.txt
+
+  #     - name: Mypy
+  #       run: uv run mypy --ignore-missing-imports

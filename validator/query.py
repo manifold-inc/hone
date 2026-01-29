@@ -1,6 +1,6 @@
 import asyncio
 import aiohttp
-from typing import Dict, List, Optional
+from typing import Dict, Optional, TypedDict
 from datetime import datetime, timezone
 from loguru import logger
 
@@ -8,10 +8,20 @@ from validator.sandbox_client import SandboxRunnerClient
 from validator.telemetry import TelemetryClient
 
 
+# type definitions
+class Miner(TypedDict):
+    hotkey: str
+
+
+class Job(TypedDict):
+    miner: Miner
+    info: Dict
+
+
 async def fetch_miner_info(
     session: aiohttp.ClientSession,
     uid: int,
-    miner: Dict,
+    miner: Miner,
     default_port: int,
     timeout: int,
 ) -> Optional[Dict]:
@@ -72,7 +82,7 @@ async def query_miners_via_sandbox(
     chain,
     db,
     config,
-    miners: Dict[int, Dict],
+    miners: Dict[int, Miner],
     current_block: int,
     telemetry_client: TelemetryClient,
 ) -> Dict[int, Dict]:
@@ -102,6 +112,8 @@ async def query_miners_via_sandbox(
             last_update_block=current_block,
         )
 
+    if not config.sandbox_runner_endpoint:
+        raise ValueError("SANDBOX_RUNNER_ENDPOINT is not set")
     sandbox_client = SandboxRunnerClient(
         endpoint=config.sandbox_runner_endpoint, api_key=config.sandbox_runner_api_key
     )
@@ -111,7 +123,7 @@ async def query_miners_via_sandbox(
     logger.info(f"Max submissions per day: {config.max_submissions_per_day}")
     logger.info(f"=" * 80)
 
-    eligible_miners = {}
+    eligible_miners: Dict[int, Miner] = {}
     for uid, miner in miners.items():
         hotkey = miner.get("hotkey")
         if not hotkey:
@@ -139,7 +151,7 @@ async def query_miners_via_sandbox(
 
     logger.info(f"Fetching /info from {len(eligible_miners)} eligible miners...")
 
-    miner_infos = {}
+    miner_infos: Dict[int, Dict] = {}
     timeout = aiohttp.ClientTimeout(total=config.miner_info_timeout_seconds)
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -159,19 +171,20 @@ async def query_miners_via_sandbox(
         for uid, result in zip(eligible_miners.keys(), results):
             if isinstance(result, Exception):
                 logger.error(f"UID {uid}: Exception fetching info: {result}")
-            elif result:
+                continue
+            elif result is not None and isinstance(result, dict):
                 miner_infos[uid] = result
 
     logger.info(
         f"Successfully fetched info from {len(miner_infos)}/{len(eligible_miners)} miners"
     )
 
-    jobs_to_submit = {}
-    cached_results = {}
+    jobs_to_submit: Dict[int, Job] = {}
+    cached_results: Dict[int, Dict] = {}
 
     for uid, info in miner_infos.items():
-        miner = eligible_miners[uid]
-        hotkey = miner.get("hotkey")
+        miner_info: Miner = eligible_miners[uid]
+        hotkey = miner_info.get("hotkey")
 
         history = await db.get_submission_history(
             hotkey=hotkey,
@@ -219,7 +232,7 @@ async def query_miners_via_sandbox(
             await db.increment_daily_submissions(hotkey)
 
         else:
-            jobs_to_submit[uid] = {"miner": miner, "info": info}
+            jobs_to_submit[uid] = {"miner": miner_info, "info": info}
 
     logger.info(
         f"Results: {len(cached_results)} from cache, {len(jobs_to_submit)} need evaluation"
@@ -233,9 +246,9 @@ async def query_miners_via_sandbox(
 
     for uid, job_data in jobs_to_submit.items():
         try:
-            miner = job_data["miner"]
+            miner_for_job: Miner = job_data["miner"]
+            hotkey = miner_for_job["hotkey"]
             info = job_data["info"]
-            hotkey = miner.get("hotkey")
 
             logger.info(f"UID {uid}: Submitting NEW solution to sandbox runner")
             logger.debug(f"  Repo: {info['repo_url']}")
@@ -261,7 +274,7 @@ async def query_miners_via_sandbox(
 
             job_submissions[uid] = {
                 "job_id": job_id,
-                "miner": miner,
+                "miner": miner_for_job,
                 "info": info,
                 "submitted_at": datetime.now(timezone.utc),
             }
@@ -276,7 +289,7 @@ async def query_miners_via_sandbox(
             await db.record_query_result(
                 block=current_block,
                 uid=uid,
-                hotkey=miner.get("hotkey"),
+                hotkey=miner_for_job.get("hotkey"),
                 success=False,
                 response=None,
                 error=f"Sandbox job submission failed: {e}",

@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Any, Set
 import os
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 import uvicorn
 from loguru import logger
@@ -42,7 +42,7 @@ class Config:
         cache_ttl_days: int = 7,
         health_check_interval: int = 30,
         github_timeout: int = 10,
-        runner_api_key: str = None,
+        runner_api_key: str | None = None,
     ):
         self.runner_urls = [url.rstrip("/") for url in runner_urls]
         self.port = port
@@ -429,7 +429,7 @@ class RunnerHealthManager:
         self,
         runner_urls: List[str],
         check_interval: int = 30,
-        runner_api_key: str = None,
+        runner_api_key: str | None = None,
     ):
         self.runner_urls = runner_urls
         self.check_interval = check_interval
@@ -1190,7 +1190,8 @@ lb: Optional[LoadBalancer] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    global lb
+    global lb  # noqa: F824 (used in global scope)
+    assert lb is not None
 
     logger.info("Starting Sandbox Load Balancer...")
     await lb.start()

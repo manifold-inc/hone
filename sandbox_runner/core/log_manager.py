@@ -10,14 +10,12 @@ Provides:
 """
 
 import asyncio
-import json
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 import threading
-from collections import defaultdict, deque
+from collections import deque
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -362,7 +360,7 @@ log_manager: Optional[LogManager] = None
 
 def get_log_manager() -> LogManager:
     """Get the global log manager instance"""
-    global log_manager
+    global log_manager  # noqa: F824 (used in global scope)
     if log_manager is None:
         raise RuntimeError("LogManager not initialized")
     return log_manager

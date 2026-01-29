@@ -2,10 +2,31 @@ import os
 import asyncio
 import asyncpg
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from loguru import logger
 import json
-import hashlib
+
+
+# Decorator to check if the database pool is initialized
+def requires_pool(func):
+    def wrapper(self: "Database", *args, **kwargs):
+        if self.pool is None:
+            raise RuntimeError("Database pool not initialized")
+
+        assert self.pool is not None
+        return func(self, self.pool, *args, **kwargs)
+
+    async def async_wrapper(self: "Database", *args, **kwargs):
+        if self.pool is None:
+            raise RuntimeError("Database pool not initialized")
+
+        assert self.pool is not None
+        return await func(self, self.pool, *args, **kwargs)
+
+    if asyncio.iscoroutinefunction(func):
+        return async_wrapper
+    else:
+        return wrapper
 
 
 class Database:
@@ -45,8 +66,10 @@ class Database:
             await self.pool.close()
             self.pool = None
 
+    @requires_pool
     async def upsert_miner(
         self,
+        pool: asyncpg.Pool,
         uid: int,
         hotkey: str,
         ip: Optional[str],
@@ -54,7 +77,7 @@ class Database:
         stake: Optional[float],
         last_update_block: Optional[int],
     ):
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             # remove any stale entry where a different uid has this hotkey
             await conn.execute(
                 "DELETE FROM miners WHERE hotkey = $1 AND uid != $2", hotkey, uid
@@ -80,25 +103,30 @@ class Database:
                 last_update_block,
             )
 
-    async def get_miners(self) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as conn:
+    @requires_pool
+    async def get_miners(self, pool: asyncpg.Pool) -> List[asyncpg.Record]:
+        async with pool.acquire() as conn:
             return await conn.fetch("SELECT * FROM miners ORDER BY uid ASC")
 
-    async def get_miner_by_hotkey(self, hotkey: str) -> Optional[asyncpg.Record]:
+    @requires_pool
+    async def get_miner_by_hotkey(
+        self, pool: asyncpg.Pool, hotkey: str
+    ) -> Optional[asyncpg.Record]:
         """Get miner by hotkey"""
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM miners WHERE hotkey = $1", hotkey)
 
     # ===== SUBMISSION HISTORY METHODS =====
 
+    @requires_pool
     async def check_daily_submission_limit(
-        self, hotkey: str, max_per_day: int
+        self, pool: asyncpg.Pool, hotkey: str, max_per_day: int
     ) -> Tuple[bool, int]:
         """
         Check if miner has reached daily submission limit
         Returns: (can_submit, current_count)
         """
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
                 SELECT submission_count 
@@ -113,9 +141,10 @@ class Database:
 
             return can_submit, current_count
 
-    async def increment_daily_submissions(self, hotkey: str):
+    @requires_pool
+    async def increment_daily_submissions(self, pool: asyncpg.Pool, hotkey: str):
         """Increment daily submission count for a miner"""
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO daily_submissions (hotkey, submission_date, submission_count, last_submission_time)
@@ -127,8 +156,10 @@ class Database:
                 hotkey,
             )
 
+    @requires_pool
     async def get_submission_history(
         self,
+        pool: asyncpg.Pool,
         hotkey: str,
         repo_url: str,
         repo_branch: str,
@@ -143,7 +174,7 @@ class Database:
         repo_commit = repo_commit or ""
         repo_path = repo_path or ""
 
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             return await conn.fetchrow(
                 """
                 SELECT * FROM submission_history
@@ -162,8 +193,10 @@ class Database:
                 weight_class,
             )
 
+    @requires_pool
     async def save_submission_history(
         self,
+        pool: asyncpg.Pool,
         hotkey: str,
         repo_url: str,
         repo_branch: str,
@@ -175,7 +208,7 @@ class Database:
         exact_match_rate: float,
     ):
         """Save or update submission history with exact_match_rate"""
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO submission_history (
@@ -202,8 +235,10 @@ class Database:
                 exact_match_rate,
             )
 
+    @requires_pool
     async def record_query_result(
         self,
+        pool: asyncpg.Pool,
         block: int,
         uid: int,
         hotkey: str,
@@ -220,7 +255,7 @@ class Database:
         weight_class: Optional[str] = None,
         from_cache: bool = False,
     ):
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             response_json = json.dumps(response) if response else None
 
             await conn.execute(
@@ -251,9 +286,12 @@ class Database:
 
     # ===== LEADERBOARD METHODS =====
 
-    async def get_leaderboard(self, limit: int = 5) -> List[asyncpg.Record]:
+    @requires_pool
+    async def get_leaderboard(
+        self, pool: asyncpg.Pool, limit: int = 5
+    ) -> List[asyncpg.Record]:
         """Get current top miners"""
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             return await conn.fetch(
                 """
                 SELECT * FROM leaderboard
@@ -263,8 +301,10 @@ class Database:
                 limit,
             )
 
+    @requires_pool
     async def update_leaderboard(
         self,
+        pool: asyncpg.Pool,
         hotkey: str,
         uid: int,
         exact_match_rate: float,
@@ -274,7 +314,7 @@ class Database:
         repo_path: str,
     ):
         """Update or insert miner into leaderboard"""
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             await conn.execute(
                 """
                 INSERT INTO leaderboard (
@@ -302,16 +342,18 @@ class Database:
                 repo_path,
             )
 
-    async def remove_from_leaderboard(self, hotkey: str):
+    @requires_pool
+    async def remove_from_leaderboard(self, pool: asyncpg.Pool, hotkey: str):
         """Remove miner from leaderboard"""
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             await conn.execute("DELETE FROM leaderboard WHERE hotkey = $1", hotkey)
 
+    @requires_pool
     async def get_recent_results(
-        self, window_blocks: int, current_block: int
+        self, pool: asyncpg.Pool, window_blocks: int, current_block: int
     ) -> List[asyncpg.Record]:
         min_block = max(0, current_block - window_blocks)
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             return await conn.fetch(
                 """
                 SELECT * FROM query_results
@@ -321,14 +363,17 @@ class Database:
                 min_block,
             )
 
-    async def save_scores(self, scores: Dict[int, float], hotkey_map: Dict[int, str]):
+    @requires_pool
+    async def save_scores(
+        self, pool: asyncpg.Pool, scores: Dict[int, float], hotkey_map: Dict[int, str]
+    ):
         """
         Save scores (exact_match_rate based)
         scores format: {uid: exact_match_rate}
         hotkey_map: {uid: hotkey}
         """
         ts = datetime.now(timezone.utc).replace(tzinfo=None)
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             for uid, exact_match_rate in scores.items():
                 hotkey = hotkey_map.get(uid)
                 if not hotkey:
@@ -345,20 +390,24 @@ class Database:
                     ts,
                 )
 
-    async def get_scores_last_hours(self, hours: int = 24) -> List[asyncpg.Record]:
-        async with self.pool.acquire() as conn:
+    @requires_pool
+    async def get_scores_last_hours(
+        self, pool: asyncpg.Pool, hours: int = 24
+    ) -> List[asyncpg.Record]:
+        async with pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM scores WHERE timestamp > NOW() - ($1 || ' hours')::interval",
                 str(hours),
             )
             return rows
 
+    @requires_pool
     async def get_miner_performance_stats(
-        self, uid: int, window_blocks: int, current_block: int
+        self, pool: asyncpg.Pool, uid: int, window_blocks: int, current_block: int
     ) -> Dict:
         """Get performance statistics for a specific miner"""
         min_block = max(0, current_block - window_blocks)
-        async with self.pool.acquire() as conn:
+        async with pool.acquire() as conn:
             stats = await conn.fetchrow(
                 """
                 SELECT 
@@ -376,6 +425,8 @@ class Database:
 
     async def cleanup_old_data(self, retention_days: int):
         """Delete data older than retention_days to prevent disk overflow"""
+        if self.pool is None:
+            raise RuntimeError("Database pool not initialized")
         async with self.pool.acquire() as conn:
             deleted_queries = await conn.execute(
                 """

@@ -8,7 +8,6 @@ and sending them to the LogManager for persistence.
 import asyncio
 import logging
 from typing import Optional, Callable, List
-from pathlib import Path
 
 from core.log_manager import get_log_manager
 
@@ -215,7 +214,7 @@ class BuildLogDisplayAdapter:
         if self.show_terminal and self.original:
             self.original.write_below_box(text)
 
-    def end(self, status: str = None):
+    def end(self, status: str | None = None):
         """End the display"""
         if status:
             self.capture.capture_line(f"[STATUS] {status}", "info")
@@ -239,7 +238,7 @@ def create_log_display(
     phase: str,
     show_terminal: bool = True,
     box_lines: int = 50,
-    title: str = None,
+    title: str | None = None,
 ):
     """
     Factory function to create appropriate log display

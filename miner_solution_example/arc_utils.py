@@ -18,9 +18,8 @@ Only modify this file if you know exactly what the validator expects.
 """
 
 import json
-import socket
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 
 def save_output_data(results: Dict[str, Any], output_dir: Path) -> None:

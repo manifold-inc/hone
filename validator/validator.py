@@ -12,6 +12,8 @@ from validator.telemetry import TelemetryClient
 
 
 class Validator:
+    chain: ChainInterface
+
     def __init__(self, config: ValidatorConfig):
         self.config = config
         self.should_stop = False
@@ -36,6 +38,8 @@ class Validator:
                 wallet_path=config.wallet_path,
             )
 
+        if not config.db_url:
+            raise ValueError("DB_URL is not set")
         self.db = Database(dsn=config.db_url)
         self.config.current_block_provider = self.get_current_block
 

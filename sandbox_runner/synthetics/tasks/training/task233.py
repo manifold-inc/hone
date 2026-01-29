@@ -14,8 +14,6 @@
 
 """Generator."""
 
-import sys
-
 from synthetics import common
 
 
