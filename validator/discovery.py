@@ -1,6 +1,7 @@
 from typing import Dict
 from loguru import logger
 
+
 async def discover_miners(chain) -> Dict[int, Dict]:
     try:
         chain.connect()

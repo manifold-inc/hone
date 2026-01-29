@@ -18,41 +18,45 @@ from synthetics import common
 
 
 def generate(row=None, col=None, size=13):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    row: a vertical coordinate where the pixel should be placed
-    col: a horizontal coordinate where the pixel should be placed
-    size: the width and height of the (square) grid
-  """
-  if row is None:
-    row, col = common.randint(0, size - 1), common.randint(0, size - 1)
+    Args:
+      row: a vertical coordinate where the pixel should be placed
+      col: a horizontal coordinate where the pixel should be placed
+      size: the width and height of the (square) grid
+    """
+    if row is None:
+        row, col = common.randint(0, size - 1), common.randint(0, size - 1)
 
-  grid, output = common.grids(size, size)
-  output[row][col] = grid[row][col] = common.cyan()
-  for dr, dc in [(-1, 1), (1, -1)]:
-    v, h, r, c = 2, 0, row, col
-    while True:
-      if v:
-        r, v = r + dr, v - 1
-        if r < 0 or r >= size: break
-        output[r][c] = common.gray()
-        if not v: h = 2
-      else:
-        c, h = c + dc, h - 1
-        if c < 0 or c >= size: break
-        output[r][c] = common.gray()
-        if not h: v = 2
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    output[row][col] = grid[row][col] = common.cyan()
+    for dr, dc in [(-1, 1), (1, -1)]:
+        v, h, r, c = 2, 0, row, col
+        while True:
+            if v:
+                r, v = r + dr, v - 1
+                if r < 0 or r >= size:
+                    break
+                output[r][c] = common.gray()
+                if not v:
+                    h = 2
+            else:
+                c, h = c + dc, h - 1
+                if c < 0 or c >= size:
+                    break
+                output[r][c] = common.gray()
+                if not h:
+                    v = 2
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(row=3, col=4),
-      generate(row=7, col=6),
-  ]
-  test = [
-      generate(row=5, col=5),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(row=3, col=4),
+        generate(row=7, col=6),
+    ]
+    test = [
+        generate(row=5, col=5),
+    ]
+    return {"train": train, "test": test}

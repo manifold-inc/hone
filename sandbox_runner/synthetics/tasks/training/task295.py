@@ -18,38 +18,38 @@ from synthetics import common
 
 
 def generate(width=None, length=None, color=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the input grid
-    length: the length of the topmost line
-    color: a digit representing a color to be used
-  """
-  if width is None:
-    width = 2 * common.randint(3, 9)
-    length = common.randint(1, width // 2 + 1)
-    color = common.random_color()
+    Args:
+      width: the width of the input grid
+      length: the length of the topmost line
+      color: a digit representing a color to be used
+    """
+    if width is None:
+        width = 2 * common.randint(3, 9)
+        length = common.randint(1, width // 2 + 1)
+        color = common.random_color()
 
-  height = width // 2
-  grid, output = common.grid(width, 1), common.grid(width, height)
-  for c in range(length):
-    grid[0][c] = color
-  for r in range(height):
-    for c in range(length + r):
-      output[r][c] = color
-  return {"input": grid, "output": output}
+    height = width // 2
+    grid, output = common.grid(width, 1), common.grid(width, height)
+    for c in range(length):
+        grid[0][c] = color
+    for r in range(height):
+        for c in range(length + r):
+            output[r][c] = color
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=6, length=2, color=1),
-      generate(width=8, length=1, color=2),
-      generate(width=10, length=3, color=5),
-      generate(width=6, length=4, color=8),
-      generate(width=6, length=1, color=7),
-  ]
-  test = [
-      generate(width=12, length=3, color=1),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(width=6, length=2, color=1),
+        generate(width=8, length=1, color=2),
+        generate(width=10, length=3, color=5),
+        generate(width=6, length=4, color=8),
+        generate(width=6, length=1, color=7),
+    ]
+    test = [
+        generate(width=12, length=3, color=1),
+    ]
+    return {"train": train, "test": test}

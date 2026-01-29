@@ -5,9 +5,10 @@ from pathlib import Path
 from substrateinterface import Keypair
 from loguru import logger
 
+
 def load_keypair(config) -> Keypair:
     """Load keypair from wallet or create mock keypair in test mode"""
-    
+
     # local test mode
     if os.getenv("SKIP_EPISTULA_VERIFY", "false").lower() == "true":
         logger.warning("⚠️ TEST MODE: Creating mock keypair")
@@ -16,22 +17,22 @@ def load_keypair(config) -> Keypair:
         keypair = Keypair.create_from_seed(seed_bytes.hex())
         logger.info(f"Mock keypair created: {keypair.ss58_address[:8]}...")
         return keypair
-    
+
     # normal mode - load from wallet file
     wallet_path = Path(config.wallet_path).expanduser()
     file_path = wallet_path / config.wallet_name / "hotkeys" / config.wallet_hotkey
-    
+
     try:
         with open(file_path, "r") as file:
             keypair_data = json.load(file)
-        
+
         if "secretSeed" in keypair_data:
             keypair = Keypair.create_from_seed(keypair_data["secretSeed"])
         elif "secretKey" in keypair_data:
             keypair = Keypair.create_from_seed(keypair_data["secretKey"])
         else:
             raise ValueError("Could not find secret key in hotkey file")
-        
+
         logger.info(f"Loaded keypair from {file_path}")
         return keypair
     except FileNotFoundError:

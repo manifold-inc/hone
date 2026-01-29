@@ -74,7 +74,9 @@ class ARCSolver:
         try:
             from openai import OpenAI
 
-            vllm_api_base = os.environ.get("VLLM_API_BASE", "http://vllm-container:8000")
+            vllm_api_base = os.environ.get(
+                "VLLM_API_BASE", "http://vllm-container:8000"
+            )
             print(f"🌐 Attempting to connect to vLLM at: {vllm_api_base}")
 
             self.vllm_client = OpenAI(
@@ -190,7 +192,9 @@ class ARCSolver:
 
             output_grid = json.loads(content)
 
-            if isinstance(output_grid, list) and all(isinstance(row, list) for row in output_grid):
+            if isinstance(output_grid, list) and all(
+                isinstance(row, list) for row in output_grid
+            ):
                 return output_grid
             else:
                 print(f"    ⚠ vLLM returned non-grid format: {type(output_grid)}")
@@ -209,7 +213,9 @@ class ARCSolver:
         test_input: List[List[int]],
     ) -> str:
         """Create a text prompt describing the ARC problem"""
-        parts: List[str] = ["Solve this ARC puzzle by finding the pattern in the training examples.\n\n"]
+        parts: List[str] = [
+            "Solve this ARC puzzle by finding the pattern in the training examples.\n\n"
+        ]
 
         parts.append("Training Examples:\n")
         for i, example in enumerate(train_examples, 1):
@@ -220,7 +226,9 @@ class ARCSolver:
         parts.append("\nNow apply the pattern to this test input:")
         parts.append(f"Test Input:\n{json.dumps(test_input)}\n")
 
-        parts.append("\nReturn ONLY the output grid as a JSON array. Do not include any explanation.")
+        parts.append(
+            "\nReturn ONLY the output grid as a JSON array. Do not include any explanation."
+        )
 
         return "\n".join(parts)
 
@@ -368,12 +376,16 @@ class ARCSolver:
         """Flip grid horizontally"""
         return [row[::-1] for row in grid]
 
-    def _crop_to_size(self, grid: List[List[int]], target_size: tuple[int, int]) -> List[List[int]]:
+    def _crop_to_size(
+        self, grid: List[List[int]], target_size: tuple[int, int]
+    ) -> List[List[int]]:
         """Crop grid to target size"""
         h, w = target_size
         return [row[:w] for row in grid[:h]]
 
-    def _expand_to_size(self, grid: List[List[int]], target_size: tuple[int, int]) -> List[List[int]]:
+    def _expand_to_size(
+        self, grid: List[List[int]], target_size: tuple[int, int]
+    ) -> List[List[int]]:
         """Expand grid to target size by padding with zeros"""
         h, w = target_size
         result = [[0] * w for _ in range(h)]

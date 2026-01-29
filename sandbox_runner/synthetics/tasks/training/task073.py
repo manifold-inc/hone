@@ -18,36 +18,38 @@ from synthetics import common
 
 
 def generate(cols=None, size=5):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    cols: a list of horizontal coordinates where towers are placed
-    size: the width and height of the (square) grid
-  """
-  if cols is None:
-    towers = common.randint(1, 2)
-    while True:
-      cols = common.sample(range(size), towers)
-      if len(cols) == 1: break
-      if abs(cols[0] - cols[1]) > 1: break
+    Args:
+      cols: a list of horizontal coordinates where towers are placed
+      size: the width and height of the (square) grid
+    """
+    if cols is None:
+        towers = common.randint(1, 2)
+        while True:
+            cols = common.sample(range(size), towers)
+            if len(cols) == 1:
+                break
+            if abs(cols[0] - cols[1]) > 1:
+                break
 
-  grid, output = common.grids(size, size)
-  for c in range(size):
-    output[size - 1][c] = grid[size - 1][c] = common.gray()
-  for c in cols:
-    output[size - 2][c] = grid[size - 2][c] = common.gray()
-    output[size - 1][c] = grid[size - 3][c] = common.blue()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    for c in range(size):
+        output[size - 1][c] = grid[size - 1][c] = common.gray()
+    for c in cols:
+        output[size - 2][c] = grid[size - 2][c] = common.gray()
+        output[size - 1][c] = grid[size - 3][c] = common.blue()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(cols=[2]),
-      generate(cols=[1, 3]),
-      generate(cols=[1, 4]),
-  ]
-  test = [
-      generate(cols=[2, 4]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(cols=[2]),
+        generate(cols=[1, 3]),
+        generate(cols=[1, 4]),
+    ]
+    test = [
+        generate(cols=[2, 4]),
+    ]
+    return {"train": train, "test": test}

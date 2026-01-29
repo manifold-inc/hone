@@ -18,52 +18,196 @@ from synthetics import common
 
 
 def generate(size=None, colors=None, color_list=(1, 2, 3, 4, 7, 8)):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    size: the width and height of the (square) grid
-    colors: digits representing the colors to be used
-  """
-  if size is None:
-    size = common.randint(4, 8)
-    idxs = [common.randint(0, len(color_list) - 1) for _ in range(size * size)]
-    colors = [color_list[idx] for idx in idxs]
+    Args:
+      size: the width and height of the (square) grid
+      colors: digits representing the colors to be used
+    """
+    if size is None:
+        size = common.randint(4, 8)
+        idxs = [common.randint(0, len(color_list) - 1) for _ in range(size * size)]
+        colors = [color_list[idx] for idx in idxs]
 
-  grid, output = common.grids(size, size, 0)
-  for r in range(size):
-    for c in range(size):
-      output[size - r - 1][c] = grid[r][c] = colors[r * size + c]
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size, 0)
+    for r in range(size):
+        for c in range(size):
+            output[size - r - 1][c] = grid[r][c] = colors[r * size + c]
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(size=5, colors=[8, 1, 2, 1, 4,
-                               4, 4, 2, 4, 8,
-                               3, 7, 2, 4, 8,
-                               2, 7, 7, 8, 7,
-                               8, 7, 7, 4, 8]),
-      generate(size=5, colors=[7, 3, 3, 1, 2,
-                               1, 8, 2, 4, 1,
-                               2, 7, 8, 7, 2,
-                               7, 7, 4, 1, 8,
-                               8, 1, 7, 7, 1]),
-      generate(size=7, colors=[2, 7, 4, 3, 4, 8, 3,
-                               2, 3, 7, 1, 2, 3, 3,
-                               8, 7, 4, 3, 2, 2, 4,
-                               1, 1, 2, 1, 4, 4, 7,
-                               2, 4, 3, 1, 1, 4, 1,
-                               4, 8, 7, 4, 4, 8, 2,
-                               7, 3, 8, 4, 3, 2, 8]),
-  ]
-  test = [
-      generate(size=7, colors=[2, 8, 1, 3, 2, 4, 1,
-                               4, 4, 1, 1, 4, 3, 4,
-                               1, 1, 1, 1, 4, 7, 3,
-                               1, 1, 2, 3, 8, 1, 3,
-                               4, 1, 1, 1, 7, 8, 4,
-                               3, 2, 8, 4, 1, 8, 4,
-                               1, 4, 7, 1, 2, 3, 4]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(
+            size=5,
+            colors=[
+                8,
+                1,
+                2,
+                1,
+                4,
+                4,
+                4,
+                2,
+                4,
+                8,
+                3,
+                7,
+                2,
+                4,
+                8,
+                2,
+                7,
+                7,
+                8,
+                7,
+                8,
+                7,
+                7,
+                4,
+                8,
+            ],
+        ),
+        generate(
+            size=5,
+            colors=[
+                7,
+                3,
+                3,
+                1,
+                2,
+                1,
+                8,
+                2,
+                4,
+                1,
+                2,
+                7,
+                8,
+                7,
+                2,
+                7,
+                7,
+                4,
+                1,
+                8,
+                8,
+                1,
+                7,
+                7,
+                1,
+            ],
+        ),
+        generate(
+            size=7,
+            colors=[
+                2,
+                7,
+                4,
+                3,
+                4,
+                8,
+                3,
+                2,
+                3,
+                7,
+                1,
+                2,
+                3,
+                3,
+                8,
+                7,
+                4,
+                3,
+                2,
+                2,
+                4,
+                1,
+                1,
+                2,
+                1,
+                4,
+                4,
+                7,
+                2,
+                4,
+                3,
+                1,
+                1,
+                4,
+                1,
+                4,
+                8,
+                7,
+                4,
+                4,
+                8,
+                2,
+                7,
+                3,
+                8,
+                4,
+                3,
+                2,
+                8,
+            ],
+        ),
+    ]
+    test = [
+        generate(
+            size=7,
+            colors=[
+                2,
+                8,
+                1,
+                3,
+                2,
+                4,
+                1,
+                4,
+                4,
+                1,
+                1,
+                4,
+                3,
+                4,
+                1,
+                1,
+                1,
+                1,
+                4,
+                7,
+                3,
+                1,
+                1,
+                2,
+                3,
+                8,
+                1,
+                3,
+                4,
+                1,
+                1,
+                1,
+                7,
+                8,
+                4,
+                3,
+                2,
+                8,
+                4,
+                1,
+                8,
+                4,
+                1,
+                4,
+                7,
+                1,
+                2,
+                3,
+                4,
+            ],
+        ),
+    ]
+    return {"train": train, "test": test}

@@ -18,32 +18,32 @@ from synthetics import common
 
 
 def generate(colors=None, colormap=(0, 5, 6, 4, 3, 1, 2, 7, 9, 8)):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    colors: a list of digits representing different colors
-    colormap: a list of "target" colors for each possible color
-  """
-  if colors is None:
-    size = common.randint(3, 3)
-    colors = common.random_colors(size, exclude=[common.orange()])
+    Args:
+      colors: a list of digits representing different colors
+      colormap: a list of "target" colors for each possible color
+    """
+    if colors is None:
+        size = common.randint(3, 3)
+        colors = common.random_colors(size, exclude=[common.orange()])
 
-  grid = [[color for _ in colors] for color in colors]
-  output = [[colormap[color] for _ in colors] for color in colors]
-  grid = [list(row) for row in zip(*grid)]
-  output = [list(row) for row in zip(*output)]
-  return {"input": grid, "output": output}
+    grid = [[color for _ in colors] for color in colors]
+    output = [[colormap[color] for _ in colors] for color in colors]
+    grid = [list(row) for row in zip(*grid)]
+    output = [list(row) for row in zip(*output)]
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(colors=[3, 1, 2]),
-      generate(colors=[2, 3, 8]),
-      generate(colors=[5, 8, 6]),
-      generate(colors=[9, 4, 2]),
-  ]
-  test = [
-      generate(colors=[8, 1, 3]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(colors=[3, 1, 2]),
+        generate(colors=[2, 3, 8]),
+        generate(colors=[5, 8, 6]),
+        generate(colors=[9, 4, 2]),
+    ]
+    test = [
+        generate(colors=[8, 1, 3]),
+    ]
+    return {"train": train, "test": test}

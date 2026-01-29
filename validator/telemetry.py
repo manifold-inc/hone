@@ -16,13 +16,12 @@ class TelemetryClient:
         max_retries: int = 3,
         loop: Optional[asyncio.AbstractEventLoop] = None,
     ) -> None:
-    
         self.endpoint_base_url = (endpoint_base_url or "").rstrip("/")
         self.enabled = bool(self.endpoint_base_url)
 
-        self.queue: asyncio.Queue[
-            Tuple[str, dict, float]
-        ] = asyncio.Queue(maxsize=max_queue_size)
+        self.queue: asyncio.Queue[Tuple[str, dict, float]] = asyncio.Queue(
+            maxsize=max_queue_size
+        )
 
         self.flush_interval_s = flush_interval_s
         self.request_timeout_s = request_timeout_s
@@ -43,14 +42,14 @@ class TelemetryClient:
             http2=True,
         )
 
-
         # spawn the worker immediately
-        self._worker_task = self._loop.create_task(self._worker_loop(), name="telemetry-worker")
+        self._worker_task = self._loop.create_task(
+            self._worker_loop(), name="telemetry-worker"
+        )
 
         logger.info(f"TelemetryClient initialized (enabled={self.enabled})")
 
     def publish(self, route: str, payload: dict) -> None:
-
         if not self.enabled:
             return
 
@@ -74,7 +73,6 @@ class TelemetryClient:
             logger.warning(f"Telemetry publish() swallowed exception: {e}")
 
     async def _worker_loop(self) -> None:
-
         if not self.enabled:
             logger.info("Telemetry disabled, worker going into idle mode.")
             await self._stopping.wait()

@@ -18,36 +18,36 @@ from synthetics import common
 
 
 def generate(colors=None, diags=None, size=7, num=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    colors: a list of digits representing different colors
-    diags: a list of diagonal indices where the striped colors will be shown
-    size: the width and height of the (square) grid
-    num: the number of stripes in the grid
-  """
-  if colors is None:
-    diags = [common.choice(range(s, 2 * size - 1, num)) for s in range(num)]
-    colors = common.random_colors(num)
+    Args:
+      colors: a list of digits representing different colors
+      diags: a list of diagonal indices where the striped colors will be shown
+      size: the width and height of the (square) grid
+      num: the number of stripes in the grid
+    """
+    if colors is None:
+        diags = [common.choice(range(s, 2 * size - 1, num)) for s in range(num)]
+        colors = common.random_colors(num)
 
-  grid, output = common.grids(size, size)
-  for c in range(size):
-    for r in range(size):
-      diag = c + r
-      color = colors[diag % len(colors)]
-      output[r][c] = color
-      grid[r][c] = color if diag in diags else common.black()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    for c in range(size):
+        for r in range(size):
+            diag = c + r
+            color = colors[diag % len(colors)]
+            output[r][c] = color
+            grid[r][c] = color if diag in diags else common.black()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(colors=[2, 8, 3], diags=[0, 1, 2]),
-      generate(colors=[2, 4, 1], diags=[8, 9, 10]),
-      generate(colors=[4, 8, 3], diags=[4, 5, 9]),
-  ]
-  test = [
-      generate(colors=[2, 1, 4], diags=[1, 6, 11]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(colors=[2, 8, 3], diags=[0, 1, 2]),
+        generate(colors=[2, 4, 1], diags=[8, 9, 10]),
+        generate(colors=[4, 8, 3], diags=[4, 5, 9]),
+    ]
+    test = [
+        generate(colors=[2, 1, 4], diags=[1, 6, 11]),
+    ]
+    return {"train": train, "test": test}

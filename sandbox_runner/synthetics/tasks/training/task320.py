@@ -14,39 +14,38 @@
 
 """Generator."""
 
-
 from synthetics import common
 
 
 def generate(lengths=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    lengths: the lengths of the columns
-  """
-  if lengths is None:
-    lengths = [common.randint(2, 10) for _ in range(4)]
+    Args:
+      lengths: the lengths of the columns
+    """
+    if lengths is None:
+        lengths = [common.randint(2, 10) for _ in range(4)]
 
-  width, height = 2 * len(lengths) + 1, max(lengths) + 1
-  grid, output = common.grids(width, height)
-  for idx, length in enumerate(lengths):
-    for i in range(length):
-      r, c = height - i - 1, 2 * idx + 1
-      output[r][c] = grid[r][c] = common.red()
-    for i in range(length // 2):
-      r, c = height - i - 1, 2 * idx + 1
-      output[r][c] = common.cyan()
-  return {"input": grid, "output": output}
+    width, height = 2 * len(lengths) + 1, max(lengths) + 1
+    grid, output = common.grids(width, height)
+    for idx, length in enumerate(lengths):
+        for i in range(length):
+            r, c = height - i - 1, 2 * idx + 1
+            output[r][c] = grid[r][c] = common.red()
+        for i in range(length // 2):
+            r, c = height - i - 1, 2 * idx + 1
+            output[r][c] = common.cyan()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(lengths=[6, 5, 4, 3]),
-      generate(lengths=[7, 5, 3, 6]),
-      generate(lengths=[7, 3, 4, 8]),
-  ]
-  test = [
-      generate(lengths=[10, 9, 2, 5]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(lengths=[6, 5, 4, 3]),
+        generate(lengths=[7, 5, 3, 6]),
+        generate(lengths=[7, 3, 4, 8]),
+    ]
+    test = [
+        generate(lengths=[10, 9, 2, 5]),
+    ]
+    return {"train": train, "test": test}

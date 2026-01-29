@@ -18,45 +18,37 @@ from synthetics import common
 
 
 def generate(width=None, idxs=None, height=3, colors=(1, 7, 8)):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the grid
-    idxs: the indices of the colors to use
-    height: the height of the grid
-    colors: the integers used for the colors
-  """
-  if width is None:
-    width = common.randint(4, 6)
-    idxs = [common.randint(0, 2) for _ in range(width * height)]
+    Args:
+      width: the width of the grid
+      idxs: the indices of the colors to use
+      height: the height of the grid
+      colors: the integers used for the colors
+    """
+    if width is None:
+        width = common.randint(4, 6)
+        idxs = [common.randint(0, 2) for _ in range(width * height)]
 
-  grid, output = [], []
-  for r in range(height):
-    row = [colors[idx] for idx in idxs[r * width : (r + 1) * width]]
-    grid.append(row[:])
-    new_row = []
-    for color in row:
-      new_row.append(color if color != common.orange() else common.gray())
-    output.append(new_row)
-  return {"input": grid, "output": output}
+    grid, output = [], []
+    for r in range(height):
+        row = [colors[idx] for idx in idxs[r * width : (r + 1) * width]]
+        grid.append(row[:])
+        new_row = []
+        for color in row:
+            new_row.append(color if color != common.orange() else common.gray())
+        output.append(new_row)
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=6, idxs=[0, 2, 2, 1, 1, 2,
-                              0, 0, 1, 1, 0, 2,
-                              1, 0, 0, 1, 1, 2]),
-      generate(width=4, idxs=[1, 1, 1, 0,
-                              0, 2, 0, 1,
-                              1, 0, 0, 1]),
-      generate(width=5, idxs=[0, 2, 0, 1, 0,
-                              1, 2, 2, 0, 0,
-                              1, 0, 2, 2, 1]),
-  ]
-  test = [
-      generate(width=5, idxs=[0, 1, 1, 0, 1,
-                              2, 0, 1, 1, 1,
-                              2, 1, 0, 1, 2]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(width=6, idxs=[0, 2, 2, 1, 1, 2, 0, 0, 1, 1, 0, 2, 1, 0, 0, 1, 1, 2]),
+        generate(width=4, idxs=[1, 1, 1, 0, 0, 2, 0, 1, 1, 0, 0, 1]),
+        generate(width=5, idxs=[0, 2, 0, 1, 0, 1, 2, 2, 0, 0, 1, 0, 2, 2, 1]),
+    ]
+    test = [
+        generate(width=5, idxs=[0, 1, 1, 0, 1, 2, 0, 1, 1, 1, 2, 1, 0, 1, 2]),
+    ]
+    return {"train": train, "test": test}

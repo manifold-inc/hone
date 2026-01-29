@@ -67,21 +67,22 @@ def run_async(coro):
 # Disk Space Management
 # ============================================================
 
+
 def get_disk_usage() -> Dict:
     """Get disk usage statistics for /app/data"""
     try:
         data_path = Path("/app/data")
         if not data_path.exists():
             data_path = Path("/tmp")
-        
+
         total, used, free = shutil.disk_usage(str(data_path))
-        
+
         return {
             "total_gb": total / (1024**3),
             "used_gb": used / (1024**3),
             "free_gb": free / (1024**3),
             "used_percent": (used / total) * 100,
-            "path": str(data_path)
+            "path": str(data_path),
         }
     except Exception as e:
         print(f"Error getting disk usage: {e}")
@@ -90,13 +91,14 @@ def get_disk_usage() -> Dict:
             "used_gb": 0,
             "free_gb": 0,
             "used_percent": 0,
-            "path": "unknown"
+            "path": "unknown",
         }
 
 
 # ============================================================
 # Core API helpers - Async versions with timeouts
 # ============================================================
+
 
 async def get_runner_status_async(use_cache: bool = True) -> Dict:
     """Get runner status including active job IDs with caching - async version."""
@@ -131,7 +133,9 @@ def get_runner_status(use_cache: bool = True) -> Dict:
     return run_async(get_runner_status_async(use_cache))
 
 
-async def fetch_job_details_async(client: httpx.AsyncClient, job_id: str) -> Optional[Dict]:
+async def fetch_job_details_async(
+    client: httpx.AsyncClient, job_id: str
+) -> Optional[Dict]:
     """Fetch single job details with timeout"""
     try:
         resp = await client.get(f"/v1/jobs/{job_id}")
@@ -145,7 +149,9 @@ async def fetch_job_details_async(client: httpx.AsyncClient, job_id: str) -> Opt
         return None
 
 
-async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], List[str]]:
+async def get_active_jobs_table_async(
+    status: Dict,
+) -> Tuple[List[List[str]], List[str]]:
     """Get active jobs with proper error handling - async with concurrent fetching"""
     try:
         active_job_ids = status.get("active_job_ids", []) or []
@@ -156,11 +162,10 @@ async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], Li
         table_data: List[List[str]] = []
 
         tasks = [fetch_job_details_async(client, job_id) for job_id in active_job_ids]
-        
+
         try:
             results = await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True),
-                timeout=8.0
+                asyncio.gather(*tasks, return_exceptions=True), timeout=8.0
             )
         except asyncio.TimeoutError:
             print("Timeout fetching job details, using partial results")
@@ -169,7 +174,7 @@ async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], Li
         for job_id, job in zip(active_job_ids, results):
             if isinstance(job, Exception):
                 continue
-            
+
             if job is None:
                 continue
 
@@ -208,7 +213,7 @@ async def get_active_jobs_table_async(status: Dict) -> Tuple[List[List[str]], Li
                         (job.get("miner_hotkey") or "")[:12] + "...",
                     ]
                 )
-                
+
             except Exception as e:
                 print(f"Error processing job {job_id}: {e}")
                 continue
@@ -224,7 +229,9 @@ def get_active_jobs_table(status: Dict) -> Tuple[List[List[str]], List[str]]:
     return run_async(get_active_jobs_table_async(status))
 
 
-async def get_job_logs_tail_async(job_id: str, lines: int = 100, phase_filter: str = "all") -> str:
+async def get_job_logs_tail_async(
+    job_id: str, lines: int = 100, phase_filter: str = "all"
+) -> str:
     """Get last N lines of logs for a job using /tail endpoint - async."""
     if not job_id:
         return ""
@@ -236,10 +243,9 @@ async def get_job_logs_tail_async(job_id: str, lines: int = 100, phase_filter: s
             params["phase"] = phase_filter
 
         resp = await asyncio.wait_for(
-            client.get(f"/v1/logs/{job_id}/tail", params=params),
-            timeout=3.0
+            client.get(f"/v1/logs/{job_id}/tail", params=params), timeout=3.0
         )
-        
+
         if resp.status_code != 200:
             return f"[{job_id}] Error: Status {resp.status_code}\n"
 
@@ -302,13 +308,14 @@ async def get_all_active_logs_async(
     out.append("=" * 100)
     out.append("")
 
-    tasks = [get_job_logs_tail_async(job_id, lines=60, phase_filter=phase_filter) 
-             for job_id in selected_job_ids]
-    
+    tasks = [
+        get_job_logs_tail_async(job_id, lines=60, phase_filter=phase_filter)
+        for job_id in selected_job_ids
+    ]
+
     try:
         logs_results = await asyncio.wait_for(
-            asyncio.gather(*tasks, return_exceptions=True),
-            timeout=10.0
+            asyncio.gather(*tasks, return_exceptions=True), timeout=10.0
         )
     except asyncio.TimeoutError:
         return "Timeout fetching logs for multiple jobs"
@@ -316,7 +323,7 @@ async def get_all_active_logs_async(
     for job_id, logs in zip(selected_job_ids, logs_results):
         if isinstance(logs, Exception):
             logs = f"Error fetching logs: {logs}"
-        
+
         out.append("\n" + "─" * 100)
         out.append(f"📋 JOB: {job_id}")
         out.append("─" * 100 + "\n")
@@ -338,15 +345,19 @@ def get_all_active_logs(
 # Completed Jobs API Functions
 # ============================================================
 
+
 async def fetch_completed_jobs_async(limit: int = 50, offset: int = 0) -> Dict:
     """Fetch completed jobs from API"""
     try:
         client = get_async_client()
         resp = await asyncio.wait_for(
-            client.get(f"/v1/dashboard/jobs/completed", params={"limit": limit, "offset": offset}),
-            timeout=5.0
+            client.get(
+                f"/v1/dashboard/jobs/completed",
+                params={"limit": limit, "offset": offset},
+            ),
+            timeout=5.0,
         )
-        
+
         if resp.status_code == 200:
             return resp.json()
         else:
@@ -367,10 +378,9 @@ async def fetch_job_results_async(job_id: str) -> Optional[Dict]:
     try:
         client = get_async_client()
         resp = await asyncio.wait_for(
-            client.get(f"/v1/jobs/{job_id}/results"),
-            timeout=3.0
+            client.get(f"/v1/jobs/{job_id}/results"), timeout=3.0
         )
-        
+
         if resp.status_code == 200:
             return resp.json()
         return None
@@ -387,6 +397,7 @@ def fetch_job_results(job_id: str) -> Optional[Dict]:
 # ============================================================
 # Plotly visualizations
 # ============================================================
+
 
 def create_gpu_gauge(total: int, allocated: int, available: int) -> go.Figure:
     """Gauge chart for GPU utilization."""
@@ -411,8 +422,14 @@ def create_gpu_gauge(total: int, allocated: int, available: int) -> go.Figure:
                 "borderwidth": 0,
                 "steps": [
                     {"range": [0, total * 0.5], "color": "rgba(56, 189, 248, 0.2)"},
-                    {"range": [total * 0.5, total * 0.8], "color": "rgba(250, 204, 21, 0.25)"},
-                    {"range": [total * 0.8, total], "color": "rgba(248, 113, 113, 0.25)"},
+                    {
+                        "range": [total * 0.5, total * 0.8],
+                        "color": "rgba(250, 204, 21, 0.25)",
+                    },
+                    {
+                        "range": [total * 0.8, total],
+                        "color": "rgba(248, 113, 113, 0.25)",
+                    },
                 ],
                 "threshold": {
                     "line": {"color": "red", "width": 3},
@@ -472,7 +489,7 @@ def create_job_stats_chart(
 def create_disk_usage_gauge() -> go.Figure:
     """Gauge chart for disk usage."""
     disk = get_disk_usage()
-    
+
     fig = go.Figure(
         go.Indicator(
             mode="gauge+number",
@@ -572,8 +589,14 @@ def create_queue_fig(status: Dict) -> Tuple[go.Figure, str]:
                 "bar": {"color": "#fbbf24"},
                 "steps": [
                     {"range": [0, max_depth * 0.4], "color": "rgba(56,189,248,0.2)"},
-                    {"range": [max_depth * 0.4, max_depth * 0.7], "color": "rgba(250,204,21,0.25)"},
-                    {"range": [max_depth * 0.7, max_depth], "color": "rgba(248,113,113,0.25)"},
+                    {
+                        "range": [max_depth * 0.4, max_depth * 0.7],
+                        "color": "rgba(250,204,21,0.25)",
+                    },
+                    {
+                        "range": [max_depth * 0.7, max_depth],
+                        "color": "rgba(248,113,113,0.25)",
+                    },
                 ],
             },
         )
@@ -597,6 +620,7 @@ def create_queue_fig(status: Dict) -> Tuple[go.Figure, str]:
 # ============================================================
 # Gradio glue
 # ============================================================
+
 
 def refresh_all(phase_filter: str, job_id_filter: str = ""):
     """Refresh all dashboard data with a single /status call."""
@@ -645,12 +669,16 @@ def refresh_failed_jobs():
     try:
         completed_data = fetch_completed_jobs(limit=100, offset=0)
         all_jobs = completed_data.get("jobs", [])
-        
-        failed_jobs = [job for job in all_jobs if job.get("status") in ["failed", "timeout", "cancelled"]]
-        
+
+        failed_jobs = [
+            job
+            for job in all_jobs
+            if job.get("status") in ["failed", "timeout", "cancelled"]
+        ]
+
         if not failed_jobs:
             return [], "No failed jobs found", create_disk_usage_gauge()
-        
+
         table_data = []
         for job in failed_jobs:
             completed_at = job.get("completed_at", "unknown")
@@ -660,19 +688,23 @@ def refresh_failed_jobs():
                     completed_at = dt.strftime("%Y-%m-%d %H:%M:%S")
                 except:
                     pass
-            
-            table_data.append([
-                job.get("job_id", "unknown"),
-                completed_at,
-                job.get("status", "unknown"),
-                (job.get("miner_hotkey", "") or "")[:12] + "...",
-                job.get("error_message", "N/A")[:80] + "..." if job.get("error_message") else "N/A"
-            ])
-        
+
+            table_data.append(
+                [
+                    job.get("job_id", "unknown"),
+                    completed_at,
+                    job.get("status", "unknown"),
+                    (job.get("miner_hotkey", "") or "")[:12] + "...",
+                    job.get("error_message", "N/A")[:80] + "..."
+                    if job.get("error_message")
+                    else "N/A",
+                ]
+            )
+
         summary = f"Total failed jobs: {len(failed_jobs)}"
-        
+
         return table_data, summary, create_disk_usage_gauge()
-        
+
     except Exception as e:
         print(f"Error refreshing failed jobs: {e}")
         return [], f"Error loading failed jobs: {e}", create_disk_usage_gauge()
@@ -687,15 +719,15 @@ def get_failed_job_logs(evt: gr.SelectData, table_data):
             job_id = str(table_data[evt.index[0]][0])
         else:
             return "Error loading logs"
-        
+
         logs = get_job_logs_tail(job_id, lines=500, phase_filter="all")
-        
+
         results = fetch_job_results(job_id)
-        
-        output = f"{'='*80}\n"
+
+        output = f"{'=' * 80}\n"
         output += f"LOGS FOR JOB: {job_id}\n"
-        output += f"{'='*80}\n\n"
-        
+        output += f"{'=' * 80}\n\n"
+
         if results:
             output += f"Status: {results.get('status', 'unknown')}\n"
             output += f"Miner: {results.get('miner_hotkey', 'unknown')}\n"
@@ -705,12 +737,12 @@ def get_failed_job_logs(evt: gr.SelectData, table_data):
                 output += f"Execution Time: {results.get('execution_time'):.1f}s\n"
             if results.get("error_message"):
                 output += f"\nError: {results.get('error_message')}\n"
-            output += f"\n{'-'*80}\n\n"
-        
+            output += f"\n{'-' * 80}\n\n"
+
         output += logs
-        
+
         return output
-        
+
     except Exception as e:
         return f"Error loading logs: {e}"
 
@@ -720,12 +752,12 @@ def refresh_success_jobs():
     try:
         completed_data = fetch_completed_jobs(limit=100, offset=0)
         all_jobs = completed_data.get("jobs", [])
-        
+
         success_jobs = [job for job in all_jobs if job.get("status") == "completed"]
-        
+
         if not success_jobs:
             return [], "No successful jobs found", create_disk_usage_gauge()
-        
+
         table_data = []
         for job in success_jobs:
             completed_at = job.get("completed_at", "unknown")
@@ -735,13 +767,13 @@ def refresh_success_jobs():
                     completed_at = dt.strftime("%Y-%m-%d %H:%M:%S")
                 except:
                     pass
-            
+
             exec_time = job.get("execution_time", 0)
             exec_time_str = f"{exec_time:.1f}s" if exec_time else "N/A"
-            
+
             has_metrics = job.get("has_metrics", False)
             metrics = job.get("metrics", {})
-            
+
             if has_metrics and metrics:
                 exact_match = "✅" if metrics.get("exact_match", False) else "❌"
                 partial = f"{metrics.get('partial_correctness', 0.0):.3f}"
@@ -750,21 +782,23 @@ def refresh_success_jobs():
                 exact_match = "N/A"
                 partial = "N/A"
                 similarity = "N/A"
-            
-            table_data.append([
-                job.get("job_id", "unknown"),
-                completed_at,
-                (job.get("miner_hotkey", "") or "")[:12] + "...",
-                exec_time_str,
-                exact_match,
-                partial,
-                similarity
-            ])
-        
+
+            table_data.append(
+                [
+                    job.get("job_id", "unknown"),
+                    completed_at,
+                    (job.get("miner_hotkey", "") or "")[:12] + "...",
+                    exec_time_str,
+                    exact_match,
+                    partial,
+                    similarity,
+                ]
+            )
+
         summary = f"Total successful jobs: {len(success_jobs)}"
-        
+
         return table_data, summary, create_disk_usage_gauge()
-        
+
     except Exception as e:
         print(f"Error refreshing success jobs: {e}")
         return [], f"Error loading success jobs: {e}", create_disk_usage_gauge()
@@ -779,66 +813,72 @@ def get_success_job_details(evt: gr.SelectData, table_data):
             job_id = str(table_data[evt.index[0]][0])
         else:
             return "Error loading details"
-        
+
         results = fetch_job_results(job_id)
-        
+
         if not results:
             return f"No results found for job {job_id}"
-        
-        details = f"{'='*80}\n"
+
+        details = f"{'=' * 80}\n"
         details += f"JOB DETAILS: {job_id}\n"
-        details += f"{'='*80}\n\n"
-        
+        details += f"{'=' * 80}\n\n"
+
         details += f"Status: {results.get('status', 'unknown')}\n"
         details += f"Miner Hotkey: {results.get('miner_hotkey', 'N/A')}\n"
-        
+
         if results.get("completed_at"):
             details += f"Completed: {results.get('completed_at')}\n"
-        
+
         if results.get("execution_time"):
             details += f"Execution Time: {results.get('execution_time'):.2f}s\n"
-        
-        details += f"\n{'-'*80}\n"
+
+        details += f"\n{'-' * 80}\n"
         details += "METRICS\n"
-        details += f"{'-'*80}\n\n"
-        
+        details += f"{'-' * 80}\n\n"
+
         metrics = results.get("metrics", {})
         if metrics:
             aggregate = metrics.get("aggregate", {})
-            
+
             details += f"Total Problems: {aggregate.get('total_problems', 0)}\n"
             details += f"Solved: {aggregate.get('num_solved', 0)}\n"
             details += f"Exact Matches: {aggregate.get('num_exact_matches', 0)}\n"
             details += f"Success Rate: {aggregate.get('success_rate', 0.0):.4f}\n"
-            details += f"Exact Match Rate: {aggregate.get('exact_match_rate', 0.0):.4f}\n"
+            details += (
+                f"Exact Match Rate: {aggregate.get('exact_match_rate', 0.0):.4f}\n"
+            )
             details += f"Avg Partial Correctness: {aggregate.get('avg_partial_correctness', 0.0):.4f}\n"
             details += f"Avg Grid Similarity: {aggregate.get('avg_grid_similarity', 0.0):.4f}\n"
-            details += f"Shape Match Rate: {aggregate.get('shape_match_rate', 0.0):.4f}\n"
-            
+            details += (
+                f"Shape Match Rate: {aggregate.get('shape_match_rate', 0.0):.4f}\n"
+            )
+
             per_problem = metrics.get("per_problem", [])
             if per_problem:
-                details += f"\n{'-'*80}\n"
+                details += f"\n{'-' * 80}\n"
                 details += "PER-PROBLEM BREAKDOWN\n"
-                details += f"{'-'*80}\n\n"
-                
+                details += f"{'-' * 80}\n\n"
+
                 for i, prob in enumerate(per_problem[:10], 1):
                     details += f"Problem {i}:\n"
                     details += f"  Exact Match: {'✅ Yes' if prob.get('exact_match') else '❌ No'}\n"
                     details += f"  Partial Correctness: {prob.get('partial_correctness', 0.0):.4f}\n"
-                    details += f"  Grid Similarity: {prob.get('grid_similarity', 0.0):.4f}\n"
-                    if prob.get('metadata'):
-                        meta = prob['metadata']
-                        if meta.get('problem_id'):
+                    details += (
+                        f"  Grid Similarity: {prob.get('grid_similarity', 0.0):.4f}\n"
+                    )
+                    if prob.get("metadata"):
+                        meta = prob["metadata"]
+                        if meta.get("problem_id"):
                             details += f"  Problem ID: {meta['problem_id']}\n"
                     details += "\n"
-                
+
                 if len(per_problem) > 10:
                     details += f"... and {len(per_problem) - 10} more problems\n"
         else:
             details += "No metrics available\n"
-        
+
         return details
-        
+
     except Exception as e:
         return f"Error loading details: {e}"
 
@@ -902,7 +942,9 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
                             gr.Markdown("### 📋 Active Jobs")
                         with gr.Column(scale=2):
                             with gr.Row():
-                                refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
+                                refresh_btn = gr.Button(
+                                    "🔄 Refresh", variant="primary", size="sm"
+                                )
                                 auto_refresh = gr.Checkbox(label="Auto", value=False)
                                 refresh_interval = gr.Radio(
                                     choices=[2, 5],
@@ -935,7 +977,14 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
                         )
                         phase_filter = gr.Dropdown(
                             label="Phase",
-                            choices=["all", "build", "prep", "inference", "vllm", "vllm_pipeline"],
+                            choices=[
+                                "all",
+                                "build",
+                                "prep",
+                                "inference",
+                                "vllm",
+                                "vllm_pipeline",
+                            ],
                             value="all",
                             scale=2,
                         )
@@ -962,7 +1011,7 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
 
                     with gr.Row():
                         job_stats_plot = gr.Plot(label="Job Statistics")
-                    
+
                     with gr.Row():
                         disk_gauge_plot = gr.Plot(label="Disk Usage")
 
@@ -988,31 +1037,27 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
         with gr.Tab("❌ Failed Jobs"):
             gr.Markdown("### Failed Jobs History")
             gr.Markdown("*Jobs that failed, timed out, or were cancelled*")
-            
+
             with gr.Row():
-                failed_refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
-            
+                failed_refresh_btn = gr.Button(
+                    "🔄 Refresh", variant="primary", size="sm"
+                )
+
             with gr.Row():
                 failed_disk_gauge = gr.Plot(label="Disk Usage")
-            
+
             failed_summary = gr.Markdown(value="")
-            
+
             failed_jobs_table = gr.Dataframe(
-                headers=[
-                    "Job ID",
-                    "Completed At",
-                    "Status",
-                    "Miner",
-                    "Error"
-                ],
+                headers=["Job ID", "Completed At", "Status", "Miner", "Error"],
                 value=[],
                 interactive=False,
                 wrap=True,
             )
-            
+
             gr.Markdown("### 📜 Job Logs & Details")
             gr.Markdown("*Click a row above to view logs*")
-            
+
             failed_logs_output = gr.Textbox(
                 label="",
                 lines=30,
@@ -1026,15 +1071,17 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
         with gr.Tab("✅ Success Jobs"):
             gr.Markdown("### Successful Jobs History")
             gr.Markdown("*Jobs that completed successfully with metrics*")
-            
+
             with gr.Row():
-                success_refresh_btn = gr.Button("🔄 Refresh", variant="primary", size="sm")
-            
+                success_refresh_btn = gr.Button(
+                    "🔄 Refresh", variant="primary", size="sm"
+                )
+
             with gr.Row():
                 success_disk_gauge = gr.Plot(label="Disk Usage")
-            
+
             success_summary = gr.Markdown(value="")
-            
+
             success_jobs_table = gr.Dataframe(
                 headers=[
                     "Job ID",
@@ -1043,16 +1090,16 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
                     "Exec Time",
                     "Exact Match",
                     "Partial",
-                    "Similarity"
+                    "Similarity",
                 ],
                 value=[],
                 interactive=False,
                 wrap=True,
             )
-            
+
             gr.Markdown("### 📊 Job Metrics & Details")
             gr.Markdown("*Click a row above to view detailed metrics*")
-            
+
             success_details_output = gr.Textbox(
                 label="",
                 lines=30,
@@ -1157,25 +1204,23 @@ with gr.Blocks(title="Sandbox Runner Dashboard") as app:
     # ===== FAILED JOBS EVENTS =====
     failed_refresh_btn.click(
         fn=refresh_failed_jobs,
-        outputs=[failed_jobs_table, failed_summary, failed_disk_gauge]
+        outputs=[failed_jobs_table, failed_summary, failed_disk_gauge],
     )
-    
+
     failed_jobs_table.select(
-        fn=get_failed_job_logs,
-        inputs=[failed_jobs_table],
-        outputs=[failed_logs_output]
+        fn=get_failed_job_logs, inputs=[failed_jobs_table], outputs=[failed_logs_output]
     )
 
     # ===== SUCCESS JOBS EVENTS =====
     success_refresh_btn.click(
         fn=refresh_success_jobs,
-        outputs=[success_jobs_table, success_summary, success_disk_gauge]
+        outputs=[success_jobs_table, success_summary, success_disk_gauge],
     )
-    
+
     success_jobs_table.select(
         fn=get_success_job_details,
         inputs=[success_jobs_table],
-        outputs=[success_details_output]
+        outputs=[success_details_output],
     )
 
     # Initial load

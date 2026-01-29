@@ -18,48 +18,125 @@ from synthetics import common
 
 
 def generate(size=None, idxs=None, colors=(6, 2, 1, 7)):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    size: the width and height of the (square) grid
-    idxs: a list of indices into the colors list
-    colors: a list of colors to be used for the pixels
-  """
-  if size is None:
-    size = common.randint(3, 9)
-    idxs = [common.choice(range(len(colors))) for _ in range(size * size)]
+    Args:
+      size: the width and height of the (square) grid
+      idxs: a list of indices into the colors list
+      colors: a list of colors to be used for the pixels
+    """
+    if size is None:
+        size = common.randint(3, 9)
+        idxs = [common.choice(range(len(colors))) for _ in range(size * size)]
 
-  grid = []
-  for r in range(size):
-    grid.append([colors[idxs[r * size + c]] for c in range(size)])
-  output = [row[::-1] for row in grid]
-  return {"input": grid, "output": output}
+    grid = []
+    for r in range(size):
+        grid.append([colors[idxs[r * size + c]] for c in range(size)])
+    output = [row[::-1] for row in grid]
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(size=4, idxs=[0, 0, 0, 1,
-                             0, 2, 0, 1,
-                             3, 1, 3, 1,
-                             2, 3, 1, 1]),
-      generate(size=7, idxs=[3, 3, 3, 0, 0, 0, 1,
-                             0, 3, 2, 2, 3, 3, 2,
-                             3, 3, 1, 2, 1, 0, 0,
-                             1, 1, 3, 3, 3, 1, 1,
-                             3, 1, 3, 2, 1, 3, 1,
-                             0, 0, 0, 1, 1, 2, 2,
-                             0, 1, 0, 0, 0, 0, 0]),
-      generate(size=6, idxs=[2, 1, 3, 2, 2, 2,
-                             1, 2, 3, 3, 1, 0,
-                             1, 2, 1, 0, 1, 2,
-                             2, 1, 2, 3, 0, 1,
-                             1, 3, 2, 1, 3, 2,
-                             1, 2, 0, 1, 3, 3]),
-  ]
-  test = [
-      generate(size=3, idxs=[3, 0, 2,
-                             0, 3, 0,
-                             0, 1, 1]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(size=4, idxs=[0, 0, 0, 1, 0, 2, 0, 1, 3, 1, 3, 1, 2, 3, 1, 1]),
+        generate(
+            size=7,
+            idxs=[
+                3,
+                3,
+                3,
+                0,
+                0,
+                0,
+                1,
+                0,
+                3,
+                2,
+                2,
+                3,
+                3,
+                2,
+                3,
+                3,
+                1,
+                2,
+                1,
+                0,
+                0,
+                1,
+                1,
+                3,
+                3,
+                3,
+                1,
+                1,
+                3,
+                1,
+                3,
+                2,
+                1,
+                3,
+                1,
+                0,
+                0,
+                0,
+                1,
+                1,
+                2,
+                2,
+                0,
+                1,
+                0,
+                0,
+                0,
+                0,
+                0,
+            ],
+        ),
+        generate(
+            size=6,
+            idxs=[
+                2,
+                1,
+                3,
+                2,
+                2,
+                2,
+                1,
+                2,
+                3,
+                3,
+                1,
+                0,
+                1,
+                2,
+                1,
+                0,
+                1,
+                2,
+                2,
+                1,
+                2,
+                3,
+                0,
+                1,
+                1,
+                3,
+                2,
+                1,
+                3,
+                2,
+                1,
+                2,
+                0,
+                1,
+                3,
+                3,
+            ],
+        ),
+    ]
+    test = [
+        generate(size=3, idxs=[3, 0, 2, 0, 3, 0, 0, 1, 1]),
+    ]
+    return {"train": train, "test": test}

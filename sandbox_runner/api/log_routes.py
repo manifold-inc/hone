@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 class LogEntry(BaseModel):
     """Single log entry"""
+
     timestamp: str
     phase: str
     level: str
@@ -27,6 +28,7 @@ class LogEntry(BaseModel):
 
 class LogStreamResponse(BaseModel):
     """Response for log stream request"""
+
     job_id: str
     entries: List[LogEntry]
     cursor_id: Optional[str] = None
@@ -38,6 +40,7 @@ class LogStreamResponse(BaseModel):
 
 class LogStatsResponse(BaseModel):
     """Response for log statistics"""
+
     active_streams: int
     total_log_entries: int
     retention_hours: int
@@ -54,49 +57,50 @@ def ensure_log_manager():
         except:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Log service not available"
+                detail="Log service not available",
             )
 
 
 def create_logs_router() -> APIRouter:
     """Create logs API router."""
     router = APIRouter(tags=["logs"])
-    
+
     @router.get(
         "/logs/{job_id}/tail",
         response_model=LogStreamResponse,
-        summary="Get latest logs for a job"
+        summary="Get latest logs for a job",
     )
     async def tail_job_logs(
         job_id: str,
-        lines: int = Query(100, ge=1, le=1000, description="Number of latest lines to return"),
+        lines: int = Query(
+            100, ge=1, le=1000, description="Number of latest lines to return"
+        ),
         phase: Optional[str] = Query(None, description="Filter by phase"),
-        auth: tuple = Depends(authenticate_request)
+        auth: tuple = Depends(authenticate_request),
     ):
         """
         Get the latest N log entries for a job (like tail command).
-        
+
         Args:
             job_id: Job identifier
             lines: Number of latest lines to return (1-1000)
             phase: Optional phase filter
         """
         log_manager = ensure_log_manager()
-        
+
         # Get all logs and return only the last N entries
         result = log_manager.get_all_logs(job_id=job_id, phase=phase)
-        
+
         if "error" in result:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=result["error"]
+                status_code=status.HTTP_404_NOT_FOUND, detail=result["error"]
             )
-        
+
         # Get only the last N entries
         entries = result.get("entries", [])
         if len(entries) > lines:
             result["entries"] = entries[-lines:]
-        
+
         return LogStreamResponse(**result)
-    
+
     return router

@@ -27,7 +27,9 @@ def _np(grid: List[List[int]]) -> np.ndarray:
     return np.array(grid, dtype=int)
 
 
-def _step_name_and_params(step: Union[str, Dict[str, Any]]) -> Tuple[str, Optional[Dict[str, Any]]]:
+def _step_name_and_params(
+    step: Union[str, Dict[str, Any]],
+) -> Tuple[str, Optional[Dict[str, Any]]]:
     """
     Backward-compatible helper:
       - If step is a string => (name, None)
@@ -67,7 +69,13 @@ class Visualizer:
         if title:
             ax.set_title(title, fontsize=title_size, pad=(14 if title_above else None))
 
-    def _arrow_right(self, left_ax: plt.Axes, right_ax: plt.Axes, lw: float = 1.2, color: str = "black") -> None:
+    def _arrow_right(
+        self,
+        left_ax: plt.Axes,
+        right_ax: plt.Axes,
+        lw: float = 1.2,
+        color: str = "black",
+    ) -> None:
         lp, rp = left_ax.get_position(), right_ax.get_position()
         x0 = lp.x1 + 0.006
         y = lp.y1 + 0.02
@@ -120,7 +128,9 @@ class Visualizer:
         figsize: Optional[Tuple[float, float]] = None,
     ) -> plt.Figure:
         meta = (problem or {}).get("metadata", {}) or {}
-        chain: List[Union[str, Dict[str, Any]]] = meta.get("transformation_chain", []) or []
+        chain: List[Union[str, Dict[str, Any]]] = (
+            meta.get("transformation_chain", []) or []
+        )
 
         base_task = meta.get("base_task")
         base_input = problem.get("input")
@@ -129,7 +139,9 @@ class Visualizer:
 
         chain_tiles = self._chain_tiles(base_output, chain, final_output)
 
-        n_base_cols = (1 if base_input is not None else 0) + (1 if base_output is not None else 0)
+        n_base_cols = (1 if base_input is not None else 0) + (
+            1 if base_output is not None else 0
+        )
         n_chain_cols = max(1, len(chain_tiles))
         have_examples = bool(train_examples or test_examples)
         n_rows = 2 if have_examples else 1
@@ -154,14 +166,22 @@ class Visualizer:
         ax_in = None
         if base_input is not None:
             ax_in = fig.add_subplot(gs_top[0, col])
-            title = f"Base Input\n(Task #{base_task})" if base_task is not None else "Base Input"
+            title = (
+                f"Base Input\n(Task #{base_task})"
+                if base_task is not None
+                else "Base Input"
+            )
             self._draw_grid(ax_in, base_input, title=title)
             col += 1
 
         ax_out = None
         if base_output is not None:
             ax_out = fig.add_subplot(gs_top[0, col])
-            title = f"Base Output\n(Task #{base_task})" if base_task is not None else "Base Output"
+            title = (
+                f"Base Output\n(Task #{base_task})"
+                if base_task is not None
+                else "Base Output"
+            )
             self._draw_grid(ax_out, base_output, title=title)
             if ax_in is not None:
                 self._arrow_right(ax_in, ax_out)
@@ -169,7 +189,11 @@ class Visualizer:
 
         # ---- CHAIN (Base Output → Step 1 → …) ----
         prev_ax: Optional[plt.Axes] = ax_out
-        tiles_iter = chain_tiles[1:] if chain_tiles and chain_tiles[0][0] == "Base Output" else chain_tiles
+        tiles_iter = (
+            chain_tiles[1:]
+            if chain_tiles and chain_tiles[0][0] == "Base Output"
+            else chain_tiles
+        )
         for label, grid in tiles_iter:
             ax = fig.add_subplot(gs_top[0, col])
             self._draw_grid(ax, grid, title=label, title_above=True)
@@ -207,14 +231,21 @@ class Visualizer:
 
             col_e = 0
 
-            def draw_pair(inp: List[List[int]], outp: List[List[int]], title_prefix: str, arrow_color: str = "green",
-                          highlight: bool = False) -> None:
+            def draw_pair(
+                inp: List[List[int]],
+                outp: List[List[int]],
+                title_prefix: str,
+                arrow_color: str = "green",
+                highlight: bool = False,
+            ) -> None:
                 nonlocal col_e
                 axA = fig.add_subplot(gs_ex[0, col_e])
                 self._draw_grid(axA, inp, title=f"{title_prefix} Input", title_size=10)
                 col_e += 1
                 axB = fig.add_subplot(gs_ex[0, col_e])
-                self._draw_grid(axB, outp, title=f"{title_prefix} Output", title_size=10)
+                self._draw_grid(
+                    axB, outp, title=f"{title_prefix} Output", title_size=10
+                )
                 if highlight:
                     for sp in list(axA.spines.values()) + list(axB.spines.values()):
                         sp.set_edgecolor("purple")
@@ -223,12 +254,23 @@ class Visualizer:
                 col_e += 1
 
             for i, ex in enumerate(trains, start=1):
-                draw_pair(ex["input"], ex["output"], f"Train {i}", arrow_color="green", highlight=False)
+                draw_pair(
+                    ex["input"],
+                    ex["output"],
+                    f"Train {i}",
+                    arrow_color="green",
+                    highlight=False,
+                )
 
             if num_test > 0:
                 ax_div = fig.add_subplot(gs_ex[0, col_e])
                 ax_div.axis("off")
-                x0, y0, x1, y1 = ax_div.get_position().x0, ax_div.get_position().y0, ax_div.get_position().x1, ax_div.get_position().y1
+                x0, y0, x1, y1 = (
+                    ax_div.get_position().x0,
+                    ax_div.get_position().y0,
+                    ax_div.get_position().x1,
+                    ax_div.get_position().y1,
+                )
                 plt.plot(
                     [(x0 + x1) / 2, (x0 + x1) / 2],
                     [y0, y1],
@@ -239,7 +281,13 @@ class Visualizer:
                 col_e += 1
 
             for i, ex in enumerate(tests, start=1):
-                draw_pair(ex["input"], ex["output"], f"Test {i}", arrow_color="purple", highlight=True)
+                draw_pair(
+                    ex["input"],
+                    ex["output"],
+                    f"Test {i}",
+                    arrow_color="purple",
+                    highlight=True,
+                )
 
         return fig
 
@@ -251,7 +299,6 @@ def _demo() -> None:
     applies the SAME chain (with params if present) to produce train/test examples.
     """
     try:
-
         gen = ARC2Generator()
         problem = gen.generate_problem(return_metadata=True)
 

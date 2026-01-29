@@ -18,36 +18,36 @@ from synthetics import common
 
 
 def generate(rows=None, cols=None, idx=None, color=None, size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    idx: the index into the pixel that should be the input grid location
-    color: a digit representing a color to be used
-    size: the width and height of the (square) grid
-  """
-  if rows is None:
-    rows, cols = common.conway_sprite()
-    idx = common.randint(0, len(rows) - 1)
-    color = common.random_color()
+    Args:
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      idx: the index into the pixel that should be the input grid location
+      color: a digit representing a color to be used
+      size: the width and height of the (square) grid
+    """
+    if rows is None:
+        rows, cols = common.conway_sprite()
+        idx = common.randint(0, len(rows) - 1)
+        color = common.random_color()
 
-  grid, output = common.grids(size * size, size * size)
-  for row, col in zip(rows, cols):
-    grid[rows[idx] * size + row][cols[idx] * size + col] = color
-    for r, c in zip(rows, cols):
-      output[row * size + r][col * size + c] = color
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size * size, size * size)
+    for row, col in zip(rows, cols):
+        grid[rows[idx] * size + row][cols[idx] * size + col] = color
+        for r, c in zip(rows, cols):
+            output[row * size + r][col * size + c] = color
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[0, 0, 1, 2], cols=[0, 1, 2, 0], idx=0, color=8),
-      generate(rows=[0, 1, 1, 2], cols=[2, 1, 2, 0], idx=1, color=7),
-      generate(rows=[0, 1, 1, 2, 2], cols=[1, 0, 2, 0, 1], idx=0, color=6),
-  ]
-  test = [
-      generate(rows=[0, 1, 1, 2, 2], cols=[0, 0, 1, 1, 2], idx=1, color=2),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(rows=[0, 0, 1, 2], cols=[0, 1, 2, 0], idx=0, color=8),
+        generate(rows=[0, 1, 1, 2], cols=[2, 1, 2, 0], idx=1, color=7),
+        generate(rows=[0, 1, 1, 2, 2], cols=[1, 0, 2, 0, 1], idx=0, color=6),
+    ]
+    test = [
+        generate(rows=[0, 1, 1, 2, 2], cols=[0, 0, 1, 1, 2], idx=1, color=2),
+    ]
+    return {"train": train, "test": test}

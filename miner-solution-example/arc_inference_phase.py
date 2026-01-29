@@ -16,7 +16,7 @@ You MUST NOT:
 - Attempt network calls (it will fail)
 - Change the basic structure of `results["predictions"]`:
     * list of dicts with at least:
-        - "problem_index" - provided in input 
+        - "problem_index" - provided in input
         - "task_hash" - provided in input
         - "predicted_output"
 
@@ -102,9 +102,7 @@ def run_inference_phase(input_dir: Path, output_dir: Path) -> None:
         save_output_data(results, output_dir)
 
         print("\n" + "=" * 60)
-        print(
-            f"INFERENCE PHASE COMPLETED - Solved "
-        )
+        print(f"INFERENCE PHASE COMPLETED - Solved ")
         print("=" * 60)
 
     except Exception as e:
@@ -132,7 +130,9 @@ def _cli() -> int:
     """CLI entry point for running only the inference phase"""
     parser = argparse.ArgumentParser(description="ARC-AGI-2 Inference Phase Script")
     parser.add_argument("--input", type=str, required=True, help="Input directory path")
-    parser.add_argument("--output", type=str, required=True, help="Output directory path")
+    parser.add_argument(
+        "--output", type=str, required=True, help="Output directory path"
+    )
     args = parser.parse_args()
 
     input_dir = Path(args.input)
