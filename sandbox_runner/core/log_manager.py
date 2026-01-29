@@ -360,7 +360,7 @@ log_manager: Optional[LogManager] = None
 
 def get_log_manager() -> LogManager:
     """Get the global log manager instance"""
-    global log_manager
+    global log_manager  # noqa: F824 (used in global scope)
     if log_manager is None:
         raise RuntimeError("LogManager not initialized")
     return log_manager

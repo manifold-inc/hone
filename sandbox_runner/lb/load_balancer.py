@@ -1190,7 +1190,7 @@ lb: Optional[LoadBalancer] = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
-    global lb
+    global lb  # noqa: F824 (used in global scope)
     assert lb is not None
 
     logger.info("Starting Sandbox Load Balancer...")
