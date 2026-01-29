@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from typing import Optional, List, Dict
-from pathlib import Path
 
 from config import NetworkPolicyConfig
 
@@ -596,8 +595,6 @@ class IptablesNetworkPolicy(NetworkPolicy):
 
         NOTE: This requires tcpdump to be installed on the host system
         """
-        import subprocess
-
         pid = self._container_netns.get(container_id)
         if not pid:
             pid = await self._get_container_pid(container_id)

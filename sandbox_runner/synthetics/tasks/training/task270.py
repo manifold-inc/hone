@@ -14,8 +14,6 @@
 
 """Generator."""
 
-from typing import cast
-
 from synthetics import common
 
 

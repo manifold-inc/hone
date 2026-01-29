@@ -7,7 +7,7 @@ This module provides grid transformations aligned with ARC-AGI-2 principles:
 """
 
 import random
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 
 
 # ============= GRID UTILITIES =============

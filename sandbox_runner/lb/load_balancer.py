@@ -27,7 +27,7 @@ from typing import Dict, List, Optional, Any, Set
 import os
 
 import aiohttp
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel, Field
 import uvicorn
 from loguru import logger

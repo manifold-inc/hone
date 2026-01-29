@@ -1,7 +1,7 @@
 import time
 from typing import Optional, Set
 
-from fastapi import Header, HTTPException, status, Request
+from fastapi import HTTPException, status
 from fastapi.security import APIKeyHeader
 import os
 

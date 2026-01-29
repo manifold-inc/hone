@@ -9,7 +9,6 @@ Validates miner repositories before execution:
 """
 
 import logging
-import re
 from pathlib import Path
 from typing import List, Optional
 

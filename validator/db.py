@@ -2,10 +2,9 @@ import os
 import asyncio
 import asyncpg
 from typing import Dict, List, Optional, Tuple
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone
 from loguru import logger
 import json
-import hashlib
 
 
 class Database:

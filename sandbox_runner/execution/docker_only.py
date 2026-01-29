@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Any
 import time
 import sys
-import httpx
 
 import docker
 from docker.errors import DockerException, ImageNotFound, ContainerError
@@ -12,7 +11,6 @@ from docker.errors import DockerException, ImageNotFound, ContainerError
 from core.job_queue import Job
 from config import Config
 from utils.log_capture import LogCapture, create_log_display
-from core.log_manager import get_log_manager
 
 logger = logging.getLogger(__name__)
 

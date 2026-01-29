@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from loguru import logger
-import os
 from async_substrate_interface import SubstrateInterface
 from substrateinterface import Keypair
 from substrateinterface.exceptions import SubstrateRequestException

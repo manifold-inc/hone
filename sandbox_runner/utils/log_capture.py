@@ -8,7 +8,6 @@ and sending them to the LogManager for persistence.
 import asyncio
 import logging
 from typing import Optional, Callable, List
-from pathlib import Path
 
 from core.log_manager import get_log_manager
 

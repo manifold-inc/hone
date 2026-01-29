@@ -16,7 +16,6 @@ from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import time
 import plotly.graph_objects as go
-import json
 import shutil
 from pathlib import Path
 import asyncio
