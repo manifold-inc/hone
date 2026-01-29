@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 class DockerExecutionError(Exception):
     """Raised when Docker execution fails"""
+
     pass
 
 
@@ -28,6 +29,7 @@ class BuildLogDisplay:
     When active, normal prints should go through write_below_box()
     Falls back to plain prints if stdout is not a TTY
     """
+
     def __init__(self, box_lines: int = 10, title: str = "🔨 BUILD LOGS"):
         import shutil, sys, re
         from collections import deque
@@ -47,7 +49,7 @@ class BuildLogDisplay:
         self.MOVE_DOWN_FMT = "\033[{}B"
         self.CARRIAGE = "\r"
 
-        self._ansi_re = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+        self._ansi_re = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
         self._move_up_to_content = self.box_lines + 1
 
@@ -56,24 +58,25 @@ class BuildLogDisplay:
 
     def _clean_line(self, line: str) -> str:
         cleaned = self._strip_ansi(line.rstrip("\r\n"))
-        cleaned = ''.join(ch for ch in cleaned if ch.isprintable() or ch in '\t ')
+        cleaned = "".join(ch for ch in cleaned if ch.isprintable() or ch in "\t ")
         max_width = self.terminal_width - 4
         if len(cleaned) > max_width:
-            cleaned = cleaned[:max_width - 3] + "..."
+            cleaned = cleaned[: max_width - 3] + "..."
         return cleaned
 
     def _should_display(self, line: str) -> bool:
         if not line.strip():
             return False
         skip_patterns = [
-            r'^\(Reading database \.\.\. \d+%',
-            r'^Get:\d+ http',
-            r'^Fetched \d+',
-            r'^Reading package lists\.\.\.',
-            r'^Building dependency tree\.\.\.',
-            r'^Reading state information\.\.\.',
+            r"^\(Reading database \.\.\. \d+%",
+            r"^Get:\d+ http",
+            r"^Fetched \d+",
+            r"^Reading package lists\.\.\.",
+            r"^Building dependency tree\.\.\.",
+            r"^Reading state information\.\.\.",
         ]
         import re
+
         return not any(re.search(p, line) for p in skip_patterns)
 
     def start(self):
@@ -82,9 +85,11 @@ class BuildLogDisplay:
         self.box_active = True
 
         if not self.is_tty:
-            print(f"\n{'='*self.terminal_width}\n{self.title:^{self.terminal_width}}\n{'='*self.terminal_width}")
+            print(
+                f"\n{'=' * self.terminal_width}\n{self.title:^{self.terminal_width}}\n{'=' * self.terminal_width}"
+            )
             print(f"[TTY not detected] Streaming logs plainly below...")
-            print('-'*self.terminal_width)
+            print("-" * self.terminal_width)
             return
 
         border = "─" * self.terminal_width
@@ -98,7 +103,7 @@ class BuildLogDisplay:
             sys.stdout.write(f"│{' ' * (self.terminal_width - 2)}│\n")
 
         sys.stdout.write(border + "\n")
-        sys.stdout.write(self.SAVE) 
+        sys.stdout.write(self.SAVE)
         sys.stdout.flush()
 
     def update(self, line: str):
@@ -148,7 +153,7 @@ class BuildLogDisplay:
         sys.stdout.write(self.RESTORE)  # go to "after box"
         sys.stdout.write(self.CLEAR_LINE + self.CARRIAGE)
         sys.stdout.write(text.rstrip("\n") + "\n")
-        sys.stdout.write(self.SAVE)     # keep "after box" current
+        sys.stdout.write(self.SAVE)  # keep "after box" current
         sys.stdout.flush()
 
     def end(self, status: str = "✅ BUILD COMPLETE"):
@@ -157,9 +162,9 @@ class BuildLogDisplay:
         self.box_active = False
 
         if not self.is_tty:
-            print('-'*self.terminal_width)
+            print("-" * self.terminal_width)
             print(f"{status} ({self.total_lines} lines processed)")
-            print('='*self.terminal_width + "\n")
+            print("=" * self.terminal_width + "\n")
             return
 
         sys.stdout.write(self.RESTORE)
@@ -175,6 +180,7 @@ class BuildLogDisplay:
 GREEN = "\033[92m"
 RESET = "\033[0m"
 
+
 def color_job_id(text: str, job_id: str) -> str:
     target = f"sandbox-job-{job_id}"
     return text.replace(target, f"{GREEN}{target}{RESET}")
@@ -184,12 +190,12 @@ async def _stream_docker_logs(build_generator, display):
     _ = asyncio.get_event_loop()
     try:
         for entry in build_generator:
-            if 'error' in entry:
+            if "error" in entry:
                 display.update(f"ERROR: {entry['error']}")
-            elif 'stream' in entry:
-                for ln in entry['stream'].splitlines():
+            elif "stream" in entry:
+                for ln in entry["stream"].splitlines():
                     display.update(ln)
-            elif 'status' in entry:
+            elif "status" in entry:
                 msg = f"{entry.get('id', '')} {entry['status']}".strip()
                 display.update(msg)
             await asyncio.sleep(0.01)
@@ -205,7 +211,9 @@ async def _stream_container_logs(container, display) -> str:
 
     def _read_logs_blocking():
         try:
-            for chunk in container.logs(stdout=True, stderr=True, stream=True, follow=True):
+            for chunk in container.logs(
+                stdout=True, stderr=True, stream=True, follow=True
+            ):
                 try:
                     text = chunk.decode("utf-8", errors="replace")
                 except Exception:
@@ -224,13 +232,13 @@ async def _stream_container_logs(container, display) -> str:
 
 class DockerOnlyExecutor:
     """
-    Docker-only container executor    
+    Docker-only container executor
     """
-    
+
     def __init__(self, config: Config, vllm_image="vllm/vllm-openai:latest"):
         """
         Initialize Docker-only executor
-        
+
         Args:
             config: Application configuration
         """
@@ -243,13 +251,13 @@ class DockerOnlyExecutor:
         except DockerException as e:
             logger.error(f"Failed to initialize Docker client: {e}")
             raise DockerExecutionError(f"Docker not available: {e}")
-        
+
     async def start(self):
         # pull latest vllm image
         await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: self.docker_client.images.pull(self.vllm_image)
-                )
-    
+            None, lambda: self.docker_client.images.pull(self.vllm_image)
+        )
+
     async def run_container(
         self,
         image_id: str,
@@ -258,11 +266,11 @@ class DockerOnlyExecutor:
         network_enabled: bool,
         work_dir: Path,
         timeout_seconds: int,
-        network_name: str = None
+        network_name: str = None,
     ) -> Tuple[int, str, str]:
         """
         Run a container for a specific job phase
-        
+
         Args:
             image_id: Docker image ID or tag
             job: Job object with execution details
@@ -271,20 +279,19 @@ class DockerOnlyExecutor:
             work_dir: Working directory on host
             timeout_seconds: Execution timeout in seconds
             network_name: Docker network to attach to (optional)
-            
+
         Returns:
             Tuple of (exit_code, stdout, stderr)
-            
+
         Raises:
             DockerExecutionError: If container execution fails
         """
         container_name = f"sandbox-{job.job_id}-{phase}"
-        
+
         logger.info(
             color_job_id(f"Starting Docker container: {container_name}", job.job_id)
         )
 
-        
         container_config = self._build_container_config(
             image_id=image_id,
             job=job,
@@ -292,33 +299,37 @@ class DockerOnlyExecutor:
             network_enabled=network_enabled,
             work_dir=work_dir,
             container_name=container_name,
-            network_name=network_name 
+            network_name=network_name,
         )
-        
+
         container = None
         display = create_log_display(
             job_id=job.job_id,
             phase=phase,
             show_terminal=self.show_terminal_logs,
             box_lines=50,
-            title=f"🧪 {phase.upper()} LOGS"
+            title=f"🧪 {phase.upper()} LOGS",
         )
-        
+
         try:
             container = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.containers.create(**container_config)
             )
-            logger.info(color_job_id(f"Docker container created: {container.id}", job.job_id))
+            logger.info(
+                color_job_id(f"Docker container created: {container.id}", job.job_id)
+            )
 
             display.start()
-            
+
             await asyncio.get_event_loop().run_in_executor(None, container.start)
-            logger.info(color_job_id(f"Docker container started: {container.id}", job.job_id))
-            
+            logger.info(
+                color_job_id(f"Docker container started: {container.id}", job.job_id)
+            )
+
             logs_task = asyncio.create_task(_stream_container_logs(container, display))
-            
+
             exit_code = await self._wait_for_container(container, timeout_seconds)
-            
+
             try:
                 combined_logs = await asyncio.wait_for(logs_task, timeout=5)
             except asyncio.TimeoutError:
@@ -328,51 +339,64 @@ class DockerOnlyExecutor:
                 except Exception:
                     pass
                 final = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: container.logs(stdout=True, stderr=True).decode("utf-8", errors="replace")
+                    None,
+                    lambda: container.logs(stdout=True, stderr=True).decode(
+                        "utf-8", errors="replace"
+                    ),
                 )
                 combined_logs = final
-            
-            status_txt = "✅ EXECUTION COMPLETE" if exit_code == 0 else f"❌ EXECUTION FAILED (code {exit_code})"
+
+            status_txt = (
+                "✅ EXECUTION COMPLETE"
+                if exit_code == 0
+                else f"❌ EXECUTION FAILED (code {exit_code})"
+            )
             display.end(status_txt)
-            
-            container_state = container.attrs['State']
-            logger.info(color_job_id(f"Docker container finished: {container.id}", job.job_id))
-            
+
+            container_state = container.attrs["State"]
+            logger.info(
+                color_job_id(f"Docker container finished: {container.id}", job.job_id)
+            )
+
             if exit_code != 0:
                 logger.error(
                     f"Container failed with exit code {exit_code}.",
                     extra={
                         "exit_code": exit_code,
-                        "container_error": container_state.get('Error', ''),
-                        "stdout_preview": (combined_logs[:500] if combined_logs else "(empty)"),
-                    }
+                        "container_error": container_state.get("Error", ""),
+                        "stdout_preview": (
+                            combined_logs[:500] if combined_logs else "(empty)"
+                        ),
+                    },
                 )
                 if combined_logs:
                     logger.info(f"Container combined logs:\n{combined_logs}")
-            
+
             return exit_code, combined_logs or "", ""
-            
+
         except asyncio.TimeoutError:
-            display.update(f"[timeout] Container exceeded {timeout_seconds}s → killing…")
+            display.update(
+                f"[timeout] Container exceeded {timeout_seconds}s → killing…"
+            )
             if container:
                 await self._kill_container(container)
             display.end(f"⏱️ EXECUTION TIMEOUT ({timeout_seconds}s)")
             raise DockerExecutionError(f"Container timeout after {timeout_seconds}s")
-        
+
         except ContainerError as e:
             display.end("❌ EXECUTION ERROR")
             logger.error(f"Docker container execution error: {e}")
             raise DockerExecutionError(f"Container execution failed: {e}")
-        
+
         except DockerException as e:
             display.end("❌ DOCKER ERROR")
             logger.error(f"Docker error: {e}")
             raise DockerExecutionError(f"Docker error: {e}")
-        
+
         finally:
             if container:
                 await self._cleanup_container(container)
-    
+
     def _build_container_config(
         self,
         image_id: str,
@@ -381,11 +405,11 @@ class DockerOnlyExecutor:
         network_enabled: bool,
         work_dir: Path,
         container_name: str,
-        network_name: str = None
+        network_name: str = None,
     ) -> Dict:
         """
         Build Docker container configuration
-        
+
         Args:
             image_id: Docker image ID
             job: Job object
@@ -394,111 +418,111 @@ class DockerOnlyExecutor:
             work_dir: Working directory on host
             container_name: Container name
             network_name: Docker network to attach to (optional)
-            
+
         Returns:
             Dictionary with container configuration
         """
         env_vars = {
-            'PHASE': phase,
-            'JOB_ID': job.job_id,
+            "PHASE": phase,
+            "JOB_ID": job.job_id,
         }
-                
+
         env_vars.update(job.custom_env_vars or {})
-        
+
         command = [
-            'python3', 'arc_main.py', 
-            '--phase', phase,
-            '--input', '/input',
-            '--output', '/output'
+            "python3",
+            "arc_main.py",
+            "--phase",
+            phase,
+            "--input",
+            "/input",
+            "--output",
+            "/output",
         ]
-        
+
         if network_name:
             network_mode = network_name
         else:
-            network_mode = 'host' if network_enabled else 'none'
+            network_mode = "host" if network_enabled else "none"
             if phase == "inference":
-                network_mode = 'none'
-        
+                network_mode = "none"
+
         mem_limit = f"{self.config.execution.memory_limit_gb}g"
         nano_cpus = int(self.config.execution.cpu_limit * 1e9)
-        
-        model_cache_dir = work_dir / 'models'
+
+        model_cache_dir = work_dir / "models"
         model_cache_dir.mkdir(parents=True, exist_ok=True)
-        
+
         volumes = {
-            str(work_dir / 'input'): {'bind': '/input', 'mode': 'ro'},
-            str(work_dir / 'output'): {'bind': '/output', 'mode': 'rw'},
-            str(model_cache_dir): {'bind': '/app/models', 'mode': 'rw'},
+            str(work_dir / "input"): {"bind": "/input", "mode": "ro"},
+            str(work_dir / "output"): {"bind": "/output", "mode": "rw"},
+            str(model_cache_dir): {"bind": "/app/models", "mode": "rw"},
         }
-        
-        security_opt = ['no-new-privileges']
-        
+
+        security_opt = ["no-new-privileges"]
+
         cap_drop = self.config.security.drop_capabilities or [
-            'CAP_SYS_ADMIN',
-            'CAP_NET_ADMIN',
-            'CAP_SYS_MODULE',
-            'CAP_SYS_PTRACE',
-            'CAP_SYS_RAWIO',
+            "CAP_SYS_ADMIN",
+            "CAP_NET_ADMIN",
+            "CAP_SYS_MODULE",
+            "CAP_SYS_PTRACE",
+            "CAP_SYS_RAWIO",
         ]
-        
+
         config = {
-            'image': image_id,
-            'name': container_name,
-            'command': command,
-            'environment': env_vars,
-            'volumes': volumes,
-            'working_dir': '/app',
-            'user': 'root',
-            'detach': True,
-            'auto_remove': False,
-            'security_opt': security_opt,
-            'cap_drop': cap_drop,
+            "image": image_id,
+            "name": container_name,
+            "command": command,
+            "environment": env_vars,
+            "volumes": volumes,
+            "working_dir": "/app",
+            "user": "root",
+            "detach": True,
+            "auto_remove": False,
+            "security_opt": security_opt,
+            "cap_drop": cap_drop,
         }
-        
+
         if network_name:
-            config['network'] = network_name
+            config["network"] = network_name
         else:
-            config['network_mode'] = network_mode
-        
+            config["network_mode"] = network_mode
+
         if job.assigned_gpus:
-            config['device_requests'] = [
+            config["device_requests"] = [
                 docker.types.DeviceRequest(
                     device_ids=[str(gpu) for gpu in job.assigned_gpus],
-                    capabilities=[['gpu', 'compute', 'utility']]
+                    capabilities=[["gpu", "compute", "utility"]],
                 )
             ]
-            config['runtime'] = 'nvidia'
-        
+            config["runtime"] = "nvidia"
+
         # this causes issues with docker / hf parallel download - need to adjust dynamically
-        #config['pids_limit'] = self.config.execution.max_processes
+        # config['pids_limit'] = self.config.execution.max_processes
         if self.config.security.readonly_rootfs:
-            config['read_only'] = True
-            config['tmpfs'] = {
-                '/tmp': 'rw,noexec,nosuid,size=1g',
-                '/var/tmp': 'rw,noexec,nosuid,size=1g'
+            config["read_only"] = True
+            config["tmpfs"] = {
+                "/tmp": "rw,noexec,nosuid,size=1g",
+                "/var/tmp": "rw,noexec,nosuid,size=1g",
             }
         return config
-    
-    async def _wait_for_container(
-        self,
-        container,
-        timeout_seconds: int
-    ) -> int:
+
+    async def _wait_for_container(self, container, timeout_seconds: int) -> int:
         """
         Wait for container to finish with timeout
-        
+
         Args:
             container: Docker container object
             timeout_seconds: Timeout in seconds
-            
+
         Returns:
             Container exit code
-            
+
         Raises:
             asyncio.TimeoutError: If container exceeds timeout
         """
         start_time = time.time()
-        
+
         while True:
             elapsed = time.time() - start_time
             if elapsed > timeout_seconds:
@@ -507,38 +531,31 @@ class DockerOnlyExecutor:
                     f"(limit: {timeout_seconds}s)"
                 )
                 raise asyncio.TimeoutError()
-            
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                container.reload
-            )
-            
-            if container.status != 'running':
-                exit_code = container.attrs['State']['ExitCode']
+
+            await asyncio.get_event_loop().run_in_executor(None, container.reload)
+
+            if container.status != "running":
+                exit_code = container.attrs["State"]["ExitCode"]
                 logger.debug(
-                    f"Container stopped with exit code {exit_code} "
-                    f"after {elapsed:.1f}s"
+                    f"Container stopped with exit code {exit_code} after {elapsed:.1f}s"
                 )
                 return exit_code
-            
+
             await asyncio.sleep(1)
-    
+
     async def _kill_container(self, container):
         """
         Kill a running container
-        
+
         Args:
             container: Docker container object
         """
         try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                container.kill
-            )
+            await asyncio.get_event_loop().run_in_executor(None, container.kill)
             logger.info(f"Docker container killed: {container.id[:12]}")
         except Exception as e:
             logger.warning(f"Failed to kill Docker container: {e}")
-    
+
     async def _cleanup_container(self, container):
         """
         Remove a container
@@ -549,46 +566,43 @@ class DockerOnlyExecutor:
             logger.debug(f"Docker container removed: {container.id[:12]}")
         except Exception as e:
             logger.warning(f"Failed to remove Docker container: {e}", exc_info=True)
-    
+
     async def build_image(
-        self,
-        repo_path: Path,
-        job_id: str,
-        timeout_seconds: int = 3600
+        self, repo_path: Path, job_id: str, timeout_seconds: int = 3600
     ) -> str:
         """
         Build Docker image from repository with real-time log streaming
-        
+
         Args:
             repo_path: Path to repository directory
             job_id: Job identifier for tagging
             timeout_seconds: Build timeout in seconds
-            
+
         Returns:
             Docker image ID
-            
+
         Raises:
             DockerExecutionError: If build fails
         """
         image_tag = f"sandbox-job-{job_id}"
-        
+
         logger.info(f"Building Docker image: {image_tag}")
-        
+
         display = create_log_display(
             job_id=job_id,
             phase="build",
             show_terminal=self.show_terminal_logs,
             box_lines=50,
-            title="🔨 BUILD LOGS"
+            title="🔨 BUILD LOGS",
         )
 
         try:
-            dockerfile_path = repo_path / 'Dockerfile'
+            dockerfile_path = repo_path / "Dockerfile"
             if not dockerfile_path.exists():
                 raise DockerExecutionError("Dockerfile not found")
-            
+
             display.start()
-            
+
             def build_with_logs():
                 """Execute build and return generator"""
                 return self.docker_client.api.build(
@@ -597,23 +611,23 @@ class DockerOnlyExecutor:
                     rm=True,
                     forcerm=True,
                     decode=True,
-                    timeout=timeout_seconds
+                    timeout=timeout_seconds,
                 )
-            
-            build_generator = await asyncio.get_event_loop().run_in_executor(None, build_with_logs)
-            
-            await _stream_docker_logs(build_generator, display)
-            
-            display.end("✅ BUILD COMPLETE")
-            
-            image = self.docker_client.images.get(image_tag)
-            
-            logger.info(
-                f"Docker image built: {image.id[:12]} ({image_tag})"
+
+            build_generator = await asyncio.get_event_loop().run_in_executor(
+                None, build_with_logs
             )
-            
+
+            await _stream_docker_logs(build_generator, display)
+
+            display.end("✅ BUILD COMPLETE")
+
+            image = self.docker_client.images.get(image_tag)
+
+            logger.info(f"Docker image built: {image.id[:12]} ({image_tag})")
+
             return image.id
-            
+
         except DockerException as e:
             display.end()
             logger.error(f"Docker build failed: {e}")
@@ -622,11 +636,11 @@ class DockerOnlyExecutor:
             display.end()
             logger.error(f"Unexpected build error: {e}")
             raise DockerExecutionError(f"Build failed: {e}")
-        
+
     async def remove_image(self, image_id: str):
         """
         Remove a Docker image
-        
+
         Args:
             image_id: Docker image ID
         """
@@ -635,18 +649,18 @@ class DockerOnlyExecutor:
                 None,
                 self.docker_client.images.remove,
                 image_id,
-                True  # force=True
+                True,  # force=True
             )
             logger.info(f"Docker image removed: {image_id[:12]}")
         except ImageNotFound:
             logger.debug(f"Image not found (already removed?): {image_id[:12]}")
         except Exception as e:
             logger.warning(f"Failed to remove image {image_id[:12]}: {e}")
-    
+
     def is_available(self) -> bool:
         """
         Check if Docker is available
-        
+
         Returns:
             True if Docker daemon is accessible
         """
@@ -655,58 +669,63 @@ class DockerOnlyExecutor:
             return True
         except Exception:
             return False
-    
+
     async def _cleanup_stale_networks(self):
         """Clean up stale sandbox networks that might be blocking subnet allocation"""
         try:
             networks = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.docker_client.networks.list()
+                None, lambda: self.docker_client.networks.list()
             )
-            
+
             for network in networks:
-                if network.name.startswith('sandbox-job-'):
+                if network.name.startswith("sandbox-job-"):
                     try:
                         # force remove containers on this network
                         network_info = await asyncio.get_event_loop().run_in_executor(
                             None,
-                            lambda: self.docker_client.api.inspect_network(network.id)
+                            lambda: self.docker_client.api.inspect_network(network.id),
                         )
-                        
-                        containers = network_info.get('Containers', {})
+
+                        containers = network_info.get("Containers", {})
                         for container_id in containers:
                             try:
-                                container = await asyncio.get_event_loop().run_in_executor(
-                                    None,
-                                    lambda: self.docker_client.containers.get(container_id)
+                                container = (
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None,
+                                        lambda: self.docker_client.containers.get(
+                                            container_id
+                                        ),
+                                    )
                                 )
                                 await asyncio.get_event_loop().run_in_executor(
-                                    None,
-                                    lambda: container.remove(force=True)
+                                    None, lambda: container.remove(force=True)
                                 )
-                                logger.info(f"Force removed stale container {container_id[:12]}")
+                                logger.info(
+                                    f"Force removed stale container {container_id[:12]}"
+                                )
                             except Exception as e:
-                                logger.debug(f"Failed to remove container {container_id[:12]}: {e}")
-                        
+                                logger.debug(
+                                    f"Failed to remove container {container_id[:12]}: {e}"
+                                )
+
                         await asyncio.get_event_loop().run_in_executor(
-                            None,
-                            lambda: network.remove()
+                            None, lambda: network.remove()
                         )
                         logger.info(f"Removed stale network: {network.name}")
-                        
+
                     except Exception as e:
                         logger.debug(f"Failed to remove network {network.name}: {e}")
-                        
+
         except Exception as e:
             logger.warning(f"Failed to cleanup stale networks: {e}")
-            
+
     async def run_job_with_vllm(
         self,
         image_id: str,
         job: Job,
         work_dir: Path,
         prep_timeout: int,
-        inference_timeout: int
+        inference_timeout: int,
     ) -> Tuple[int, str, str]:
         """
         Run complete job with/without vLLM pipeline using shared Docker network
@@ -719,84 +738,12 @@ class DockerOnlyExecutor:
                 phase="prep",
                 network_enabled=True,
                 work_dir=work_dir,
-                timeout_seconds=prep_timeout
-            )
-            
-            if prep_exit_code != 0:
-                return prep_exit_code, prep_stdout, prep_stderr
-            
-            inf_exit_code, inf_stdout, inf_stderr = await self.run_container(
-                image_id=image_id,
-                job=job,
-                phase="inference",
-                network_enabled=False,
-                work_dir=work_dir,
-                timeout_seconds=inference_timeout
-            )
-            
-            return inf_exit_code, f"{prep_stdout}\n{inf_stdout}", f"{prep_stderr}\n{inf_stderr}"
-
-        network_name = f"sandbox-job-{job.job_id}"
-        vllm_container = None
-        vllm_port = 8000
-        models_dir = work_dir / 'models'
-        
-        try:
-            logger.info("=" * 60)
-            logger.info(f"STEP 0: Creating shared network {network_name}")
-            logger.info("=" * 60)
-            
-            _ = await self._create_network(network_name)
-            logger.info(f"✓ Created network: {network_name}")
-            
-            logger.info("=" * 60)
-            logger.info("STEP 1: PREP - Downloading models")
-            logger.info("=" * 60)
-            
-            prep_exit_code, prep_stdout, prep_stderr = await self.run_container(
-                image_id=image_id,
-                job=job,
-                phase="prep",
-                network_enabled=True,
-                work_dir=work_dir,
                 timeout_seconds=prep_timeout,
-                network_name=None
             )
-            
+
             if prep_exit_code != 0:
-                logger.error(f"Prep phase failed with exit code {prep_exit_code}")
                 return prep_exit_code, prep_stdout, prep_stderr
-            
-            logger.info("✓ Prep phase completed successfully")
-            
-            logger.info("=" * 60)
-            logger.info("STEP 2: Starting vLLM server")
-            logger.info("=" * 60)
-            
-            vllm_container, vllm_id = await self.start_vllm_container(
-                job=job,
-                models_dir=models_dir,
-                network_name=network_name,
-                port=vllm_port
-            )
-            
-            vllm_ready = await self.wait_for_vllm_ready_from_logs(
-                container=vllm_container,
-                timeout_seconds=300
-            )
-            
-            if not vllm_ready:
-                raise DockerExecutionError("vLLM failed to start")
-            
-            logger.info("=" * 60)
-            logger.info("STEP 3: INFERENCE - Using vLLM API")
-            logger.info("=" * 60)
-            
-            vllm_container_name = f"vllm-{job.job_id}"
-            job.custom_env_vars['VLLM_API_BASE'] = f'http://{vllm_container_name}:{vllm_port}'
-            
-            logger.info(f"Inference will connect to vLLM at: {job.custom_env_vars['VLLM_API_BASE']}")
-            
+
             inf_exit_code, inf_stdout, inf_stderr = await self.run_container(
                 image_id=image_id,
                 job=job,
@@ -804,111 +751,187 @@ class DockerOnlyExecutor:
                 network_enabled=False,
                 work_dir=work_dir,
                 timeout_seconds=inference_timeout,
-                network_name=network_name
             )
-            
+
+            return (
+                inf_exit_code,
+                f"{prep_stdout}\n{inf_stdout}",
+                f"{prep_stderr}\n{inf_stderr}",
+            )
+
+        network_name = f"sandbox-job-{job.job_id}"
+        vllm_container = None
+        vllm_port = 8000
+        models_dir = work_dir / "models"
+
+        try:
+            logger.info("=" * 60)
+            logger.info(f"STEP 0: Creating shared network {network_name}")
+            logger.info("=" * 60)
+
+            _ = await self._create_network(network_name)
+            logger.info(f"✓ Created network: {network_name}")
+
+            logger.info("=" * 60)
+            logger.info("STEP 1: PREP - Downloading models")
+            logger.info("=" * 60)
+
+            prep_exit_code, prep_stdout, prep_stderr = await self.run_container(
+                image_id=image_id,
+                job=job,
+                phase="prep",
+                network_enabled=True,
+                work_dir=work_dir,
+                timeout_seconds=prep_timeout,
+                network_name=None,
+            )
+
+            if prep_exit_code != 0:
+                logger.error(f"Prep phase failed with exit code {prep_exit_code}")
+                return prep_exit_code, prep_stdout, prep_stderr
+
+            logger.info("✓ Prep phase completed successfully")
+
+            logger.info("=" * 60)
+            logger.info("STEP 2: Starting vLLM server")
+            logger.info("=" * 60)
+
+            vllm_container, vllm_id = await self.start_vllm_container(
+                job=job,
+                models_dir=models_dir,
+                network_name=network_name,
+                port=vllm_port,
+            )
+
+            vllm_ready = await self.wait_for_vllm_ready_from_logs(
+                container=vllm_container, timeout_seconds=300
+            )
+
+            if not vllm_ready:
+                raise DockerExecutionError("vLLM failed to start")
+
+            logger.info("=" * 60)
+            logger.info("STEP 3: INFERENCE - Using vLLM API")
+            logger.info("=" * 60)
+
+            vllm_container_name = f"vllm-{job.job_id}"
+            job.custom_env_vars["VLLM_API_BASE"] = (
+                f"http://{vllm_container_name}:{vllm_port}"
+            )
+
+            logger.info(
+                f"Inference will connect to vLLM at: {job.custom_env_vars['VLLM_API_BASE']}"
+            )
+
+            inf_exit_code, inf_stdout, inf_stderr = await self.run_container(
+                image_id=image_id,
+                job=job,
+                phase="inference",
+                network_enabled=False,
+                work_dir=work_dir,
+                timeout_seconds=inference_timeout,
+                network_name=network_name,
+            )
+
             if inf_exit_code != 0:
                 logger.error(f"Inference phase failed with exit code {inf_exit_code}")
                 return inf_exit_code, inf_stdout, inf_stderr
-            
+
             logger.info("✓ Inference phase completed successfully")
-            
+
             combined_stdout = f"=== PREP PHASE ===\n{prep_stdout}\n\n=== INFERENCE PHASE ===\n{inf_stdout}"
             combined_stderr = f"=== PREP PHASE ===\n{prep_stderr}\n\n=== INFERENCE PHASE ===\n{inf_stderr}"
-            
+
             return 0, combined_stdout, combined_stderr
-            
+
         finally:
             # Cleanup vLLM container
             if vllm_container:
                 await self.stop_vllm_container(vllm_container)
-            
+
             # Cleanup network
             try:
                 await self._remove_network(network_name)
             except Exception as e:
                 logger.warning(f"Failed to remove network {network_name}: {e}")
-    
+
     async def _create_network(self, network_name: str):
         """Create an isolated Docker network without internet access."""
         try:
             # force cleanup of existing network and any containers on it
             try:
                 existing_network = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: self.docker_client.networks.get(network_name)
+                    None, lambda: self.docker_client.networks.get(network_name)
                 )
-                
+
                 # force remove all containers on this network first
                 try:
                     network_info = await asyncio.get_event_loop().run_in_executor(
                         None,
-                        lambda: self.docker_client.api.inspect_network(network_name)
+                        lambda: self.docker_client.api.inspect_network(network_name),
                     )
-                    containers = network_info.get('Containers', {})
+                    containers = network_info.get("Containers", {})
                     for container_id in containers:
                         try:
                             container = await asyncio.get_event_loop().run_in_executor(
                                 None,
-                                lambda: self.docker_client.containers.get(container_id)
+                                lambda: self.docker_client.containers.get(container_id),
                             )
                             await asyncio.get_event_loop().run_in_executor(
-                                None,
-                                lambda: container.remove(force=True)
+                                None, lambda: container.remove(force=True)
                             )
-                            logger.info(f"Force removed container {container_id[:12]} from network")
+                            logger.info(
+                                f"Force removed container {container_id[:12]} from network"
+                            )
                         except Exception as e:
-                            logger.warning(f"Failed to remove container {container_id[:12]}: {e}")
+                            logger.warning(
+                                f"Failed to remove container {container_id[:12]}: {e}"
+                            )
                 except Exception as e:
                     logger.debug(f"Failed to inspect/clean network containers: {e}")
-                
+
                 await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: existing_network.remove()
+                    None, lambda: existing_network.remove()
                 )
                 logger.info(f"Removed existing network: {network_name}")
             except Exception:
                 pass
-            
+
             # more subnet ranges with more options and smaller subnets
             import random
+
             subnet_options = [
-                '172.28.0.0/16',
-                '172.29.0.0/16',
-                '172.30.0.0/16',
-                '172.31.0.0/16',
+                "172.28.0.0/16",
+                "172.29.0.0/16",
+                "172.30.0.0/16",
+                "172.31.0.0/16",
                 # Additional 10.x ranges
-                '10.100.0.0/16',
-                '10.101.0.0/16',
-                '10.102.0.0/16',
-                '10.103.0.0/16',
-                '10.104.0.0/16',
-                '10.105.0.0/16',
+                "10.100.0.0/16",
+                "10.101.0.0/16",
+                "10.102.0.0/16",
+                "10.103.0.0/16",
+                "10.104.0.0/16",
+                "10.105.0.0/16",
                 # Smaller /24 subnets for more options
-                f'10.200.{random.randint(1, 250)}.0/24',
-                f'10.201.{random.randint(1, 250)}.0/24',
-                f'10.202.{random.randint(1, 250)}.0/24',
+                f"10.200.{random.randint(1, 250)}.0/24",
+                f"10.201.{random.randint(1, 250)}.0/24",
+                f"10.202.{random.randint(1, 250)}.0/24",
             ]
-            
+
             # to avoid always hitting the same exhausted ranges
             random.shuffle(subnet_options)
-            
+
             last_error = None
             for subnet in subnet_options:
                 try:
-                    if '/24' in subnet:
-                        gateway = subnet.replace('.0/24', '.1')
+                    if "/24" in subnet:
+                        gateway = subnet.replace(".0/24", ".1")
                     else:
-                        gateway = subnet.replace('0.0/16', '0.1')
-                    
-                    ipam_pool = docker.types.IPAMPool(
-                        subnet=subnet,
-                        gateway=gateway
-                    )
-                    ipam_config = docker.types.IPAMConfig(
-                        pool_configs=[ipam_pool]
-                    )
-                    
+                        gateway = subnet.replace("0.0/16", "0.1")
+
+                    ipam_pool = docker.types.IPAMPool(subnet=subnet, gateway=gateway)
+                    ipam_config = docker.types.IPAMConfig(pool_configs=[ipam_pool])
+
                     network = await asyncio.get_event_loop().run_in_executor(
                         None,
                         lambda: self.docker_client.networks.create(
@@ -918,40 +941,41 @@ class DockerOnlyExecutor:
                             ipam=ipam_config,
                             options={
                                 "com.docker.network.bridge.enable_ip_masquerade": "false"
-                            }
+                            },
+                        ),
+                    )
+                    logger.info(
+                        color_job_id(
+                            f"Created isolated Docker network: {network_name} (subnet: {subnet})",
+                            network_name.replace("sandbox-job-", ""),
                         )
                     )
-                    logger.info(color_job_id(
-                        f"Created isolated Docker network: {network_name} (subnet: {subnet})",
-                        network_name.replace("sandbox-job-", "")
-                    ))
 
                     return network
-                    
+
                 except docker.errors.APIError as e:
                     last_error = e
                     if "overlaps" in str(e).lower() or "pool" in str(e).lower():
-                        logger.debug(f"Subnet {subnet} overlaps/conflicts, trying next option...")
+                        logger.debug(
+                            f"Subnet {subnet} overlaps/conflicts, trying next option..."
+                        )
                         continue
                     else:
                         raise
-            
+
             # If all options failed, try to clean up stale networks and retry
-            logger.warning("All subnet options exhausted, attempting cleanup of stale networks...")
+            logger.warning(
+                "All subnet options exhausted, attempting cleanup of stale networks..."
+            )
             await self._cleanup_stale_networks()
-            
+
             # Try one more time with a random subnet
-            random_subnet = f'10.250.{random.randint(1, 250)}.0/24'
+            random_subnet = f"10.250.{random.randint(1, 250)}.0/24"
             try:
-                gateway = random_subnet.replace('.0/24', '.1')
-                ipam_pool = docker.types.IPAMPool(
-                    subnet=random_subnet,
-                    gateway=gateway
-                )
-                ipam_config = docker.types.IPAMConfig(
-                    pool_configs=[ipam_pool]
-                )
-                
+                gateway = random_subnet.replace(".0/24", ".1")
+                ipam_pool = docker.types.IPAMPool(subnet=random_subnet, gateway=gateway)
+                ipam_config = docker.types.IPAMConfig(pool_configs=[ipam_pool])
+
                 network = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: self.docker_client.networks.create(
@@ -961,53 +985,47 @@ class DockerOnlyExecutor:
                         ipam=ipam_config,
                         options={
                             "com.docker.network.bridge.enable_ip_masquerade": "false"
-                        }
-                    )
+                        },
+                    ),
                 )
                 logger.info(f"Created network with random subnet: {random_subnet}")
                 return network
             except Exception:
                 pass
-            
+
             if last_error:
-                logger.error(f"Failed to create network after trying all subnet options")
+                logger.error(
+                    f"Failed to create network after trying all subnet options"
+                )
                 raise DockerExecutionError(f"Network creation failed: {last_error}")
-                
+
         except docker.errors.APIError as e:
             logger.error(f"Failed to create network {network_name}: {e}")
             raise DockerExecutionError(f"Network creation failed: {e}")
-    
+
     async def _remove_network(self, network_name: str):
         """Remove a Docker network."""
         try:
             network = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: self.docker_client.networks.get(network_name)
+                None, lambda: self.docker_client.networks.get(network_name)
             )
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                network.remove
-            )
+            await asyncio.get_event_loop().run_in_executor(None, network.remove)
             logger.info(f"Removed Docker network: {network_name}")
         except Exception as e:
             logger.warning(f"Failed to remove network {network_name}: {e}")
-    
+
     async def start_vllm_container(
-        self,
-        job: Job,
-        models_dir: Path,
-        network_name: str,
-        port: int = 8000
+        self, job: Job, models_dir: Path, network_name: str, port: int = 8000
     ) -> Tuple[Any, str]:
         """
         Start vLLM container with models mounted on shared network.
-        
+
         Args:
             job: Job object
             models_dir: Path to models directory
             network_name: Docker network name to attach to
             port: vLLM API port (internal to network)
-        
+
         Returns:
             Tuple of (container, container_id)
         """
@@ -1020,29 +1038,38 @@ class DockerOnlyExecutor:
         max_model_len = vllm_config.get("max_model_len", 4096)
 
         command = [
-            '--model', f"/app/models/{model_name.replace('/', '--')}",
-            '--host', '0.0.0.0',
-            '--port', str(port),
-            '--dtype', dtype,
-            '--gpu-memory-utilization', str(gpu_memory),
+            "--model",
+            f"/app/models/{model_name.replace('/', '--')}",
+            "--host",
+            "0.0.0.0",
+            "--port",
+            str(port),
+            "--dtype",
+            dtype,
+            "--gpu-memory-utilization",
+            str(gpu_memory),
         ]
         if self.config.execution.persist_logs:
             log_capture = LogCapture(job.job_id, "vllm", self.show_terminal_logs)
-            log_capture.capture_line(f"Starting vLLM container: {container_name}", "info")
+            log_capture.capture_line(
+                f"Starting vLLM container: {container_name}", "info"
+            )
 
         if max_model_len:
-            command.extend(['--max-model-len', str(max_model_len)])
+            command.extend(["--max-model-len", str(max_model_len)])
 
         extra_args = vllm_config.get("extra_args", {})
         if extra_args:
             for key, value in extra_args.items():
-                command.extend([f'--{key.replace("_", "-")}', str(value)])
-        
-        logger.info(color_job_id(
-            f"Starting vLLM container: {container_name} on network {network_name}",
-            job.job_id
-        ))
-        
+                command.extend([f"--{key.replace('_', '-')}", str(value)])
+
+        logger.info(
+            color_job_id(
+                f"Starting vLLM container: {container_name} on network {network_name}",
+                job.job_id,
+            )
+        )
+
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.images.get(self.vllm_image)
@@ -1058,113 +1085,118 @@ class DockerOnlyExecutor:
             except Exception as e:
                 logger.error(f"Failed to pull vLLM image: {e}")
                 raise DockerExecutionError(f"Failed to pull vLLM image: {e}")
-        
+
         model_info_path = models_dir.parent / "output" / "model_info.json"
         if model_info_path.exists():
             import json
+
             with open(model_info_path) as f:
                 model_info = json.load(f)
-                model_name = model_info.get("model_name", "unsloth/Meta-Llama-3.1-8B-Instruct")
+                model_name = model_info.get(
+                    "model_name", "unsloth/Meta-Llama-3.1-8B-Instruct"
+                )
         else:
             model_name = "unsloth/Meta-Llama-3.1-8B-Instruct"
-        
+
         model_dir_name = model_name.replace("/", "--")
-        
+
         config = {
-            'image': self.vllm_image,
-            'name': container_name,
-            'command': command,
-            'volumes': {
-                str(models_dir): {'bind': '/app/models', 'mode': 'ro'}
-            },
-            'detach': True,
-            'auto_remove': False,
-            'network': network_name,  
+            "image": self.vllm_image,
+            "name": container_name,
+            "command": command,
+            "volumes": {str(models_dir): {"bind": "/app/models", "mode": "ro"}},
+            "detach": True,
+            "auto_remove": False,
+            "network": network_name,
         }
-        
+
         gpu_count = job.weight_class.gpu_count()
         if job.assigned_gpus:
-            config['device_requests'] = [
+            config["device_requests"] = [
                 docker.types.DeviceRequest(
                     device_ids=[str(gpu) for gpu in job.assigned_gpus],
-                    capabilities=[['gpu', 'compute', 'utility']]
+                    capabilities=[["gpu", "compute", "utility"]],
                 )
             ]
-            config['runtime'] = 'nvidia'
+            config["runtime"] = "nvidia"
             if gpu_count > 1:
-                command.extend(['--tensor-parallel-size', str(gpu_count)])
-                logger.info(f"Configuring vLLM with tensor parallelism: {gpu_count} GPUs")
+                command.extend(["--tensor-parallel-size", str(gpu_count)])
+                logger.info(
+                    f"Configuring vLLM with tensor parallelism: {gpu_count} GPUs"
+                )
 
-                
         try:
             container = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: self.docker_client.containers.create(**config)
             )
-            
+
             await asyncio.get_event_loop().run_in_executor(None, container.start)
-            
-            logger.info(color_job_id(f"vLLM container started: {container.id}", job.job_id))
-            
+
+            logger.info(
+                color_job_id(f"vLLM container started: {container.id}", job.job_id)
+            )
+
             return container, container.id
-            
+
         except Exception as e:
             logger.error(f"Failed to start vLLM container: {e}")
             raise DockerExecutionError(f"vLLM container start failed: {e}")
 
     async def wait_for_vllm_ready_from_logs(
-        self,
-        container,
-        timeout_seconds: int = 300,
-        check_interval: float = 0.5
+        self, container, timeout_seconds: int = 300, check_interval: float = 0.5
     ) -> bool:
         """
         Wait for vLLM API to be ready by monitoring logs for "application startup complete."
-        
+
         Args:
             container: Docker container object
             timeout_seconds: Maximum wait time
             check_interval: Seconds between log checks
-            
+
         Returns:
             True if vLLM is ready
         """
-        logger.info(f"Waiting for vLLM startup (checking logs for 'application startup complete.')...")
-        
+        logger.info(
+            f"Waiting for vLLM startup (checking logs for 'application startup complete.')..."
+        )
+
         display = create_log_display(
-            job_id=container.name.split('-')[-1],
+            job_id=container.name.split("-")[-1],
             phase="vllm",
             show_terminal=self.show_terminal_logs,
             box_lines=30,
-            title="🚀 vLLM STARTUP LOGS"
+            title="🚀 vLLM STARTUP LOGS",
         )
 
         display.start()
-        
+
         start_time = time.time()
-        
+
         found_startup_complete = asyncio.Event()
-        
+
         async def stream_logs():
             try:
-                for chunk in container.logs(stdout=True, stderr=True, stream=True, follow=True):
+                for chunk in container.logs(
+                    stdout=True, stderr=True, stream=True, follow=True
+                ):
                     try:
                         text = chunk.decode("utf-8", errors="replace")
                     except Exception:
                         text = str(chunk)
-                    
+
                     for ln in text.splitlines():
                         display.update(ln)
-                        
+
                         if "application startup complete" in ln.lower():
                             found_startup_complete.set()
                             return
-                    
+
                     await asyncio.sleep(0.01)
             except Exception as e:
                 display.update(f"[log-stream] ERROR: {e}")
-        
+
         log_task = asyncio.create_task(stream_logs())
-        
+
         try:
             while time.time() - start_time < timeout_seconds:
                 if found_startup_complete.is_set():
@@ -1173,49 +1205,47 @@ class DockerOnlyExecutor:
                         await log_task
                     except asyncio.CancelledError:
                         pass
-                    
+
                     display.end("✅ vLLM API READY")
                     return True
-                
-                await asyncio.get_event_loop().run_in_executor(
-                    None, container.reload
-                )
-                if container.status not in ['running', 'created']:
+
+                await asyncio.get_event_loop().run_in_executor(None, container.reload)
+                if container.status not in ["running", "created"]:
                     log_task.cancel()
                     try:
                         await log_task
                     except asyncio.CancelledError:
                         pass
-                    
+
                     display.end(f"❌ vLLM CONTAINER DIED (status: {container.status})")
                     logger.error(f"vLLM container died with status: {container.status}")
                     return False
-                
+
                 elapsed = time.time() - start_time
                 if int(elapsed) % 10 == 0:
                     display.write_below_box(
                         f"⏳ Waiting for vLLM startup... ({elapsed:.0f}s/{timeout_seconds}s)"
                     )
-                
+
                 await asyncio.sleep(check_interval)
-            
+
             log_task.cancel()
             try:
                 await log_task
             except asyncio.CancelledError:
                 pass
-            
+
             display.end(f"⏱️ vLLM STARTUP TIMEOUT ({timeout_seconds}s)")
             logger.error(f"vLLM API failed to start within {timeout_seconds}s")
             return False
-            
+
         except Exception as e:
             log_task.cancel()
             try:
                 await log_task
             except asyncio.CancelledError:
                 pass
-            
+
             display.end("❌ vLLM STARTUP ERROR")
             logger.error(f"Error waiting for vLLM: {e}")
             raise
@@ -1224,15 +1254,19 @@ class DockerOnlyExecutor:
         """Stop and remove vLLM container"""
         try:
             if container:
-                logger.info(color_job_id(f"Stopping vLLM container: {container.id}", container.id))
-                
+                logger.info(
+                    color_job_id(
+                        f"Stopping vLLM container: {container.id}", container.id
+                    )
+                )
+
                 try:
                     await asyncio.get_event_loop().run_in_executor(
                         None, lambda: container.stop(timeout=10)
                     )
                 except Exception as e:
                     logger.warning(f"Failed to stop vLLM container gracefully: {e}")
-                    
+
                     # force kill if stop failed
                     try:
                         await asyncio.get_event_loop().run_in_executor(
@@ -1240,7 +1274,7 @@ class DockerOnlyExecutor:
                         )
                     except Exception as kill_e:
                         logger.warning(f"Failed to kill vLLM container: {kill_e}")
-                
+
                 try:
                     await asyncio.get_event_loop().run_in_executor(
                         None, lambda: container.remove(force=True)
@@ -1248,16 +1282,18 @@ class DockerOnlyExecutor:
                     logger.info("✓ vLLM container removed")
                 except Exception as remove_e:
                     logger.warning(f"Failed to remove vLLM container: {remove_e}")
-                    
+
                     # last resort: remove by ID directly
                     try:
                         await asyncio.get_event_loop().run_in_executor(
-                            None, 
-                            lambda: self.docker_client.api.remove_container(container.id, force=True)
+                            None,
+                            lambda: self.docker_client.api.remove_container(
+                                container.id, force=True
+                            ),
                         )
                         logger.info("✓ vLLM container force removed via API")
                     except Exception as api_e:
                         logger.error(f"Complete failure to remove container: {api_e}")
-                        
+
         except Exception as e:
             logger.error(f"Unexpected error in stop_vllm_container: {e}")

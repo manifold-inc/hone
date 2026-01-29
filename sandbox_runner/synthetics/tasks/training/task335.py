@@ -18,32 +18,40 @@ from synthetics import common
 
 
 def generate(width=None, height=None, rows=None, cols=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the grid
-    height: the height of the grid
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-  """
-  if width is None:
-    width, height = common.randint(10, 20), common.randint(10, 20)
-    rows = common.sample(range(1, height - 2), 2)
-    cols = common.sample(range(1, width - 2), 2)
+    Args:
+      width: the width of the grid
+      height: the height of the grid
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+    """
+    if width is None:
+        width, height = common.randint(10, 20), common.randint(10, 20)
+        rows = common.sample(range(1, height - 2), 2)
+        cols = common.sample(range(1, width - 2), 2)
 
-  grid, output = common.hpwl(width, height, rows, cols, common.black(),
-                             common.red(), common.cyan(), common.yellow())
-  return {"input": grid, "output": output}
+    grid, output = common.hpwl(
+        width,
+        height,
+        rows,
+        cols,
+        common.black(),
+        common.red(),
+        common.cyan(),
+        common.yellow(),
+    )
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=12, height=10, rows=[8, 2], cols=[9, 1]),
-      generate(width=11, height=8, rows=[5, 1], cols=[1, 8]),
-      generate(width=11, height=12, rows=[1, 10], cols=[8, 2]),
-  ]
-  test = [
-      generate(width=13, height=12, rows=[2, 8], cols=[11, 3]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(width=12, height=10, rows=[8, 2], cols=[9, 1]),
+        generate(width=11, height=8, rows=[5, 1], cols=[1, 8]),
+        generate(width=11, height=12, rows=[1, 10], cols=[8, 2]),
+    ]
+    test = [
+        generate(width=13, height=12, rows=[2, 8], cols=[11, 3]),
+    ]
+    return {"train": train, "test": test}

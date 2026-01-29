@@ -16,51 +16,35 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Hone Subnet Sandbox Runner - Secure GPU execution service"
     )
-    
+
     parser.add_argument(
         "--config",
         type=Path,
         default=Path("config.yaml"),
-        help="Path to configuration YAML file (default: config.yaml)"
+        help="Path to configuration YAML file (default: config.yaml)",
     )
-    
-    parser.add_argument(
-        "--port",
-        type=int,
-        help="Override API port from config"
-    )
-    
-    parser.add_argument(
-        "--gpu-count",
-        type=int,
-        help="Override GPU count from config"
-    )
-    
+
+    parser.add_argument("--port", type=int, help="Override API port from config")
+
+    parser.add_argument("--gpu-count", type=int, help="Override GPU count from config")
+
     parser.add_argument(
         "--execution-mode",
         choices=["docker+gvisor", "docker", "direct"],
-        help="Override execution mode from config"
+        help="Override execution mode from config",
     )
-    
+
     parser.add_argument(
         "--log-level",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         default="INFO",
-        help="Set logging level (default: INFO)"
+        help="Set logging level (default: INFO)",
     )
-    
-    parser.add_argument(
-        "--ssl-cert",
-        type=Path,
-        help="Path to SSL certificate file"
-    )
-    
-    parser.add_argument(
-        "--ssl-key",
-        type=Path,
-        help="Path to SSL private key file"
-    )
-    
+
+    parser.add_argument("--ssl-cert", type=Path, help="Path to SSL certificate file")
+
+    parser.add_argument("--ssl-key", type=Path, help="Path to SSL private key file")
+
     return parser.parse_args()
 
 
@@ -68,14 +52,13 @@ def apply_cli_overrides(config: Config, args: argparse.Namespace) -> Config:
     """Apply command-line argument overrides to configuration"""
     if args.port:
         config.api.port = args.port
-    
+
     if args.gpu_count:
         config.hardware.gpu_count = args.gpu_count
-    
+
     if args.execution_mode:
         config.execution.mode = args.execution_mode
-    
-    
+
     return config
 
 
@@ -85,25 +68,25 @@ async def startup_checks(config: Config, logger: logging.Logger):
     logger.info(f"Execution mode: {config.execution.mode}")
     logger.info(f"GPU count: {config.hardware.gpu_count}")
     logger.info(f"API port: {config.api.port}")
-    
+
     logger.info("Startup validation completed successfully")
 
 
 def main():
     """Main application entry point"""
-    args = parse_args()    
+    args = parse_args()
     logger = setup_logging(args.log_level)
-    
+
     try:
         logger.info(f"Loading configuration from: {args.config}")
         config = load_config(args.config)
-        
+
         config = apply_cli_overrides(config, args)
-        
+
         asyncio.run(startup_checks(config, logger))
-        
+
         app = create_app(config)
-                
+
         logger.info(f"Starting HTTPS server on port {config.api.port}")
         uvicorn.run(
             app,
@@ -112,7 +95,7 @@ def main():
             log_level=args.log_level.lower(),
             access_log=True,
         )
-        
+
     except FileNotFoundError as e:
         logger.error(f"Configuration file not found: {e}")
         sys.exit(1)

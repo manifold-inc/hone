@@ -18,28 +18,29 @@ from synthetics import common
 
 
 def generate(width=None, height=10):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the grid
-    height: the height of the grid
-  """
-  if width is None:
-    width = common.randint(2, 10)
+    Args:
+      width: the width of the grid
+      height: the height of the grid
+    """
+    if width is None:
+        width = common.randint(2, 10)
 
-  grid, output = common.bounce(width, height, common.black(), common.black(),
-                               common.blue())
-  return {"input": grid, "output": output}
+    grid, output = common.bounce(
+        width, height, common.black(), common.black(), common.blue()
+    )
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=2),
-      generate(width=3),
-      generate(width=4),
-  ]
-  test = [
-      generate(width=5),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(width=2),
+        generate(width=3),
+        generate(width=4),
+    ]
+    test = [
+        generate(width=5),
+    ]
+    return {"train": train, "test": test}

@@ -18,36 +18,36 @@ from synthetics import common
 
 
 def generate(colors=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    colors: a list of digits representing the colors to be used
-  """
-  if colors is None:
-    colors = common.random_colors(common.randint(1, 5))
-    colors.extend([0] * (5 - len(colors)))
-    colors = common.shuffle(colors)
+    Args:
+      colors: a list of digits representing the colors to be used
+    """
+    if colors is None:
+        colors = common.random_colors(common.randint(1, 5))
+        colors.extend([0] * (5 - len(colors)))
+        colors = common.shuffle(colors)
 
-  num_colors = sum([1 for c in colors if c > 0])
-  size = num_colors * len(colors)
-  grid, output = common.grid(len(colors), 1), common.grid(size, size)
-  for c, color in enumerate(colors):
-    grid[0][c] = color
-    for r in range(c, size):
-      output[r][size - 1 + c - r] = color
-  return {"input": grid, "output": output}
+    num_colors = sum([1 for c in colors if c > 0])
+    size = num_colors * len(colors)
+    grid, output = common.grid(len(colors), 1), common.grid(size, size)
+    for c, color in enumerate(colors):
+        grid[0][c] = color
+        for r in range(c, size):
+            output[r][size - 1 + c - r] = color
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(colors=[1, 0, 7, 0, 0]),
-      generate(colors=[0, 0, 2, 0, 0]),
-      generate(colors=[4, 0, 6, 0, 8]),
-      generate(colors=[0, 9, 0, 8, 4]),
-      generate(colors=[0, 4, 0, 0, 0]),
-  ]
-  test = [
-      generate(colors=[0, 6, 7, 8, 9]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(colors=[1, 0, 7, 0, 0]),
+        generate(colors=[0, 0, 2, 0, 0]),
+        generate(colors=[4, 0, 6, 0, 8]),
+        generate(colors=[0, 9, 0, 8, 4]),
+        generate(colors=[0, 4, 0, 0, 0]),
+    ]
+    test = [
+        generate(colors=[0, 6, 7, 8, 9]),
+    ]
+    return {"train": train, "test": test}

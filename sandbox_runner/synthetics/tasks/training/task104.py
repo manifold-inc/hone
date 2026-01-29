@@ -18,47 +18,47 @@ from synthetics import common
 
 
 def generate(quadrant=None, size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    quadrant: the quadrant to be filled
-    size: the width and height of the (square) grid
-  """
-  if quadrant is None:
-    quadrant = common.randint(0, 3)
+    Args:
+      quadrant: the quadrant to be filled
+      size: the width and height of the (square) grid
+    """
+    if quadrant is None:
+        quadrant = common.randint(0, 3)
 
-  grid, output = common.grid(size, size), common.grid(size * size, size * size)
-  grid[0][0] = common.green() if quadrant in [0] else common.black()
-  grid[0][1] = common.green() if quadrant in [0, 1] else common.black()
-  grid[0][2] = common.green() if quadrant in [1] else common.black()
-  grid[1][0] = common.green() if quadrant in [0, 2] else common.black()
-  grid[1][1] = common.red()
-  grid[1][2] = common.green() if quadrant in [1, 3] else common.black()
-  grid[2][0] = common.green() if quadrant in [2] else common.black()
-  grid[2][1] = common.green() if quadrant in [2, 3] else common.black()
-  grid[2][2] = common.green() if quadrant in [3] else common.black()
-  for row in range(size + 1):
-    for col in range(size + 1):
-      r = row if quadrant in [0, 1] else row + 1
-      c = col if quadrant in [0, 1] else col + 1
-      c = c if quadrant in [0, 3] else size * size - c - 1
-      output[r][c] = common.green()
-  for row in range(size + 1):
-    for col in range(size + 1):
-      r = row + 4 if quadrant in [0, 1] else row + 5
-      c = col + 4 if quadrant in [0, 1] else col + 5
-      c = c if quadrant in [0, 3] else size * size - c - 1
-      output[r][c] = common.green()
-  return {"input": grid, "output": output}
+    grid, output = common.grid(size, size), common.grid(size * size, size * size)
+    grid[0][0] = common.green() if quadrant in [0] else common.black()
+    grid[0][1] = common.green() if quadrant in [0, 1] else common.black()
+    grid[0][2] = common.green() if quadrant in [1] else common.black()
+    grid[1][0] = common.green() if quadrant in [0, 2] else common.black()
+    grid[1][1] = common.red()
+    grid[1][2] = common.green() if quadrant in [1, 3] else common.black()
+    grid[2][0] = common.green() if quadrant in [2] else common.black()
+    grid[2][1] = common.green() if quadrant in [2, 3] else common.black()
+    grid[2][2] = common.green() if quadrant in [3] else common.black()
+    for row in range(size + 1):
+        for col in range(size + 1):
+            r = row if quadrant in [0, 1] else row + 1
+            c = col if quadrant in [0, 1] else col + 1
+            c = c if quadrant in [0, 3] else size * size - c - 1
+            output[r][c] = common.green()
+    for row in range(size + 1):
+        for col in range(size + 1):
+            r = row + 4 if quadrant in [0, 1] else row + 5
+            c = col + 4 if quadrant in [0, 1] else col + 5
+            c = c if quadrant in [0, 3] else size * size - c - 1
+            output[r][c] = common.green()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(quadrant=0),
-      generate(quadrant=3),
-  ]
-  test = [
-      generate(quadrant=1),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(quadrant=0),
+        generate(quadrant=3),
+    ]
+    test = [
+        generate(quadrant=1),
+    ]
+    return {"train": train, "test": test}

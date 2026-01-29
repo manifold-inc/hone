@@ -17,46 +17,46 @@
 from synthetics import common
 
 
-def generate(rows=None, cols=None, row=None, col=None, color=None, size=8,
-             minisize=3):
-  """Returns input and output grids according to the given parameters.
+def generate(rows=None, cols=None, row=None, col=None, color=None, size=8, minisize=3):
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    row: a vertical coordinate where the sprite should be placed
-    col: a horizontal coordinate where the sprite should be placed
-    color: a digit representing a color to be used
-    size: the width and height of the (square) grid
-    minisize: the width and height of the sprite
-  """
-  if rows is None:
-    while True:
-      rows, cols = common.conway_sprite()
-      if common.diagonally_connected(list(zip(rows, cols))): break
-    row = common.randint(0, size - minisize - 1)
-    col = common.randint(0, size - minisize - 1)
-    color = common.random_color()
+    Args:
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      row: a vertical coordinate where the sprite should be placed
+      col: a horizontal coordinate where the sprite should be placed
+      color: a digit representing a color to be used
+      size: the width and height of the (square) grid
+      minisize: the width and height of the sprite
+    """
+    if rows is None:
+        while True:
+            rows, cols = common.conway_sprite()
+            if common.diagonally_connected(list(zip(rows, cols))):
+                break
+        row = common.randint(0, size - minisize - 1)
+        col = common.randint(0, size - minisize - 1)
+        color = common.random_color()
 
-  grid, output = common.grid(size, size), common.grid(2 * minisize, minisize)
-  for r, c in zip(rows, cols):
-    grid[row + r][col + c] = color
-    output[r][c + minisize] = output[r][c] = color
-  return {"input": grid, "output": output}
+    grid, output = common.grid(size, size), common.grid(2 * minisize, minisize)
+    for r, c in zip(rows, cols):
+        grid[row + r][col + c] = color
+        output[r][c + minisize] = output[r][c] = color
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[0, 0, 1, 2, 2, 2], cols=[0, 1, 1, 0, 1, 2], row=1, col=1,
-               color=8),
-      generate(rows=[0, 1, 1, 1, 2, 2], cols=[1, 0, 1, 2, 0, 1], row=5, col=2,
-               color=2),
-      generate(rows=[0, 0, 1, 2], cols=[1, 2, 0, 1], row=1, col=4,
-               color=1),
-  ]
-  test = [
-      generate(rows=[0, 1, 1, 1, 2], cols=[2, 0, 1, 2, 0], row=4, col=1,
-               color=3),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(
+            rows=[0, 0, 1, 2, 2, 2], cols=[0, 1, 1, 0, 1, 2], row=1, col=1, color=8
+        ),
+        generate(
+            rows=[0, 1, 1, 1, 2, 2], cols=[1, 0, 1, 2, 0, 1], row=5, col=2, color=2
+        ),
+        generate(rows=[0, 0, 1, 2], cols=[1, 2, 0, 1], row=1, col=4, color=1),
+    ]
+    test = [
+        generate(rows=[0, 1, 1, 1, 2], cols=[2, 0, 1, 2, 0], row=4, col=1, color=3),
+    ]
+    return {"train": train, "test": test}

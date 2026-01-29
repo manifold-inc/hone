@@ -18,33 +18,33 @@ from synthetics import common
 
 
 def generate(cols=None, colors=(2, 4, 3), size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    cols: a list of horizontal coordinates where pixels should be placed
-    colors: digit representing colors to be used
-    size: the width and height of the (square) grid
-  """
-  if cols is None:
-    cols = common.shuffle(range(size))
+    Args:
+      cols: a list of horizontal coordinates where pixels should be placed
+      colors: digit representing colors to be used
+      size: the width and height of the (square) grid
+    """
+    if cols is None:
+        cols = common.shuffle(range(size))
 
-  grid, output = common.grids(size, size)
-  for r, col in enumerate(cols):
-    grid[r][col] = common.gray()
-    for c in range(size):
-      output[r][c] = colors[col]
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size)
+    for r, col in enumerate(cols):
+        grid[r][col] = common.gray()
+        for c in range(size):
+            output[r][c] = colors[col]
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(cols=[2, 1, 0]),
-      generate(cols=[2, 2, 2]),
-      generate(cols=[0, 1, 0]),
-      generate(cols=[1, 2, 1]),
-  ]
-  test = [
-      generate(cols=[2, 0, 1]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(cols=[2, 1, 0]),
+        generate(cols=[2, 2, 2]),
+        generate(cols=[0, 1, 0]),
+        generate(cols=[1, 2, 1]),
+    ]
+    test = [
+        generate(cols=[2, 0, 1]),
+    ]
+    return {"train": train, "test": test}

@@ -18,40 +18,40 @@ from synthetics import common
 
 
 def generate(colors=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    colors: a list of digits representing the colors to be used
-  """
-  if colors is None:
-    colors = [common.randint(1, 4) for _ in range(3 * common.randint(1, 2))]
+    Args:
+      colors: a list of digits representing the colors to be used
+    """
+    if colors is None:
+        colors = [common.randint(1, 4) for _ in range(3 * common.randint(1, 2))]
 
-  width, height = 11, 4 * len(colors) // 3 - 1
-  grid, output = common.grids(width, height)
-  for r in range(height):
-    for c in range(3, width, 4):
-      output[r][c] = grid[r][c] = common.gray()
-  for r in range(3, height, 4):
-    for c in range(width):
-      output[r][c] = grid[r][c] = common.gray()
-  for idx, color in enumerate(colors):
-    r, c = idx // 3, idx % 3
-    grid[4 * r + 1][4 * c + 1] = color
-    for dr in range(3):
-      for dc in range(3):
-        output[4 * r + dr][4 * c + dc] = color + 5
-  return {"input": grid, "output": output}
+    width, height = 11, 4 * len(colors) // 3 - 1
+    grid, output = common.grids(width, height)
+    for r in range(height):
+        for c in range(3, width, 4):
+            output[r][c] = grid[r][c] = common.gray()
+    for r in range(3, height, 4):
+        for c in range(width):
+            output[r][c] = grid[r][c] = common.gray()
+    for idx, color in enumerate(colors):
+        r, c = idx // 3, idx % 3
+        grid[4 * r + 1][4 * c + 1] = color
+        for dr in range(3):
+            for dc in range(3):
+                output[4 * r + dr][4 * c + dc] = color + 5
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(colors=[1, 2, 1]),
-      generate(colors=[2, 3, 1]),
-      generate(colors=[3, 1, 4]),
-      generate(colors=[4, 1, 2, 2, 3, 4]),
-  ]
-  test = [
-      generate(colors=[2, 3, 4, 1, 1, 3]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(colors=[1, 2, 1]),
+        generate(colors=[2, 3, 1]),
+        generate(colors=[3, 1, 4]),
+        generate(colors=[4, 1, 2, 2, 3, 4]),
+    ]
+    test = [
+        generate(colors=[2, 3, 4, 1, 1, 3]),
+    ]
+    return {"train": train, "test": test}

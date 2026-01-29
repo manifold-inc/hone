@@ -10,7 +10,12 @@ import hashlib
 
 class Database:
     def __init__(self, dsn: Optional[str] = None, schema: str = "hone"):
-        self.dsn = dsn or os.getenv("DB_URL") or os.getenv("DATABASE_URL") or "postgresql://postgres:postgres@localhost:5432/hone"
+        self.dsn = (
+            dsn
+            or os.getenv("DB_URL")
+            or os.getenv("DATABASE_URL")
+            or "postgresql://postgres:postgres@localhost:5432/hone"
+        )
         self.schema = schema
         self.pool: Optional[asyncpg.Pool] = None
 
@@ -28,7 +33,9 @@ class Database:
             except Exception as e:
                 last_exc = e
                 attempts += 1
-                logger.warning(f"DB connect attempt {attempts}/10 failed ({e}); retrying in {delay:.1f}s")
+                logger.warning(
+                    f"DB connect attempt {attempts}/10 failed ({e}); retrying in {delay:.1f}s"
+                )
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 5.0)
         self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=5)
@@ -38,14 +45,21 @@ class Database:
             await self.pool.close()
             self.pool = None
 
-    async def upsert_miner(self, uid: int, hotkey: str, ip: Optional[str], port: Optional[int], stake: Optional[float], last_update_block: Optional[int]):
+    async def upsert_miner(
+        self,
+        uid: int,
+        hotkey: str,
+        ip: Optional[str],
+        port: Optional[int],
+        stake: Optional[float],
+        last_update_block: Optional[int],
+    ):
         async with self.pool.acquire() as conn:
             # remove any stale entry where a different uid has this hotkey
             await conn.execute(
-                "DELETE FROM miners WHERE hotkey = $1 AND uid != $2",
-                hotkey, uid
+                "DELETE FROM miners WHERE hotkey = $1 AND uid != $2", hotkey, uid
             )
-            
+
             await conn.execute(
                 """
                 INSERT INTO miners (uid, hotkey, ip, port, stake, last_update_block, updated_at)
@@ -58,7 +72,12 @@ class Database:
                     last_update_block = EXCLUDED.last_update_block,
                     updated_at = NOW()
                 """,
-                uid, hotkey, ip, port, stake, last_update_block
+                uid,
+                hotkey,
+                ip,
+                port,
+                stake,
+                last_update_block,
             )
 
     async def get_miners(self) -> List[asyncpg.Record]:
@@ -71,8 +90,10 @@ class Database:
             return await conn.fetchrow("SELECT * FROM miners WHERE hotkey = $1", hotkey)
 
     # ===== SUBMISSION HISTORY METHODS =====
-    
-    async def check_daily_submission_limit(self, hotkey: str, max_per_day: int) -> Tuple[bool, int]:
+
+    async def check_daily_submission_limit(
+        self, hotkey: str, max_per_day: int
+    ) -> Tuple[bool, int]:
         """
         Check if miner has reached daily submission limit
         Returns: (can_submit, current_count)
@@ -84,12 +105,12 @@ class Database:
                 FROM daily_submissions 
                 WHERE hotkey = $1 AND submission_date = CURRENT_DATE
                 """,
-                hotkey
+                hotkey,
             )
-            
-            current_count = row['submission_count'] if row else 0
+
+            current_count = row["submission_count"] if row else 0
             can_submit = current_count < max_per_day
-            
+
             return can_submit, current_count
 
     async def increment_daily_submissions(self, hotkey: str):
@@ -103,25 +124,25 @@ class Database:
                     submission_count = daily_submissions.submission_count + 1,
                     last_submission_time = NOW()
                 """,
-                hotkey
+                hotkey,
             )
 
     async def get_submission_history(
-        self, 
+        self,
         hotkey: str,
         repo_url: str,
         repo_branch: str,
         repo_commit: Optional[str],
         repo_path: str,
-        weight_class: str
+        weight_class: str,
     ) -> Optional[asyncpg.Record]:
         """
         Check if identical solution has been evaluated before
         Returns cached metrics if found
         """
-        repo_commit = repo_commit or ''
-        repo_path = repo_path or ''
-        
+        repo_commit = repo_commit or ""
+        repo_path = repo_path or ""
+
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(
                 """
@@ -133,7 +154,12 @@ class Database:
                 AND repo_path = $5
                 AND weight_class = $6
                 """,
-                hotkey, repo_url, repo_branch, repo_commit, repo_path, weight_class
+                hotkey,
+                repo_url,
+                repo_branch,
+                repo_commit,
+                repo_path,
+                weight_class,
             )
 
     async def save_submission_history(
@@ -146,7 +172,7 @@ class Database:
         weight_class: str,
         use_vllm: bool,
         vllm_config: Optional[Dict],
-        exact_match_rate: float
+        exact_match_rate: float,
     ):
         """Save or update submission history with exact_match_rate"""
         async with self.pool.acquire() as conn:
@@ -165,20 +191,26 @@ class Database:
                     last_evaluated_at = NOW(),
                     evaluation_count = submission_history.evaluation_count + 1
                 """,
-                hotkey, repo_url, repo_branch, repo_commit or '', repo_path, weight_class,
-                use_vllm, json.dumps(vllm_config) if vllm_config else None,
-                exact_match_rate
+                hotkey,
+                repo_url,
+                repo_branch,
+                repo_commit or "",
+                repo_path,
+                weight_class,
+                use_vllm,
+                json.dumps(vllm_config) if vllm_config else None,
+                exact_match_rate,
             )
 
     async def record_query_result(
-        self, 
-        block: int, 
+        self,
+        block: int,
         uid: int,
         hotkey: str,
-        success: bool, 
-        response: Optional[dict], 
-        error: Optional[str], 
-        response_time: Optional[float], 
+        success: bool,
+        response: Optional[dict],
+        error: Optional[str],
+        response_time: Optional[float],
         ts: datetime,
         exact_match_rate: float = 0.0,
         repo_url: Optional[str] = None,
@@ -186,11 +218,11 @@ class Database:
         repo_commit: Optional[str] = None,
         repo_path: Optional[str] = None,
         weight_class: Optional[str] = None,
-        from_cache: bool = False
+        from_cache: bool = False,
     ):
         async with self.pool.acquire() as conn:
             response_json = json.dumps(response) if response else None
-            
+
             await conn.execute(
                 """
                 INSERT INTO query_results (
@@ -200,13 +232,25 @@ class Database:
                 )
                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 """,
-                block, uid, hotkey, success, response_json, error, response_time, ts,
+                block,
+                uid,
+                hotkey,
+                success,
+                response_json,
+                error,
+                response_time,
+                ts,
                 exact_match_rate,
-                repo_url, repo_branch, repo_commit, repo_path, weight_class, from_cache
+                repo_url,
+                repo_branch,
+                repo_commit,
+                repo_path,
+                weight_class,
+                from_cache,
             )
 
     # ===== LEADERBOARD METHODS =====
-    
+
     async def get_leaderboard(self, limit: int = 5) -> List[asyncpg.Record]:
         """Get current top miners"""
         async with self.pool.acquire() as conn:
@@ -216,7 +260,7 @@ class Database:
                 ORDER BY exact_match_rate DESC
                 LIMIT $1
                 """,
-                limit
+                limit,
             )
 
     async def update_leaderboard(
@@ -227,7 +271,7 @@ class Database:
         repo_url: str,
         repo_branch: str,
         repo_commit: Optional[str],
-        repo_path: str
+        repo_path: str,
     ):
         """Update or insert miner into leaderboard"""
         async with self.pool.acquire() as conn:
@@ -249,18 +293,23 @@ class Database:
                     last_updated_at = NOW(),
                     evaluation_count = leaderboard.evaluation_count + 1
                 """,
-                hotkey, uid, exact_match_rate, repo_url, repo_branch, repo_commit, repo_path
+                hotkey,
+                uid,
+                exact_match_rate,
+                repo_url,
+                repo_branch,
+                repo_commit,
+                repo_path,
             )
 
     async def remove_from_leaderboard(self, hotkey: str):
         """Remove miner from leaderboard"""
         async with self.pool.acquire() as conn:
-            await conn.execute(
-                "DELETE FROM leaderboard WHERE hotkey = $1",
-                hotkey
-            )
+            await conn.execute("DELETE FROM leaderboard WHERE hotkey = $1", hotkey)
 
-    async def get_recent_results(self, window_blocks: int, current_block: int) -> List[asyncpg.Record]:
+    async def get_recent_results(
+        self, window_blocks: int, current_block: int
+    ) -> List[asyncpg.Record]:
         min_block = max(0, current_block - window_blocks)
         async with self.pool.acquire() as conn:
             return await conn.fetch(
@@ -269,7 +318,7 @@ class Database:
                 WHERE block >= $1
                 ORDER BY timestamp DESC
                 """,
-                min_block
+                min_block,
             )
 
     async def save_scores(self, scores: Dict[int, float], hotkey_map: Dict[int, str]):
@@ -284,24 +333,29 @@ class Database:
                 hotkey = hotkey_map.get(uid)
                 if not hotkey:
                     continue
-                    
+
                 await conn.execute(
                     """
                     INSERT INTO scores (uid, hotkey, exact_match_rate, timestamp) 
                     VALUES ($1, $2, $3, $4)
                     """,
-                    uid, hotkey, float(exact_match_rate), ts
+                    uid,
+                    hotkey,
+                    float(exact_match_rate),
+                    ts,
                 )
 
     async def get_scores_last_hours(self, hours: int = 24) -> List[asyncpg.Record]:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
                 "SELECT * FROM scores WHERE timestamp > NOW() - ($1 || ' hours')::interval",
-                str(hours)
+                str(hours),
             )
             return rows
 
-    async def get_miner_performance_stats(self, uid: int, window_blocks: int, current_block: int) -> Dict:
+    async def get_miner_performance_stats(
+        self, uid: int, window_blocks: int, current_block: int
+    ) -> Dict:
         """Get performance statistics for a specific miner"""
         min_block = max(0, current_block - window_blocks)
         async with self.pool.acquire() as conn:
@@ -315,10 +369,11 @@ class Database:
                 FROM query_results
                 WHERE uid = $1 AND block >= $2 AND success = true
                 """,
-                uid, min_block
+                uid,
+                min_block,
             )
             return dict(stats) if stats else {}
-    
+
     async def cleanup_old_data(self, retention_days: int):
         """Delete data older than retention_days to prevent disk overflow"""
         async with self.pool.acquire() as conn:
@@ -327,16 +382,16 @@ class Database:
                 DELETE FROM query_results
                 WHERE timestamp < NOW() - ($1 || ' days')::interval
                 """,
-                str(retention_days)
+                str(retention_days),
             )
-            
+
             deleted_scores = await conn.execute(
                 """
                 DELETE FROM scores
                 WHERE timestamp < NOW() - ($1 || ' days')::interval
                 """,
-                str(retention_days)
+                str(retention_days),
             )
-            
+
             logger.info(f"Cleaned up data older than {retention_days} days")
             return deleted_queries, deleted_scores

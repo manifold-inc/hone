@@ -18,46 +18,47 @@ from synthetics import common
 
 
 def generate(rows=None, cols=None, size=15):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    size: the width and height of the (square) grid
-  """
-  if rows is None:
-    rows, cols = [], []
-    for _ in range(2):
-      row, col = common.randint(3, 11), common.randint(3, 11)
-      overlaps = False
-      for r, c in zip(rows, cols):
-        # Boxes can't overlap, and also their crosshairs shouldn't touch.
-        overlaps = overlaps or (abs(r - row) < 6 and abs(c - col) < 6)
-        overlaps = overlaps or abs(r - row) < 3 or abs(c - col) < 3
-      if overlaps: continue
-      rows.append(row)
-      cols.append(col)
+    Args:
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      size: the width and height of the (square) grid
+    """
+    if rows is None:
+        rows, cols = [], []
+        for _ in range(2):
+            row, col = common.randint(3, 11), common.randint(3, 11)
+            overlaps = False
+            for r, c in zip(rows, cols):
+                # Boxes can't overlap, and also their crosshairs shouldn't touch.
+                overlaps = overlaps or (abs(r - row) < 6 and abs(c - col) < 6)
+                overlaps = overlaps or abs(r - row) < 3 or abs(c - col) < 3
+            if overlaps:
+                continue
+            rows.append(row)
+            cols.append(col)
 
-  grid, output = common.grids(size, size, common.cyan())
-  for r, c in zip(rows, cols):
-    for i in range(size):
-      output[r][i] = output[i][c] = common.pink()
-  for r, c in zip(rows, cols):
-    for i in range(5):
-      output[r - 2][c - 2 + i] = grid[r - 2][c - 2 + i] = common.blue()
-      output[r + 2][c - 2 + i] = grid[r + 2][c - 2 + i] = common.blue()
-      output[r - 2 + i][c - 2] = grid[r - 2 + i][c - 2] = common.blue()
-      output[r - 2 + i][c + 2] = grid[r - 2 + i][c + 2] = common.blue()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size, common.cyan())
+    for r, c in zip(rows, cols):
+        for i in range(size):
+            output[r][i] = output[i][c] = common.pink()
+    for r, c in zip(rows, cols):
+        for i in range(5):
+            output[r - 2][c - 2 + i] = grid[r - 2][c - 2 + i] = common.blue()
+            output[r + 2][c - 2 + i] = grid[r + 2][c - 2 + i] = common.blue()
+            output[r - 2 + i][c - 2] = grid[r - 2 + i][c - 2] = common.blue()
+            output[r - 2 + i][c + 2] = grid[r - 2 + i][c + 2] = common.blue()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[3], cols=[5]),
-      generate(rows=[5, 11], cols=[5, 10]),
-  ]
-  test = [
-      generate(rows=[3, 11], cols=[8, 5]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(rows=[3], cols=[5]),
+        generate(rows=[5, 11], cols=[5, 10]),
+    ]
+    test = [
+        generate(rows=[3, 11], cols=[8, 5]),
+    ]
+    return {"train": train, "test": test}

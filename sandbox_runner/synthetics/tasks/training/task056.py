@@ -18,44 +18,44 @@ from synthetics import common
 
 
 def generate(idx=None, color=None, size=3, oneof=(1, 2, 3, 6)):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    idx: an index into one of many pattern types
-    color: a digit representing a color to be used
-    size: the width and height of the (square) grid
-    oneof: a list of possible pattern indices (of which one will be chosen)
-  """
-  if idx is None:
-    idx, color = oneof[common.randint(0, len(oneof) - 1)], common.random_color()
+    Args:
+      idx: an index into one of many pattern types
+      color: a digit representing a color to be used
+      size: the width and height of the (square) grid
+      oneof: a list of possible pattern indices (of which one will be chosen)
+    """
+    if idx is None:
+        idx, color = oneof[common.randint(0, len(oneof) - 1)], common.random_color()
 
-  grid, output = common.grid(size, size), common.grid(1, 1)
-  if idx == 1:
-    grid[0][0] = grid[0][1] = grid[1][0] = grid[1][2] = grid[2][1] = color
-  if idx == 2:
-    grid[0][0] = grid[0][2] = grid[1][1] = grid[2][0] = grid[2][2] = color
-  if idx == 3:
-    grid[0][1] = grid[0][2] = grid[1][1] = grid[1][2] = grid[2][0] = color
-  if idx == 6:
-    grid[0][1] = grid[1][0] = grid[1][1] = grid[1][2] = grid[2][1] = color
-  output[0][0] = idx
-  return {"input": grid, "output": output}
+    grid, output = common.grid(size, size), common.grid(1, 1)
+    if idx == 1:
+        grid[0][0] = grid[0][1] = grid[1][0] = grid[1][2] = grid[2][1] = color
+    if idx == 2:
+        grid[0][0] = grid[0][2] = grid[1][1] = grid[2][0] = grid[2][2] = color
+    if idx == 3:
+        grid[0][1] = grid[0][2] = grid[1][1] = grid[1][2] = grid[2][0] = color
+    if idx == 6:
+        grid[0][1] = grid[1][0] = grid[1][1] = grid[1][2] = grid[2][1] = color
+    output[0][0] = idx
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(idx=1, color=5),
-      generate(idx=2, color=8),
-      generate(idx=2, color=5),
-      generate(idx=3, color=1),
-      generate(idx=3, color=8),
-      generate(idx=1, color=4),
-      generate(idx=6, color=5),
-  ]
-  test = [
-      generate(idx=6, color=8),
-      generate(idx=1, color=7),
-      generate(idx=2, color=2),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(idx=1, color=5),
+        generate(idx=2, color=8),
+        generate(idx=2, color=5),
+        generate(idx=3, color=1),
+        generate(idx=3, color=8),
+        generate(idx=1, color=4),
+        generate(idx=6, color=5),
+    ]
+    test = [
+        generate(idx=6, color=8),
+        generate(idx=1, color=7),
+        generate(idx=2, color=2),
+    ]
+    return {"train": train, "test": test}

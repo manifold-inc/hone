@@ -18,34 +18,34 @@ from synthetics import common
 
 
 def generate(size=None, color=None):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    size: the width and height of the (square) grid
-    color: a digit representing a color to be used
-  """
-  if size is None:
-    size = 2 * common.randint(2, 7) + 1
-    color = common.random_color()
+    Args:
+      size: the width and height of the (square) grid
+      color: a digit representing a color to be used
+    """
+    if size is None:
+        size = 2 * common.randint(2, 7) + 1
+        color = common.random_color()
 
-  grid, output = common.grids(size, size, color)
-  grid[size // 2][size // 2] = common.black()
-  for i in range(size):
-    output[i][i] = common.black()
-    output[i][size - 1 - i] = common.black()
-    output[size - 1 - i][i] = common.black()
-    output[size - 1 - i][size - 1 - i] = common.black()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(size, size, color)
+    grid[size // 2][size // 2] = common.black()
+    for i in range(size):
+        output[i][i] = common.black()
+        output[i][size - 1 - i] = common.black()
+        output[size - 1 - i][i] = common.black()
+        output[size - 1 - i][size - 1 - i] = common.black()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(size=3, color=1),
-      generate(size=5, color=2),
-      generate(size=7, color=3),
-  ]
-  test = [
-      generate(size=11, color=6),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(size=3, color=1),
+        generate(size=5, color=2),
+        generate(size=7, color=3),
+    ]
+    test = [
+        generate(size=11, color=6),
+    ]
+    return {"train": train, "test": test}

@@ -18,39 +18,39 @@ from synthetics import common
 
 
 def generate(width=None, height=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the grid
-    height: the height of the grid
-  """
-  if width is None:
-    width = common.randint(5, 25)
+    Args:
+      width: the width of the grid
+      height: the height of the grid
+    """
+    if width is None:
+        width = common.randint(5, 25)
 
-  grid, output = common.grids(width, height)
-  mode = -1
-  for c in range(width):
-    r = c % (2 * height - 2)
-    r = r if r < height else 2 * height - r - 2
-    output[r][c] = grid[r][c] = common.red()
-    mode = mode if r not in [0, height - 1] else (mode + 1) % 6
-    if mode in [0, 5]:
-      for i in range(r + 1, height):
-        output[i][c] = common.yellow()
-    if mode in [2, 3]:
-      for i in range(0, r):
-        output[i][c] = common.yellow()
-  return {"input": grid, "output": output}
+    grid, output = common.grids(width, height)
+    mode = -1
+    for c in range(width):
+        r = c % (2 * height - 2)
+        r = r if r < height else 2 * height - r - 2
+        output[r][c] = grid[r][c] = common.red()
+        mode = mode if r not in [0, height - 1] else (mode + 1) % 6
+        if mode in [0, 5]:
+            for i in range(r + 1, height):
+                output[i][c] = common.yellow()
+        if mode in [2, 3]:
+            for i in range(0, r):
+                output[i][c] = common.yellow()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=10),
-      generate(width=15),
-      generate(width=18),
-  ]
-  test = [
-      generate(width=25),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(width=10),
+        generate(width=15),
+        generate(width=18),
+    ]
+    test = [
+        generate(width=25),
+    ]
+    return {"train": train, "test": test}

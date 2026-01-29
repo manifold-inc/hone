@@ -18,37 +18,38 @@ from synthetics import common
 
 
 def generate(colors=None, size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    colors: a list of digits representing the colors to be used
-    size: the width and height of the (square) grid
-  """
-  if colors is None:
-    color_list = common.random_colors(common.randint(3, 4))
-    colors = common.square_with_unique_max_color(size, color_list)
+    Args:
+      colors: a list of digits representing the colors to be used
+      size: the width and height of the (square) grid
+    """
+    if colors is None:
+        color_list = common.random_colors(common.randint(3, 4))
+        colors = common.square_with_unique_max_color(size, color_list)
 
-  grid = common.grid(size, size)
-  output = common.grid(size * size, size * size)
-  mode = max(set(colors), key=colors.count)
-  for r in range(size):
-    for c in range(size):
-      grid[r][c] = colors[r * size + c]
-      if colors[r * size + c] != mode: continue
-      for dr in range(size):
-        for dc in range(size):
-          output[r * size + dr][c * size + dc] = colors[dr * size + dc]
-  return {"input": grid, "output": output}
+    grid = common.grid(size, size)
+    output = common.grid(size * size, size * size)
+    mode = max(set(colors), key=colors.count)
+    for r in range(size):
+        for c in range(size):
+            grid[r][c] = colors[r * size + c]
+            if colors[r * size + c] != mode:
+                continue
+            for dr in range(size):
+                for dc in range(size):
+                    output[r * size + dr][c * size + dc] = colors[dr * size + dc]
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(colors=[3, 8, 7, 9, 3, 8, 7, 9, 3]),
-      generate(colors=[8, 6, 8, 3, 3, 8, 8, 8, 8]),
-      generate(colors=[6, 9, 9, 4, 6, 8, 9, 9, 8]),
-  ]
-  test = [
-      generate(colors=[1, 1, 7, 7, 4, 1, 5, 1, 7]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(colors=[3, 8, 7, 9, 3, 8, 7, 9, 3]),
+        generate(colors=[8, 6, 8, 3, 3, 8, 8, 8, 8]),
+        generate(colors=[6, 9, 9, 4, 6, 8, 9, 9, 8]),
+    ]
+    test = [
+        generate(colors=[1, 1, 7, 7, 4, 1, 5, 1, 7]),
+    ]
+    return {"train": train, "test": test}

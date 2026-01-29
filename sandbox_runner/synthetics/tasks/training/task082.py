@@ -18,39 +18,39 @@ from synthetics import common
 
 
 def generate(width=None, cols=None, colors=None, height=6):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    width: the width of the input grid
-    cols: a list of horizontal coordinates where pixels should be placed
-    colors: a list of digits representing the colors to be used
-    height: the height of the input grid
-  """
-  if width is None:
-    width, col = common.randint(5, 15), common.randint(1, 2)
-    cols, colors = [], []
-    while col + 1 < width:
-      cols.append(col)
-      colors.append(common.random_color())
-      col += common.randint(3, 4)
+    Args:
+      width: the width of the input grid
+      cols: a list of horizontal coordinates where pixels should be placed
+      colors: a list of digits representing the colors to be used
+      height: the height of the input grid
+    """
+    if width is None:
+        width, col = common.randint(5, 15), common.randint(1, 2)
+        cols, colors = [], []
+        while col + 1 < width:
+            cols.append(col)
+            colors.append(common.random_color())
+            col += common.randint(3, 4)
 
-  grid, output = common.grids(width, height)
-  for c, color in zip(cols, colors):
-    grid[0][c] = color
-    for r in range(height):
-      output[r][c] = color if r % 2 == 0 else common.black()
-      for dc in [-1, 1]:
-        output[r][c + dc] = common.black() if r % 2 == 0 else color
-  return {"input": grid, "output": output}
+    grid, output = common.grids(width, height)
+    for c, color in zip(cols, colors):
+        grid[0][c] = color
+        for r in range(height):
+            output[r][c] = color if r % 2 == 0 else common.black()
+            for dc in [-1, 1]:
+                output[r][c + dc] = common.black() if r % 2 == 0 else color
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(width=10, cols=[1, 5], colors=[2, 8]),
-      generate(width=7, cols=[1], colors=[4]),
-  ]
-  test = [
-      generate(width=12, cols=[2, 6, 9], colors=[3, 6, 7]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(width=10, cols=[1, 5], colors=[2, 8]),
+        generate(width=7, cols=[1], colors=[4]),
+    ]
+    test = [
+        generate(width=12, cols=[2, 6, 9], colors=[3, 6, 7]),
+    ]
+    return {"train": train, "test": test}

@@ -18,36 +18,37 @@ from synthetics import common
 
 
 def generate(rows=None, cols=None, size=3):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    rows: a list of vertical coordinates where pixels should be placed
-    cols: a list of horizontal coordinates where pixels should be placed
-    size: the width and height of the (square) grid
-  """
-  if rows is None:
-    while True:
-      pixels = common.random_pixels(size, size)
-      if pixels: break
-    rows, cols = zip(*pixels)
+    Args:
+      rows: a list of vertical coordinates where pixels should be placed
+      cols: a list of horizontal coordinates where pixels should be placed
+      size: the width and height of the (square) grid
+    """
+    if rows is None:
+        while True:
+            pixels = common.random_pixels(size, size)
+            if pixels:
+                break
+        rows, cols = zip(*pixels)
 
-  grid = common.grid(size * size, size * size)
-  output = common.grid(size * size, size * size)
-  for r, c in zip(rows, cols):
-    grid[size * r + 1][size * c + 1] = common.gray()
-    for rr in range(size):
-      for cc in range(size):
-        output[size * r + rr][size * c + cc] = common.blue()
-  return {"input": grid, "output": output}
+    grid = common.grid(size * size, size * size)
+    output = common.grid(size * size, size * size)
+    for r, c in zip(rows, cols):
+        grid[size * r + 1][size * c + 1] = common.gray()
+        for rr in range(size):
+            for cc in range(size):
+                output[size * r + rr][size * c + cc] = common.blue()
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(rows=[0, 1, 2], cols=[0, 1, 2]),
-      generate(rows=[0, 1, 2, 2], cols=[1, 1, 1, 2]),
-  ]
-  test = [
-      generate(rows=[0, 1, 1, 2], cols=[2, 0, 2, 0]),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(rows=[0, 1, 2], cols=[0, 1, 2]),
+        generate(rows=[0, 1, 2, 2], cols=[1, 1, 1, 2]),
+    ]
+    test = [
+        generate(rows=[0, 1, 1, 2], cols=[2, 0, 2, 0]),
+    ]
+    return {"train": train, "test": test}

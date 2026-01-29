@@ -14,12 +14,12 @@ def _count_non_black(grid: List[List[int]]) -> int:
 class ARC2Generator:
     """
     Generate ARC-AGI-2 style problems by applying transformation chains to ARC-1 base tasks.
-    
+
     Key approach:
       - Start from a base ARC-1 task (input -> output)
       - Apply a parameterized chain of transforms to the *output*
       - The same chain (with frozen parameters) is reused for all examples
-    
+
     This creates problems requiring compositional reasoning while remaining
     solvable by humans who can infer the transformation pattern.
     """
@@ -51,7 +51,7 @@ class ARC2Generator:
     ) -> Dict[str, Any]:
         """
         Generate a base ARC-1 style problem from task_list.
-        
+
         Returns:
             Dict with "input", "output", and "task_num" keys
         """
@@ -61,7 +61,7 @@ class ARC2Generator:
 
         _, gen_fn, _ = tmap[task_num]
         pair = gen_fn()
-        
+
         if isinstance(pair, dict):
             inp = pair["input"]
             out = pair["output"]
@@ -69,15 +69,21 @@ class ARC2Generator:
             inp, out = pair
 
         if not utils.is_valid_grid(inp) or not utils.is_valid_grid(out):
-            raise ValueError(f"Base task produced invalid grid(s) - task_num: {task_num}")
+            raise ValueError(
+                f"Base task produced invalid grid(s) - task_num: {task_num}"
+            )
 
         h, w = utils.get_grid_size(out)
         if h > self.max_grid_size or w > self.max_grid_size:
-            raise ValueError(f"Base output too large: {h}x{w} > {self.max_grid_size} - task_num: {task_num}")
+            raise ValueError(
+                f"Base output too large: {h}x{w} > {self.max_grid_size} - task_num: {task_num}"
+            )
 
         return {"input": inp, "output": out, "task_num": task_num}
 
-    def _sample_params(self, name: str, grid: List[List[int]]) -> Optional[Dict[str, Any]]:
+    def _sample_params(
+        self, name: str, grid: List[List[int]]
+    ) -> Optional[Dict[str, Any]]:
         """
         Sample parameters for a transformation based on current grid state.
         Returns None if the transform doesn't need parameters or can't be applied.
@@ -123,7 +129,7 @@ class ARC2Generator:
     ) -> List[Dict[str, Any]]:
         """
         Build a parameterized transformation chain.
-        
+
         Each transform is applied to the current grid state to ensure compatibility,
         and parameters are frozen for reuse across examples.
         """
@@ -135,7 +141,9 @@ class ARC2Generator:
         cur = utils.deep_copy_grid(grid)
 
         for _ in range(chain_length):
-            compatible = utils.get_compatible_transformations(cur, max_size=self.max_grid_size)
+            compatible = utils.get_compatible_transformations(
+                cur, max_size=self.max_grid_size
+            )
             available = [t for t in pool if t in compatible]
 
             if preserves_size_only:
@@ -164,7 +172,7 @@ class ARC2Generator:
 
             name = self.rng.choice(available)
             params = self._sample_params(name, cur)
-            
+
             # Skip if params are invalid
             if name in ("remove_color", "highlight_color") and params is None:
                 continue
@@ -246,7 +254,7 @@ class ARC2Generator:
             "input": base["input"],
             "output": transformed,
         }
-        
+
         if return_metadata:
             result["metadata"] = {
                 "base_task": base["task_num"],
@@ -254,7 +262,7 @@ class ARC2Generator:
                 "chain_length": len(chain),
                 "initial_output": base["output"],
             }
-        
+
         return result
 
     def generate_problem_set(
@@ -267,10 +275,10 @@ class ARC2Generator:
     ) -> Dict[str, Any]:
         """
         Generate train/test examples with the same transformation chain.
-        
+
         This mirrors the ARC-AGI format where the same underlying rule
         applies across all examples.
-        
+
         Returns:
             {
               "train_examples": [{"input": <grid>, "output": <grid>}, ...],
@@ -286,7 +294,7 @@ class ARC2Generator:
         # Generate initial task to get base task number
         base_initial = self.generate_initial_problem(task_num)
         task_num = base_initial["task_num"]
-        
+
         # Generate transformation chain (empty if chain_length is 0)
         if chain_length == 0:
             chain = []
@@ -296,37 +304,34 @@ class ARC2Generator:
                 chain_length=chain_length,
                 preserves_size_only=preserves_size_only,
             )
-        
+
         # Generate training examples
         train_examples = []
         attempts = 0
         max_attempts = num_train * 5
-        
+
         while len(train_examples) < num_train and attempts < max_attempts:
             attempts += 1
             try:
                 base = self.generate_initial_problem(task_num=task_num)
-                
+
                 if chain:
                     output = self.apply_transformation_chain(base["output"], chain)
                 else:
                     output = base["output"]
-                
+
                 if self._non_degenerate(output):
-                    train_examples.append({
-                        "input": base["input"],
-                        "output": output
-                    })
+                    train_examples.append({"input": base["input"], "output": output})
             except:
                 continue
-        
+
         # Generate test example
         test_base = self.generate_initial_problem(task_num=task_num)
         if chain:
             test_output = self.apply_transformation_chain(test_base["output"], chain)
         else:
             test_output = test_base["output"]
-        
+
         return {
             "train_examples": train_examples,
             "test_input": test_base["input"],
@@ -334,6 +339,6 @@ class ARC2Generator:
             "metadata": {
                 "base_task": task_num,
                 "transformation_chain": chain,
-                "chain_length": len(chain)
-            }
+                "chain_length": len(chain),
+            },
         }

@@ -18,43 +18,43 @@ from synthetics import common
 
 
 def generate(neck=None, shoulder=None, shirt=None, antenna=None, b=0):
-  """Returns input and output grids according to the given parameters.
+    """Returns input and output grids according to the given parameters.
 
-  Args:
-    neck: the width of the neck
-    shoulder: the width of the shoulder
-    shirt: the color of the shirt
-    antenna: the color of the antenna
-    b: the integer used for all background cells
-  """
-  if neck is None:
-    neck = 2 * common.randint(0, 1) + 1
-    shoulder = common.randint(1, 3)
-    colors = common.random_colors(2)
-    shirt, antenna = colors[0], colors[1]
+    Args:
+      neck: the width of the neck
+      shoulder: the width of the shoulder
+      shirt: the color of the shirt
+      antenna: the color of the antenna
+      b: the integer used for all background cells
+    """
+    if neck is None:
+        neck = 2 * common.randint(0, 1) + 1
+        shoulder = common.randint(1, 3)
+        colors = common.random_colors(2)
+        shirt, antenna = colors[0], colors[1]
 
-  size = neck + 2 * shoulder
-  grid, output = common.grid(size, size, b), common.grid(size, size, b)
-  for c in range(shoulder, shoulder + neck):
-    output[size - 1][c] = grid[size - 1][c] = antenna
-    output[size - 2][c] = grid[size - 2][c] = shirt
-  for c in range(shoulder):
-    output[size - 1][c] = grid[size - 1][c] = shirt
-    output[size - 1][size - 1 - c] = grid[size - 1][size - 1 - c] = shirt
-    output[size - 2 - shoulder + c][c] = antenna
-    output[size - 2 - shoulder + c][size - 1 - c] = antenna
-  return {"input": grid, "output": output}
+    size = neck + 2 * shoulder
+    grid, output = common.grid(size, size, b), common.grid(size, size, b)
+    for c in range(shoulder, shoulder + neck):
+        output[size - 1][c] = grid[size - 1][c] = antenna
+        output[size - 2][c] = grid[size - 2][c] = shirt
+    for c in range(shoulder):
+        output[size - 1][c] = grid[size - 1][c] = shirt
+        output[size - 1][size - 1 - c] = grid[size - 1][size - 1 - c] = shirt
+        output[size - 2 - shoulder + c][c] = antenna
+        output[size - 2 - shoulder + c][size - 1 - c] = antenna
+    return {"input": grid, "output": output}
 
 
 def validate():
-  """Validates the generator."""
-  train = [
-      generate(neck=1, shoulder=1, shirt=2, antenna=4),
-      generate(neck=1, shoulder=2, shirt=8, antenna=3),
-      generate(neck=3, shoulder=1, shirt=6, antenna=1),
-      generate(neck=3, shoulder=2, shirt=2, antenna=4),
-  ]
-  test = [
-      generate(neck=3, shoulder=3, shirt=8, antenna=2),
-  ]
-  return {"train": train, "test": test}
+    """Validates the generator."""
+    train = [
+        generate(neck=1, shoulder=1, shirt=2, antenna=4),
+        generate(neck=1, shoulder=2, shirt=8, antenna=3),
+        generate(neck=3, shoulder=1, shirt=6, antenna=1),
+        generate(neck=3, shoulder=2, shirt=2, antenna=4),
+    ]
+    test = [
+        generate(neck=3, shoulder=3, shirt=8, antenna=2),
+    ]
+    return {"train": train, "test": test}

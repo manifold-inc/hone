@@ -63,7 +63,9 @@ def read_weights_by_uid(substrate: SubstrateInterface, netuid: int, uid: int):
     return [(int(dest), int(w)) for dest, w in vals]
 
 
-def get_last_update_block(substrate: SubstrateInterface, netuid: int, uid: int) -> int | None:
+def get_last_update_block(
+    substrate: SubstrateInterface, netuid: int, uid: int
+) -> int | None:
     q = substrate.query("SubtensorModule", "LastUpdate", [netuid], block_hash=None)
     arr = q.value
     if not arr or uid >= len(arr):
@@ -91,7 +93,9 @@ def get_block_timestamp(substrate: SubstrateInterface, block_number: int) -> int
         return None
 
 
-def get_current_block_and_timestamp(substrate: SubstrateInterface) -> tuple[int | None, int | None]:
+def get_current_block_and_timestamp(
+    substrate: SubstrateInterface,
+) -> tuple[int | None, int | None]:
     header = substrate.get_block_header()
     try:
         current_block = int(header["header"]["number"])
@@ -102,7 +106,9 @@ def get_current_block_and_timestamp(substrate: SubstrateInterface) -> tuple[int 
     return current_block, current_ts
 
 
-def get_validator_uid(substrate: SubstrateInterface, netuid: int, hotkey: str) -> int | None:
+def get_validator_uid(
+    substrate: SubstrateInterface, netuid: int, hotkey: str
+) -> int | None:
     try:
         q = substrate.query("SubtensorModule", "Uids", [netuid, hotkey])
         if q and q.value is not None:
@@ -112,7 +118,9 @@ def get_validator_uid(substrate: SubstrateInterface, netuid: int, hotkey: str) -
         return None
 
 
-def get_hotkey_for_uid(substrate: SubstrateInterface, netuid: int, uid: int) -> Optional[str]:
+def get_hotkey_for_uid(
+    substrate: SubstrateInterface, netuid: int, uid: int
+) -> Optional[str]:
     try:
         q = substrate.query("SubtensorModule", "Keys", [netuid, uid])
         if q and q.value is not None:
@@ -123,7 +131,9 @@ def get_hotkey_for_uid(substrate: SubstrateInterface, netuid: int, uid: int) -> 
 
 
 @st.cache_data(show_spinner=False)
-def resolve_hotkeys_for_uids(uids: List[int], netuid: int = DEFAULT_NETUID, endpoint: str = DEFAULT_ENDPOINT) -> Dict[int, str]:
+def resolve_hotkeys_for_uids(
+    uids: List[int], netuid: int = DEFAULT_NETUID, endpoint: str = DEFAULT_ENDPOINT
+) -> Dict[int, str]:
     out: Dict[int, str] = {}
     try:
         substrate = connect_substrate(endpoint)
@@ -221,7 +231,9 @@ def fetch_validator_weights_info(uid: int, netuid: int, endpoint: str, top_n: in
         return None, str(e)
 
 
-def summarize_last_set_weights_for_hotkey(hotkey: str, endpoint: str = DEFAULT_ENDPOINT):
+def summarize_last_set_weights_for_hotkey(
+    hotkey: str, endpoint: str = DEFAULT_ENDPOINT
+):
     try:
         substrate = connect_substrate(endpoint)
     except Exception:
@@ -586,13 +598,10 @@ def page_overview():
         st.warning("No data found for this selection yet.")
         return
 
-    agg = (
-        df.groupby("uid", as_index=False)
-        .agg(
-            avg_latency_s=("response_time", "mean"),
-            accuracy=("accuracy", "mean"),
-            queries=("uid", "size"),
-        )
+    agg = df.groupby("uid", as_index=False).agg(
+        avg_latency_s=("response_time", "mean"),
+        accuracy=("accuracy", "mean"),
+        queries=("uid", "size"),
     )
 
     uid_list = agg["uid"].tolist()
@@ -607,16 +616,17 @@ def page_overview():
 
     if search_term:
         s = str(search_term).lower()
-        mask = (
-            agg["uid"].astype(str).str.contains(s, case=False)
-            | agg["hotkey"].astype(str).str.lower().str.contains(s, case=False)
-        )
+        mask = agg["uid"].astype(str).str.contains(s, case=False) | agg[
+            "hotkey"
+        ].astype(str).str.lower().str.contains(s, case=False)
         agg_filtered = agg[mask].copy()
     else:
         agg_filtered = agg.copy()
 
     st.subheader("Accuracy vs Latency (Per Miner)")
-    st.caption("Each point is one miner UID. Accuracy = mean(exact_match). Latency = mean(response_time in s).")
+    st.caption(
+        "Each point is one miner UID. Accuracy = mean(exact_match). Latency = mean(response_time in s)."
+    )
 
     if agg_filtered.empty:
         st.info("No miners match this filter.")
@@ -775,9 +785,7 @@ def page_validators():
     status_dots = []
     last_heartbeat_strs = []
     for _, row in df.iterrows():
-        lbl, dot = version_status_label_and_color(
-            row.get("version"), latest_version
-        )
+        lbl, dot = version_status_label_and_color(row.get("version"), latest_version)
         status_labels.append(lbl)
         status_dots.append(dot)
 
@@ -827,9 +835,7 @@ def page_validators():
     st.markdown("---")
 
     st.subheader("Validator Inspector")
-    st.caption(
-        "Inspect a validator's current weights vector. netuid is fixed to 5."
-    )
+    st.caption("Inspect a validator's current weights vector. netuid is fixed to 5.")
 
     colA, colB = st.columns([1, 2])
     with colA:
@@ -865,12 +871,12 @@ def page_validators():
                 f"""
 **Validator UID {validator_uid} (netuid {DEFAULT_NETUID})**
 
-- Last set_weights block: `{info['last_block']}`
-- Last set_weights time: `{info['last_ts_human']}`
-- Time since last set_weights: `{info['time_since']}`
-- Blocks since last set_weights: `{info['blocks_since']}`  
-- Current chain block: `{info['current_block']}`  
-- Current chain time: `{info['current_ts_human']}`
+- Last set_weights block: `{info["last_block"]}`
+- Last set_weights time: `{info["last_ts_human"]}`
+- Time since last set_weights: `{info["time_since"]}`
+- Blocks since last set_weights: `{info["blocks_since"]}`  
+- Current chain block: `{info["current_block"]}`  
+- Current chain time: `{info["current_ts_human"]}`
                 """
             )
 
