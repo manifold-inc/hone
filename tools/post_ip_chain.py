@@ -268,13 +268,6 @@ def main():
     )
     
     parser.add_argument(
-        "--protocol",
-        type=int,
-        default=4,
-        help="Protocol type (default: 4)"
-    )
-    
-    parser.add_argument(
         "--no-coldkey",
         action="store_true",
         help="Don't include coldkey parameters (for older chain versions)"
@@ -291,7 +284,6 @@ def main():
         chain_endpoint=args.chain_endpoint,
         wallet_path=args.wallet_path,
         include_coldkey=not args.no_coldkey,
-        protocol=args.protocol
     )
     
     sys.exit(0 if success else 1)

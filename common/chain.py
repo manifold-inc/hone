@@ -135,15 +135,12 @@ def _get_nodes_for_uid(substrate: SubstrateInterface, netuid: int, block: int | 
             alpha_stake=metagraph.get("alpha_stake", [0]*256)[uid] * 10**-9,
             tao_stake=metagraph.get("tao_stake", [0]*256)[uid] * 10**-9,
             stake=metagraph["total_stake"][uid] * 10**-9,
-            trust=metagraph["trust"][uid],
             vtrust=metagraph["consensus"][uid],
-            consensus=metagraph["consensus"][uid],
             last_updated=float(metagraph["last_update"][uid]),
             last_update=float(metagraph["last_update"][uid]),
             ip=str(axon["ip"]),
             ip_type=axon["ip_type"],
             port=axon["port"],
-            protocol=axon.get("protocol", 4),
             is_validator=metagraph['validator_permit'][uid]
         )
         nodes.append(node)
