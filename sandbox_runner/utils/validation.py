@@ -29,9 +29,9 @@ class RepositoryValidator:
     obvious security issues.
     """
 
-    BLACKLISTED_PACKAGES = {}
+    BLACKLISTED_PACKAGES: set[str] = set()
 
-    SUSPICIOUS_PACKAGES = {
+    SUSPICIOUS_PACKAGES: set[str] = {
         "eval",
         "exec",
         "compile",

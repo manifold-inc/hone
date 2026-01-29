@@ -1,11 +1,12 @@
 import os
+from typing import Optional, Any
 import asyncpg
 from loguru import logger
 
-_pool = None
+_pool: Optional[asyncpg.Pool] = None
 
 
-async def init_pool():
+async def init_pool() -> asyncpg.Pool:
     global _pool
     if _pool is not None:
         return _pool
@@ -24,7 +25,7 @@ async def init_pool():
     return _pool
 
 
-async def close_pool():
+async def close_pool() -> None:
     global _pool
     if _pool is not None:
         await _pool.close()
@@ -32,7 +33,7 @@ async def close_pool():
         _pool = None
 
 
-async def execute(query: str, *args):
+async def execute(query: str, *args: Any) -> None:
     if _pool is None:
         raise RuntimeError("DB pool not initialized")
 

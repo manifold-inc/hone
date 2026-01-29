@@ -63,7 +63,7 @@ class SeccompProfile:
         Returns:
             Dictionary in Docker seccomp JSON format
         """
-        profile = {
+        profile: dict = {
             "defaultAction": self.default_action,
             "architectures": ["SCMP_ARCH_X86_64", "SCMP_ARCH_X86", "SCMP_ARCH_X32"],
             "syscalls": [],
@@ -520,7 +520,7 @@ class SeccompManager:
         "rseq",
     }
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize seccomp manager"""
         self.profiles: Dict[str, SeccompProfile] = {}
 

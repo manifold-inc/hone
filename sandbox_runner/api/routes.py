@@ -196,6 +196,11 @@ async def authenticate_request(
     if validator_id:
         await rate_limiter.check_rate_limit(validator_id)
 
+    if not validator_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized"
+        )
+
     return validator_id, auth_method
 
 

@@ -42,7 +42,7 @@ class Config:
         cache_ttl_days: int = 7,
         health_check_interval: int = 30,
         github_timeout: int = 10,
-        runner_api_key: str = None,
+        runner_api_key: str | None = None,
     ):
         self.runner_urls = [url.rstrip("/") for url in runner_urls]
         self.port = port
@@ -429,7 +429,7 @@ class RunnerHealthManager:
         self,
         runner_urls: List[str],
         check_interval: int = 30,
-        runner_api_key: str = None,
+        runner_api_key: str | None = None,
     ):
         self.runner_urls = runner_urls
         self.check_interval = check_interval
@@ -1191,6 +1191,7 @@ lb: Optional[LoadBalancer] = None
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global lb
+    assert lb is not None
 
     logger.info("Starting Sandbox Load Balancer...")
     await lb.start()

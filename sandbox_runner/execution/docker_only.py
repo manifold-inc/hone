@@ -34,7 +34,7 @@ class BuildLogDisplay:
 
         self.box_lines = max(3, box_lines)
         self.title = title
-        self.log_buffer = deque(maxlen=self.box_lines)
+        self.log_buffer: deque[str] = deque(maxlen=self.box_lines)
         self.terminal_width = min(shutil.get_terminal_size((120, 20)).columns, 140)
         self.box_active = False
         self.total_lines = 0
@@ -264,7 +264,7 @@ class DockerOnlyExecutor:
         network_enabled: bool,
         work_dir: Path,
         timeout_seconds: int,
-        network_name: str = None,
+        network_name: str | None = None,
     ) -> Tuple[int, str, str]:
         """
         Run a container for a specific job phase
@@ -403,7 +403,7 @@ class DockerOnlyExecutor:
         network_enabled: bool,
         work_dir: Path,
         container_name: str,
-        network_name: str = None,
+        network_name: str | None = None,
     ) -> Dict:
         """
         Build Docker container configuration

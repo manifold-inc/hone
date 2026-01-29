@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from socket import AddressFamily, SocketKind
 from typing import Optional, List, Dict
 
 from config import NetworkPolicyConfig
@@ -144,9 +145,9 @@ class NetworkPolicy:
             "phase": phase,
             "network_mode": network_mode,
             "internet_enabled": internet_enabled,
-            "allowed_domains": self.config.allowed_prep_domains
-            if phase == "prep"
-            else [],
+            "allowed_domains": (
+                self.config.allowed_prep_domains if phase == "prep" else []
+            ),
             "blocked_domains": self.config.blocked_domains,
         }
 
@@ -517,7 +518,9 @@ class IptablesNetworkPolicy(NetworkPolicy):
         import socket
 
         try:
-            result = socket.getaddrinfo(domain, None)
+            result: list[
+                tuple[AddressFamily, SocketKind, int, str, tuple[str, int]]
+            ] = socket.getaddrinfo(domain, None)
             ips = list(set([r[4][0] for r in result]))
             logger.debug(f"Resolved {domain} to {ips}")
             return ips

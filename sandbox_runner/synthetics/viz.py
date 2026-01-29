@@ -38,7 +38,7 @@ def _step_name_and_params(
     if isinstance(step, str):
         return step, None
     if isinstance(step, dict):
-        return step.get("name"), step.get("params")
+        return step.get("name", ""), step.get("params")
     raise TypeError(f"Unexpected step type: {type(step)}")
 
 

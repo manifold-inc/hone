@@ -50,7 +50,7 @@ class ValidatorConfig:
 
     default_miner_port: int = int(os.getenv("MINER_PORT", "8091"))
 
-    db_url: str = os.getenv("DB_URL")
+    db_url: str | None = os.getenv("DB_URL")
 
     use_mock_chain: bool = os.getenv("USE_MOCK_CHAIN", "false").lower() == "true"
 
@@ -64,7 +64,7 @@ class ValidatorConfig:
     cleanup_interval_hours: int = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
 
     # sandbox runner configuration
-    sandbox_runner_endpoint: str = os.getenv("SANDBOX_RUNNER_ENDPOINT")
+    sandbox_runner_endpoint: str | None = os.getenv("SANDBOX_RUNNER_ENDPOINT")
     sandbox_runner_api_key: Optional[str] = os.getenv("SANDBOX_RUNNER_API_KEY")
     sandbox_runner_timeout_hours: int = int(
         os.getenv("SANDBOX_RUNNER_TIMEOUT_HOURS", "3")
@@ -77,8 +77,6 @@ class ValidatorConfig:
     )  # 3h with 30s intervals
 
     # miner info fetching
-    miner_info_timeout_seconds: int = int(os.getenv("MINER_INFO_TIMEOUT", "5"))
-
     miner_info_timeout_seconds: int = int(os.getenv("MINER_INFO_TIMEOUT", "5"))
 
     max_submissions_per_day: int = int(os.getenv("MAX_SUBMISSIONS_PER_DAY", "1"))

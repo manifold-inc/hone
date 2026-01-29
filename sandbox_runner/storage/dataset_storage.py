@@ -161,7 +161,7 @@ class DatasetStorage:
         with open(self.unsolved_tasks_file, "w") as f:
             json.dump(data, f, indent=2)
 
-    def _find_task_by_hash(self, task_hash: str) -> Dict:
+    def _find_task_by_hash(self, task_hash: str) -> Dict | None:
         """Find task by hash in current dataset"""
         current_dataset = self.load_current_dataset()
 

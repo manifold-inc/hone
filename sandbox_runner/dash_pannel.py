@@ -13,7 +13,7 @@ Features:
 import gradio as gr
 import httpx
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TypedDict
 import time
 import plotly.graph_objects as go
 import shutil
@@ -28,8 +28,14 @@ from concurrent.futures import ThreadPoolExecutor
 API_BASE_URL = "http://localhost:8080"
 API_KEY = "dev-key-12345"
 
+
 # Cache for reducing API calls
-_status_cache = {"data": None, "timestamp": 0.0}
+class StatusCache(TypedDict):
+    data: Optional[dict]
+    timestamp: float
+
+
+_status_cache: StatusCache = {"data": None, "timestamp": 0.0}
 _CACHE_TTL = 1.0
 
 # Async HTTP client with aggressive timeouts
@@ -115,7 +121,7 @@ async def get_runner_status_async(use_cache: bool = True) -> Dict:
         client = get_async_client()
         resp = await client.get("/v1/status")
         if resp.status_code == 200:
-            data = resp.json()
+            data: dict = resp.json()
             _status_cache = {"data": data, "timestamp": now}
             return data
         return _status_cache.get("data") or {}
@@ -171,10 +177,10 @@ async def get_active_jobs_table_async(
             results = [None] * len(active_job_ids)
 
         for job_id, job in zip(active_job_ids, results):
-            if isinstance(job, Exception):
+            if job is None:
                 continue
 
-            if job is None:
+            if not isinstance(job, dict):  # e.g. Exception
                 continue
 
             try:
@@ -237,7 +243,7 @@ async def get_job_logs_tail_async(
 
     try:
         client = get_async_client()
-        params = {"lines": lines}
+        params: Dict[str, Any] = {"lines": lines}
         if phase_filter != "all":
             params["phase"] = phase_filter
 
@@ -326,7 +332,7 @@ async def get_all_active_logs_async(
         out.append("\n" + "─" * 100)
         out.append(f"📋 JOB: {job_id}")
         out.append("─" * 100 + "\n")
-        out.append(logs)
+        out.append(str(logs))
         out.append("")
 
     return "\n".join(out)

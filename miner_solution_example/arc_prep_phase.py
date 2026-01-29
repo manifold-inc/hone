@@ -47,8 +47,8 @@ def download_model_with_retry(repo_id: str, cache_dir: str, local_dir: str) -> s
         repo_id=repo_id,
         cache_dir=cache_dir,
         local_dir=local_dir,
-        local_dir_use_symlinks=False,
-        resume_download=True,
+        # local_dir_use_symlinks=False,
+        # resume_download=True,
         ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
     )
 

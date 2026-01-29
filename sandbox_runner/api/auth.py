@@ -108,6 +108,8 @@ class RateLimiter:
     Simple in-memory rate limiter for API endpoints
     """
 
+    _request_log: dict[str, list[float]]
+
     def __init__(self, requests_per_minute: int):
         """
         Initialize rate limiter.

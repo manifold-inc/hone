@@ -113,7 +113,7 @@ class JobQueue:
     - Estimated wait time calculation
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize empty job queue"""
         self._lock = asyncio.Lock()
         self._queues: Dict[int, deque] = defaultdict(deque)

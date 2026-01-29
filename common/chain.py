@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Sequence
 from loguru import logger
 from async_substrate_interface import SubstrateInterface
 from substrateinterface import Keypair
@@ -15,6 +15,12 @@ SS58_FORMAT = 42
 
 
 class Node:
+    hotkey: str
+    coldkey: str
+    uid: int
+    port: int
+    is_validator: bool
+
     def __init__(self, hotkey: str, coldkey: str = "", uid: int = 0, **kwargs):
         self.hotkey = hotkey
         self.coldkey = coldkey
@@ -108,9 +114,13 @@ def _ss58_encode(
     address: list[int] | list[list[int]], ss58_format: int = SS58_FORMAT
 ) -> str:
     """Encode SS58 address"""
+    address_: list[int]
     if not isinstance(address[0], int):
-        address = address[0]
-    return ss58_encode(bytes(address).hex(), ss58_format)
+        address_ = address[0]
+    else:
+        address_ = address  # type: ignore
+
+    return ss58_encode(bytes(address_).hex(), ss58_format)
 
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=4))
@@ -217,11 +227,11 @@ def blocks_since_last_update(
     substrate, last_updated_value = query_substrate(
         substrate, "SubtensorModule", "LastUpdate", [netuid], return_value=False
     )
-
+    updated: int
     try:
-        updated: int = current_block - last_updated_value[node_id]
+        updated = current_block - last_updated_value[node_id]
     except TypeError:
-        updated: int = current_block - last_updated_value[node_id].value
+        updated = current_block - last_updated_value[node_id].value
     return updated
 
 
@@ -311,6 +321,8 @@ def set_node_weights(
             subtensor = bt.subtensor(config=config)
 
             total_weight_formatted = sum(node_weights_formatted)
+
+            node_weights_float: Sequence[float | int] = []
             if total_weight_formatted > 0:
                 node_weights_float = [
                     w / total_weight_formatted for w in node_weights_formatted
@@ -349,6 +361,9 @@ def set_node_weights(
         except Exception as e:
             logger.error(f"Exception during commit-reveal weight setting: {e}")
             return False
+    else:
+        logger.error("Commit-reveal is not enabled")
+        return False
 
 
 class ChainInterface:
