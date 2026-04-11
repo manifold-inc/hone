@@ -1,4 +1,0 @@
-huggingface-hub==1.1.2
-openai==2.7.1
-requests
-tenacity
