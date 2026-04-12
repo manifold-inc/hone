@@ -3,7 +3,10 @@
 Implements the architecture from "Scaling Latent Reasoning via Looped Language
 Models" (arXiv:2510.25741).  A shared stack of N transformer layers is applied
 recurrently T_max times.  At each recurrent step an exit gate produces a halting
-probability and the LM head emits next-token logits.
+logit and the LM head emits next-token logits.
+
+Parameter naming matches the official Ouro HuggingFace checkpoint
+(ByteDance/Ouro-1.4B) for weight-loading compatibility.
 """
 
 from __future__ import annotations
@@ -28,7 +31,7 @@ class LoopLMConfig:
     n_layers: int = 24
     n_heads: int = 16
     n_kv_heads: int | None = None
-    ffn_hidden_dim: int | None = None
+    intermediate_size: int | None = None
     ffn_dim_multiplier: float | None = None
     multiple_of: int = 256
     norm_eps: float = 1e-5
@@ -36,15 +39,16 @@ class LoopLMConfig:
     max_seq_len: int = 4096
     t_max: int = 4
     tie_embeddings: bool = True
+    hidden_act: str = "silu"
 
     def __post_init__(self):
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
-        if self.ffn_hidden_dim is None:
+        if self.intermediate_size is None:
             raw = int(8 * self.dim / 3)
             if self.ffn_dim_multiplier is not None:
                 raw = int(raw * self.ffn_dim_multiplier)
-            self.ffn_hidden_dim = self.multiple_of * (
+            self.intermediate_size = self.multiple_of * (
                 (raw + self.multiple_of - 1) // self.multiple_of
             )
 
@@ -56,211 +60,227 @@ class LoopLMConfig:
 @dataclass
 class LoopLMOutput:
     step_logits: list[torch.Tensor] = field(default_factory=list)
-    step_gate_probs: list[torch.Tensor] = field(default_factory=list)
+    step_gate_logits: list[torch.Tensor] = field(default_factory=list)
     final_hidden: torch.Tensor | None = None
 
 
 # ---------------------------------------------------------------------------
-# RMSNorm
+# RMSNorm  (matches OuroRMSNorm)
 # ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
+        self.variance_epsilon = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        norm = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
-        return (x.float() * norm).type_as(x) * self.weight
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
+        variance = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * x.to(input_dtype)
 
 
 # ---------------------------------------------------------------------------
-# Rotary Position Embeddings
+# Rotary Position Embeddings  (matches OuroRotaryEmbedding)
 # ---------------------------------------------------------------------------
 
-def precompute_freqs_cis(
-    dim: int,
-    seq_len: int,
-    theta: float = 10000.0,
-    device: torch.device | None = None,
-) -> torch.Tensor:
-    freqs = 1.0 / (
-        theta ** (torch.arange(0, dim, 2, device=device).float() / dim)
-    )
-    t = torch.arange(seq_len, device=device).float()
-    freqs = torch.outer(t, freqs)
-    return torch.polar(torch.ones_like(freqs), freqs)  # complex64
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
 
 
-def apply_rotary_emb(
-    xq: torch.Tensor,
-    xk: torch.Tensor,
-    freqs_cis: torch.Tensor,
+def apply_rotary_pos_emb(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # xq, xk: (B, S, H, D)  -> reshape last dim to complex pairs
-    xq_c = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
-    xk_c = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    """Apply RoPE.  q, k are (B, H, S, D); cos, sin are (B, S, D) or (1, S, D)."""
+    cos = cos.unsqueeze(1)  # (B, 1, S, D)
+    sin = sin.unsqueeze(1)
+    q_embed = (q * cos) + (_rotate_half(q) * sin)
+    k_embed = (k * cos) + (_rotate_half(k) * sin)
+    return q_embed, k_embed
 
-    freqs = freqs_cis[: xq.shape[1]]  # (S, D/2)
-    freqs = freqs.unsqueeze(0).unsqueeze(2)  # (1, S, 1, D/2)
 
-    xq_out = torch.view_as_real(xq_c * freqs).flatten(-2)
-    xk_out = torch.view_as_real(xk_c * freqs).flatten(-2)
-    return xq_out.type_as(xq), xk_out.type_as(xk)
+class RotaryEmbedding(nn.Module):
+    """Precomputes and caches cos/sin tables for RoPE."""
+
+    def __init__(self, dim: int, max_seq_len: int = 4096, theta: float = 10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.max_seq_len = max_seq_len
+
+    @torch.no_grad()
+    def forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_freq = self.inv_freq[None, :, None].float().expand(
+            position_ids.shape[0], -1, 1
+        ).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
 
 # ---------------------------------------------------------------------------
-# Attention
+# Attention  (matches OuroAttention)
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
-    def __init__(self, dim: int, n_heads: int, n_kv_heads: int):
+    def __init__(self, config: LoopLMConfig, layer_idx: int):
         super().__init__()
-        self.n_heads = n_heads
-        self.n_kv_heads = n_kv_heads
-        self.head_dim = dim // n_heads
-        self.n_rep = n_heads // n_kv_heads
+        self.layer_idx = layer_idx
+        self.head_dim = config.dim // config.n_heads
+        self.n_heads = config.n_heads
+        self.n_kv_heads = config.n_kv_heads or config.n_heads
+        self.num_key_value_groups = self.n_heads // self.n_kv_heads
+        self.scaling = self.head_dim ** -0.5
 
-        self.wq = nn.Linear(dim, n_heads * self.head_dim, bias=False)
-        self.wk = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.wv = nn.Linear(dim, n_kv_heads * self.head_dim, bias=False)
-        self.wo = nn.Linear(n_heads * self.head_dim, dim, bias=False)
+        self.q_proj = nn.Linear(config.dim, self.n_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(self.n_heads * self.head_dim, config.dim, bias=False)
 
     def forward(
         self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        B, S, _ = x.shape
+        B, S, _ = hidden_states.shape
 
-        q = self.wq(x).view(B, S, self.n_heads, self.head_dim)
-        k = self.wk(x).view(B, S, self.n_kv_heads, self.head_dim)
-        v = self.wv(x).view(B, S, self.n_kv_heads, self.head_dim)
+        q = self.q_proj(hidden_states).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
+        k = self.k_proj(hidden_states).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(hidden_states).view(B, S, self.n_kv_heads, self.head_dim).transpose(1, 2)
 
-        q, k = apply_rotary_emb(q, k, freqs_cis)
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         # GQA: expand KV heads
-        if self.n_rep > 1:
-            k = k.unsqueeze(3).expand(-1, -1, -1, self.n_rep, -1).reshape(
-                B, S, self.n_heads, self.head_dim
-            )
-            v = v.unsqueeze(3).expand(-1, -1, -1, self.n_rep, -1).reshape(
-                B, S, self.n_heads, self.head_dim
-            )
+        if self.num_key_value_groups > 1:
+            k = k[:, :, None, :, :].expand(
+                -1, -1, self.num_key_value_groups, -1, -1
+            ).reshape(B, self.n_heads, S, self.head_dim)
+            v = v[:, :, None, :, :].expand(
+                -1, -1, self.num_key_value_groups, -1, -1
+            ).reshape(B, self.n_heads, S, self.head_dim)
 
-        # (B, H, S, D) for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-
-        out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=(mask is None))
+        out = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=attention_mask, is_causal=(attention_mask is None)
+        )
         out = out.transpose(1, 2).contiguous().view(B, S, -1)
-        return self.wo(out)
+        return self.o_proj(out)
 
 
 # ---------------------------------------------------------------------------
-# SwiGLU Feed-Forward
+# SwiGLU Feed-Forward  (matches OuroMLP)
 # ---------------------------------------------------------------------------
 
-class FeedForward(nn.Module):
-    def __init__(self, dim: int, hidden_dim: int):
-        super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=False)  # gate
-        self.w2 = nn.Linear(hidden_dim, dim, bias=False)   # down
-        self.w3 = nn.Linear(dim, hidden_dim, bias=False)   # up
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.w2(F.silu(self.w1(x)) * self.w3(x))
-
-
-# ---------------------------------------------------------------------------
-# Transformer Block with sandwich normalization
-# ---------------------------------------------------------------------------
-
-class TransformerBlock(nn.Module):
-    """Pre-norm + post-norm ("sandwich") on both attention and FFN sub-layers,
-    following Geiping et al. for recurrent-depth stability."""
-
+class MLP(nn.Module):
     def __init__(self, config: LoopLMConfig):
         super().__init__()
-        assert config.n_kv_heads is not None
-        assert config.ffn_hidden_dim is not None
+        assert config.intermediate_size is not None
+        self.gate_proj = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(config.dim, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.dim, bias=False)
+        self.act_fn = F.silu
 
-        self.pre_attn_norm = RMSNorm(config.dim, config.norm_eps)
-        self.attention = Attention(config.dim, config.n_heads, config.n_kv_heads)
-        self.post_attn_norm = RMSNorm(config.dim, config.norm_eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-        self.pre_ffn_norm = RMSNorm(config.dim, config.norm_eps)
-        self.feed_forward = FeedForward(config.dim, config.ffn_hidden_dim)
-        self.post_ffn_norm = RMSNorm(config.dim, config.norm_eps)
+
+# ---------------------------------------------------------------------------
+# Transformer Block with sandwich normalization  (matches OuroDecoderLayer)
+# ---------------------------------------------------------------------------
+
+class DecoderLayer(nn.Module):
+    """Pre-norm + post-norm ("sandwich") on both attention and FFN sub-layers,
+    following Geiping et al. for recurrent-depth stability.
+
+    Norm naming matches the official Ouro checkpoint:
+      input_layernorm / input_layernorm_2       — around attention
+      post_attention_layernorm / post_attention_layernorm_2 — around FFN
+    """
+
+    def __init__(self, config: LoopLMConfig, layer_idx: int):
+        super().__init__()
+        self.self_attn = Attention(config, layer_idx)
+        self.mlp = MLP(config)
+
+        self.input_layernorm = RMSNorm(config.dim, config.norm_eps)
+        self.input_layernorm_2 = RMSNorm(config.dim, config.norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.dim, config.norm_eps)
+        self.post_attention_layernorm_2 = RMSNorm(config.dim, config.norm_eps)
 
     def forward(
         self,
-        x: torch.Tensor,
-        freqs_cis: torch.Tensor,
-        mask: Optional[torch.Tensor] = None,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        h = x + self.post_attn_norm(
-            self.attention(self.pre_attn_norm(x), freqs_cis, mask)
+        # Attention with sandwich norm
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            hidden_states, position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
         )
-        out = h + self.post_ffn_norm(
-            self.feed_forward(self.pre_ffn_norm(h))
-        )
-        return out
+        hidden_states = self.input_layernorm_2(hidden_states)
+        hidden_states = residual + hidden_states
+
+        # FFN with sandwich norm
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_attention_layernorm_2(hidden_states)
+        hidden_states = residual + hidden_states
+
+        return hidden_states
 
 
 # ---------------------------------------------------------------------------
-# Exit Gate
-# ---------------------------------------------------------------------------
-
-class ExitGate(nn.Module):
-    """Produces per-token instantaneous exit probability lambda_t."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.linear = nn.Linear(dim, 1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.linear(x)).squeeze(-1)  # (B, S)
-
-
-# ---------------------------------------------------------------------------
-# LoopLM
+# LoopLM  (matches OuroModel + OuroForCausalLM structure)
 # ---------------------------------------------------------------------------
 
 class LoopLM(nn.Module):
     """Looped Language Model.
 
     A shared stack of ``n_layers`` transformer blocks is applied ``t_max``
-    times.  Each recurrent step produces next-token logits and an exit-gate
-    probability.
+    times.  Each recurrent step produces next-token logits and raw exit-gate
+    logits (sigmoid applied downstream in loss computation).
     """
 
     def __init__(self, config: LoopLMConfig):
         super().__init__()
         self.config = config
 
-        self.tok_embeddings = nn.Embedding(config.vocab_size, config.dim)
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.dim)
         self.layers = nn.ModuleList(
-            [TransformerBlock(config) for _ in range(config.n_layers)]
+            [DecoderLayer(config, layer_idx=i) for i in range(config.n_layers)]
         )
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
-        self.exit_gate = ExitGate(config.dim)
+        self.early_exit_gate = nn.Linear(config.dim, 1)
 
         if config.tie_embeddings:
-            self.lm_head.weight = self.tok_embeddings.weight
+            self.lm_head.weight = self.embed_tokens.weight
 
-        self.register_buffer(
-            "freqs_cis",
-            precompute_freqs_cis(
-                config.dim // config.n_heads,
-                config.max_seq_len,
-                config.rope_theta,
-            ),
-            persistent=False,
+        self.rotary_emb = RotaryEmbedding(
+            config.dim // config.n_heads,
+            max_seq_len=config.max_seq_len,
+            theta=config.rope_theta,
         )
 
     def forward(
@@ -271,25 +291,26 @@ class LoopLM(nn.Module):
         B, S = input_ids.shape
         t_max = t_max if t_max is not None else self.config.t_max
 
-        h = self.tok_embeddings(input_ids)
+        hidden_states = self.embed_tokens(input_ids)
 
-        freqs_cis = self.freqs_cis[:S].to(h.device)
+        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         step_logits: list[torch.Tensor] = []
-        step_gate_probs: list[torch.Tensor] = []
+        step_gate_logits: list[torch.Tensor] = []
 
         for _t in range(t_max):
             for layer in self.layers:
-                h = layer(h, freqs_cis)
+                hidden_states = layer(hidden_states, position_embeddings)
 
-            normed = self.norm(h)
-            step_logits.append(self.lm_head(normed))
-            step_gate_probs.append(self.exit_gate(normed))
+            hidden_states = self.norm(hidden_states)
+            step_logits.append(self.lm_head(hidden_states))
+            step_gate_logits.append(self.early_exit_gate(hidden_states))
 
         return LoopLMOutput(
             step_logits=step_logits,
-            step_gate_probs=step_gate_probs,
-            final_hidden=h,
+            step_gate_logits=step_gate_logits,
+            final_hidden=hidden_states,
         )
 
     # ------------------------------------------------------------------
@@ -308,29 +329,30 @@ class LoopLM(nn.Module):
         """
         t_max = t_max if t_max is not None else self.config.t_max
         B, S = input_ids.shape
-        h = self.tok_embeddings(input_ids)
-        freqs_cis = self.freqs_cis[:S].to(h.device)
+        hidden_states = self.embed_tokens(input_ids)
+        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        cdf = torch.zeros(B, S, device=h.device)
-        survival = torch.ones(B, S, device=h.device)
+        cdf = torch.zeros(B, S, device=hidden_states.device)
+        survival = torch.ones(B, S, device=hidden_states.device)
 
         for t in range(t_max):
             for layer in self.layers:
-                h = layer(h, freqs_cis)
+                hidden_states = layer(hidden_states, position_embeddings)
 
-            normed = self.norm(h)
-            logits = self.lm_head(normed)
-            lam = self.exit_gate(normed)  # (B, S)
+            hidden_states = self.norm(hidden_states)
+            logits = self.lm_head(hidden_states)
+            lam = torch.sigmoid(self.early_exit_gate(hidden_states).squeeze(-1))
 
             if t < t_max - 1:
                 p_t = lam * survival
                 survival = survival * (1 - lam)
             else:
-                p_t = survival  # remaining mass at final step
+                p_t = survival
 
             cdf = cdf + p_t
 
-            if (cdf.mean() >= q_threshold):
+            if cdf.mean() >= q_threshold:
                 return logits, t + 1
 
         return logits, t_max

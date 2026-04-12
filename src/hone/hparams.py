@@ -90,7 +90,7 @@ def create_namespace(hparams: dict) -> SimpleNamespace:
         n_layers=ns.num_hidden_layers,
         n_heads=ns.num_attention_heads,
         n_kv_heads=getattr(ns, "num_key_value_heads", ns.num_attention_heads),
-        ffn_hidden_dim=getattr(ns, "intermediate_size", None),
+        intermediate_size=getattr(ns, "intermediate_size", None),
         norm_eps=getattr(ns, "rms_norm_eps", 1e-5),
         rope_theta=getattr(ns, "rope_theta", 10000.0),
         max_seq_len=ns.sequence_length,

@@ -6,6 +6,9 @@ Language Models" (arXiv:2510.25741):
   Stage I  — Entropy-regularized pre-training (Eq. 4)
   Stage II — Focused adaptive gate training  (Eq. 6)
   SFT      — Standard cross-entropy on the final recurrent step
+
+Gate logits are stored raw (pre-sigmoid) in LoopLMOutput to match the official
+Ouro checkpoint convention.  Sigmoid is applied inside these loss functions.
 """
 
 from __future__ import annotations
@@ -20,31 +23,40 @@ from .model import LoopLMOutput
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _compute_exit_distribution(
-    step_gate_probs: list[torch.Tensor],
+def _gate_logits_to_lambdas(
+    step_gate_logits: list[torch.Tensor],
 ) -> torch.Tensor:
-    """Convert per-step instantaneous exit probs lambda_t into a valid
-    discrete distribution p(t|x) over exit steps (Eq. 3).
+    """Convert raw gate logits to per-step exit probabilities lambda_t.
+
+    Returns:
+        lam: (T, B, S) tensor with values in (0, 1).
+    """
+    # Each gate logit is (B, S, 1); squeeze and sigmoid
+    return torch.stack(
+        [torch.sigmoid(g.squeeze(-1)) for g in step_gate_logits], dim=0
+    )  # (T, B, S)
+
+
+def _compute_exit_distribution(
+    step_gate_logits: list[torch.Tensor],
+) -> torch.Tensor:
+    """Convert per-step raw gate logits into a valid discrete distribution
+    p(t|x) over exit steps (Eq. 3).
 
     Args:
-        step_gate_probs: List of T tensors, each (B, S) with values in (0,1).
+        step_gate_logits: List of T tensors, each (B, S, 1) raw logits.
 
     Returns:
         p_exit: (T, B, S) tensor where p_exit[t] is the probability of
                 exiting at step t, summing to 1 over the T dimension.
     """
-    T = len(step_gate_probs)
-    device = step_gate_probs[0].device
-    dtype = step_gate_probs[0].dtype
-
-    lam = torch.stack(step_gate_probs, dim=0)  # (T, B, S)
+    lam = _gate_logits_to_lambdas(step_gate_logits)  # (T, B, S)
 
     # Clamp to avoid log(0) / division-by-zero
     lam = lam.clamp(1e-6, 1.0 - 1e-6)
 
     # Survival: S_t = prod_{j=1}^{t} (1 - lambda_j)
     log_survival = torch.cumsum(torch.log(1.0 - lam), dim=0)  # (T, B, S)
-    # S_0 = 1, S_1 = 1-lam1, S_2 = (1-lam1)(1-lam2), ...
     # Shift right so prev_survival[t] = S_{t-1}
     prev_log_survival = torch.zeros_like(log_survival)
     prev_log_survival[1:] = log_survival[:-1]
@@ -123,7 +135,7 @@ def looplm_stage1_loss(
 
     L = sum_t p(t|x) * L^(t) - beta * H(p(.|x))
 
-    The exit distribution p(t|x) is derived from the gate probs via Eq. 3.
+    The exit distribution p(t|x) is derived from raw gate logits via Eq. 3.
     The entropy term prevents collapse to always using T_max.
     """
     # Per-step per-token CE: (T, B, S)
@@ -131,7 +143,7 @@ def looplm_stage1_loss(
         output.step_logits, labels
     )
     # Exit distribution: (T, B, S)
-    p_exit = _compute_exit_distribution(output.step_gate_probs)
+    p_exit = _compute_exit_distribution(output.step_gate_logits)
 
     # Expected task loss: sum_t p(t) * L(t)  — per-token then mean
     expected_loss = (p_exit * per_token_losses).sum(dim=0)  # (B, S)
@@ -173,6 +185,9 @@ def looplm_stage2_loss(
     per_token_losses = _per_step_per_token_cross_entropy(detached_logits, labels)
     # (T, B, S)
 
+    # Convert raw gate logits to lambda_t
+    lam = _gate_logits_to_lambdas(output.step_gate_logits)  # (T, B, S)
+
     valid_mask = (labels != -100).float()  # (B, S)
     n_valid = valid_mask.sum().clamp(min=1.0)
 
@@ -189,7 +204,7 @@ def looplm_stage2_loss(
         w = torch.sigmoid(k * (improvement - gamma))
 
         # Gate continuation probability: 1 - lambda_t
-        lam_t = output.step_gate_probs[t]  # (B, S)
+        lam_t = lam[t]  # (B, S)
         cont_prob = (1.0 - lam_t).clamp(1e-6, 1.0 - 1e-6)
         lam_t_clamped = lam_t.clamp(1e-6, 1.0 - 1e-6)
 

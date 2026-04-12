@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# © 2025 hone.ai
+# © 2025 hone.training
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 # documentation files (the "Software"), to deal in the Software without restriction, including without limitation
@@ -491,6 +491,15 @@ class Validator(BaseNode, Trainer):
         else:
             self.wandb = NullMetricsLogger()
             self.metrics_logger = NullMetricsLogger()
+
+        # Dashboard reporter
+        self.dashboard_reporter = hone.DashboardReporter(
+            hotkey=str(self.wallet.hotkey.ss58_address),
+            role="validator",
+            netuid=self.config.netuid,
+            uid=self.uid,
+            version=hone.__version__,
+        )
 
         # Weighted selection counters for fair picking of eval peers
         self.eval_peers = defaultdict(lambda: 1)
@@ -1168,6 +1177,8 @@ class Validator(BaseNode, Trainer):
         self.loop = asyncio.get_running_loop()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=CPU_COUNT)
         self.loop.set_default_executor(self.executor)
+
+        await self.dashboard_reporter.register_run()
 
         # Use config peers if provided
         if self.config.peers:
@@ -2749,6 +2760,73 @@ class Validator(BaseNode, Trainer):
                     with_system_metrics=True,
                     with_gpu_metrics=True,
                 )
+                # Dashboard reporter
+                dashboard_uid_scores = []
+                for eval_uid in sorted(self.evaluated_uids):
+                    if 0 <= eval_uid < self.gradient_scores.numel():
+                        dashboard_uid_scores.append(
+                            {
+                                "uid": int(eval_uid),
+                                "gradientScore": float(self.gradient_scores[eval_uid].item()),
+                                "binaryIndicator": float(self.binary_indicator_scores[eval_uid].item()),
+                                "binaryMovingAvg": float(self.binary_moving_averages[eval_uid].item()),
+                                "syncScore": float(self.sync_scores[eval_uid].item()),
+                                "finalScore": float(self.final_scores[eval_uid].item()),
+                                "weight": float(self.weights[eval_uid].item()),
+                            }
+                        )
+                        if eval_uid in self.openskill_ratings:
+                            r = self.openskill_ratings[eval_uid]
+                            dashboard_uid_scores[-1].update(
+                                {
+                                    "openskillMu": float(r.mu),
+                                    "openskillSigma": float(r.sigma),
+                                    "openskillOrdinal": float(r.ordinal()),
+                                }
+                            )
+
+                asyncio.create_task(
+                    self.dashboard_reporter.report_window(
+                        window=int(self.sync_window),
+                        global_step=int(self.global_step),
+                        block=int(self.current_block),
+                        loss_own_before=float(avg_loss_before_per_batch_own),
+                        loss_own_after=float(avg_loss_after_per_batch_own),
+                        loss_random_before=float(avg_loss_before_per_batch_random),
+                        loss_random_after=float(avg_loss_after_per_batch_random),
+                        loss_own_improvement=float(self.relative_improvement_own),
+                        loss_random_improvement=float(self.relative_improvement_random),
+                        outer_lr=float(self.lr),
+                        inner_lr=float(current_inner_lr),
+                        active_miners=int(len(self.comms.active_peers)),
+                        gather_success_rate=gather_success_rate,
+                        gather_peers=int(len(actual_gather_uids)),
+                        positive_peers_ratio=float(gather_peers_positive_ratio * 100),
+                        reserve_used=int(reserve_used),
+                        overlap_mean=float(idx_overlap["mean_overlap"]),
+                        overlap_max=float(idx_overlap["max_overlap"]),
+                        overlap_pairs_checked=int(idx_overlap["pairs_checked"]),
+                        timing_window_total=float(window_total_time),
+                        timing_peer_update=float(peer_update_time),
+                        timing_gather=float(gather_time),
+                        timing_evaluation=float(evaluation_time),
+                        timing_model_update=float(model_update_time),
+                        evaluated_uids=int(len(self.evaluated_uids)),
+                        total_negative_evals=int(total_negative_evals),
+                        total_excluded=int(total_excluded_peers),
+                        uid_scores=dashboard_uid_scores,
+                        gradient_stats={
+                            "mean_grad_norm": mean_grad_norm,
+                            "max_grad_norm": max_grad_norm,
+                            "min_grad_norm": min_grad_norm,
+                            "median_grad_norm": median_grad_norm,
+                            "grad_norm_std": grad_norm_std,
+                            "mean_weight_norm": mean_weight_norm,
+                            "grad_to_weight_ratio": grad_to_weight_ratio,
+                        },
+                    )
+                )
+
                 hone.log_with_context(
                     level="info",
                     message="Finished metrics logging call for validator",
