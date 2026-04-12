@@ -1,5 +1,5 @@
 # The MIT License (MIT)
-# © 2025 hone.ai
+# © 2025 hone.training
 
 # Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated
 # documentation files (the "Software"), to deal in the Software without restriction, including without limitation
@@ -334,6 +334,15 @@ class Miner(BaseNode, Trainer):
                 job_type="mining",
             )
 
+        # Dashboard reporter
+        self.dashboard_reporter = hone.DashboardReporter(
+            hotkey=str(self.wallet.hotkey.ss58_address),
+            role="miner",
+            netuid=self.config.netuid,
+            uid=self.uid,
+            version=hone.__version__,
+        )
+
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
         self.next_reserve_peers: list[int] | None = None
@@ -368,6 +377,8 @@ class Miner(BaseNode, Trainer):
         self.loop = asyncio.get_running_loop()
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=CPU_COUNT)
         self.loop.set_default_executor(self.executor)
+
+        await self.dashboard_reporter.register_run()
 
         # Use config peers if provided
         if self.config.peers:
@@ -962,6 +973,36 @@ class Miner(BaseNode, Trainer):
                         "tokens_per_sec": tokens_per_sec,
                     },
                 )
+                # Dashboard reporter
+                asyncio.create_task(
+                    self.dashboard_reporter.report_miner(
+                        window=int(self.current_window),
+                        global_step=int(self.global_step),
+                        loss=float(window_entry_loss) if window_entry_loss else None,
+                        window_entry_loss=float(window_entry_loss) if window_entry_loss else None,
+                        tokens_per_sec=float(tokens_per_sec),
+                        batch_tokens=int(window_tokens),
+                        grad_norm=float(global_grad_norm),
+                        weight_norm=float(global_weight_norm),
+                        momentum_norm=float(mean_momentum_norm),
+                        gather_success_rate=float(gather_success_rate),
+                        gather_peers=int(len(self.comms.peers)),
+                        gpu_memory_allocated=float(torch.cuda.memory_allocated() / 1024**2),
+                        gpu_memory_cached=float(torch.cuda.memory_reserved() / 1024**2),
+                        inner_lr=float(inner_lr),
+                        timing={
+                            "window_total": float(window_total_time),
+                            "peer_update": float(peer_update_time),
+                            "data_loading": float(data_loading_time),
+                            "training": float(training_time),
+                            "compression": float(compression_time),
+                            "gather": float(gather_time),
+                            "put": float(put_time),
+                            "model_update": float(model_update_time),
+                        },
+                    )
+                )
+
                 hone.logger.info("Finished metrics logging call for miner")
 
             # global_step is now incremented only when outer_step is performed

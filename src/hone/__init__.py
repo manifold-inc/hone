@@ -15,5 +15,6 @@ from .sharded_sampler import EvalSampler, MinerSampler
 from .checkpoint import DCPCheckpointer
 from .model import LoopLM, LoopLMConfig, LoopLMOutput
 from .loss import compute_looplm_loss
+from .reporter import DashboardReporter
 from . import muon
 from . import distributed
