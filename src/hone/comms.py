@@ -73,9 +73,12 @@ def _validate(state_dict: dict[str, CompressedTensor], chunk_size: int) -> bool:
         if not torch.isfinite(ct.quant_params).all():
             return False
         idx = ct.indices
-        if idx.numel() and ((idx.long() >= chunk_size).any() or (idx.long() < 0).any()):
+        if idx.numel() and (idx.long() >= chunk_size).any():
             return False
-        if int(ct.numel) != int(torch.tensor(ct.shape).prod().item()):
+        expected_numel = 1
+        for d in ct.shape:
+            expected_numel *= d
+        if int(ct.numel) != expected_numel:
             return False
     return True
 

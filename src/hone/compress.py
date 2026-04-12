@@ -25,7 +25,7 @@ def chunk_topk(tensor: Tensor, k: int, chunk_size: int) -> tuple[Tensor, Tensor,
     chunks = flat.view(n_chunks, chunk_size)
     _, idx = torch.topk(chunks.abs(), k, dim=1, largest=True, sorted=False)
     vals = torch.gather(chunks, 1, idx)
-    return idx.to(torch.uint16), vals, n_chunks
+    return idx.to(torch.int16), vals, n_chunks
 
 
 def quantize_2bit(values: Tensor) -> tuple[Tensor, Tensor]:

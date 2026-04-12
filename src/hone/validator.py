@@ -125,7 +125,8 @@ class Validator:
         shards = load_shards(self.config.dataset_bins_path)
         self._eval_loader = build_dataloader(self.config, shards, seed=0, shuffle=True)
         self._eval_iter = iter(self._eval_loader)
-        assert mg is not None
+        if mg is None:
+            raise RuntimeError("Metagraph not loaded after connect()")
         n_uids = _metagraph_n(mg)
         self.verifier = GradientVerifier(self.config)
         self.scorer = Scorer(self.config, max_uids=max(n_uids, 256), device=self._device)
@@ -141,8 +142,8 @@ class Validator:
                 {
                     "account_id": c.r2_gradients_account_id,
                     "bucket_name": c.r2_gradients_bucket_name,
-                    "access_key_id": c.r2_gradients_write_access_key_id,
-                    "secret_access_key": c.r2_gradients_write_secret_access_key,
+                    "access_key_id": c.r2_gradients_read_access_key_id,
+                    "secret_access_key": c.r2_gradients_read_secret_access_key,
                 }
             )
 

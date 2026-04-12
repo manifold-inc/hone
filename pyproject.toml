@@ -4,10 +4,11 @@ version = "0.1.0"
 description = "Slim SparseLoCo distributed training for Bittensor subnet 5"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.7",
+    "torch>=2.5",
     "transformers>=4.50",
     "bittensor>=9.10",
     "bittensor-wallet>=4.0",
+    "boto3>=1.35",
     "aioboto3>=13.0",
     "zstandard>=0.23",
     "openskill>=6.0",

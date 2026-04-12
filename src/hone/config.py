@@ -5,14 +5,14 @@ from __future__ import annotations
 import os
 from typing import Any
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
 class HoneConfig(BaseSettings):
     """Merged config from CLI args, env vars, and on-chain hparams."""
 
-    model_config = {"env_prefix": "HONE_", "extra": "ignore"}
+    model_config = {"env_prefix": "HONE_", "extra": "ignore", "env_file": ".env", "env_file_encoding": "utf-8"}
 
     # --- Subnet ---
     netuid: int = 5
@@ -54,7 +54,7 @@ class HoneConfig(BaseSettings):
     ef_freeze_pct: float = 0.05
 
     # --- FSDP ---
-    fsdp_enabled: bool = True
+    fsdp_enabled: bool = False
 
     # --- Validator ---
     validator_offset: int = 1
@@ -82,8 +82,14 @@ class HoneConfig(BaseSettings):
     dataset_bins_path: str = "/tmp/hone/dataset"
 
     # --- Hone API ---
-    hone_api_url: str = "http://localhost:3001"
-    hone_api_key: str = ""
+    hone_api_url: str = Field(
+        default="http://localhost:3001",
+        validation_alias=AliasChoices("hone_api_url", "HONE_API_URL"),
+    )
+    hone_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("hone_api_key", "HONE_API_KEY"),
+    )
 
     @property
     def r2_gradients_endpoint(self) -> str:
