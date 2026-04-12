@@ -1,94 +1,36 @@
+[project]
+name = "hone"
+version = "0.1.0"
+description = "Slim SparseLoCo distributed training for Bittensor subnet 5"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.7",
+    "transformers>=4.50",
+    "bittensor>=9.10",
+    "bittensor-wallet>=4.0",
+    "aioboto3>=13.0",
+    "zstandard>=0.23",
+    "openskill>=6.0",
+    "pyarrow>=18.0",
+    "numpy>=1.26",
+    "aiohttp>=3.10",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.8"]
+
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=75"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where   = ["src", "."]
-include = ["hone*", "neurons*"]
-
-[project]
-name = "hone"
-description = "LoopLM — Incentivised Internet-Wide Training with Looped Language Models"
-readme = "README.md"
-dynamic = ["version"]
-requires-python = ">=3.11"
-dependencies = [
-    "bittensor>=9.10.1",
-    "bt-decode",
-    "torch>=2.7.1",
-    "boto3",
-    "einops",
-    "aiofiles==24.1.0",
-    "aioboto3==13.2.0",
-    "transformers",
-    "wandb",
-    "python-dotenv",
-    "zstandard",
-    "s3fs",
-    "pyarrow",
-    "scipy",
-    "rich>=13.0.0",
-    "lm-eval>=0.4.8",
-    "psutil>=7.0.0",
-    "influxdb-client>=1.48.0",
-    "multiprocessing-logging>=0.3.4",
-    "python-logging-loki>=0.3.1",
-    "uvloop>=0.21.0",
-    "openskill>=6.0.2",
-    "dnspython>=2.7.0",
-    "pydantic>=2.11.7",
-]
-
-[tool.setuptools.dynamic]
-version = {attr = "hone.__version__"}
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=7.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.1.0",
-    "pytest-mock>=3.14.0",
-    "pytest-xdist",
-    "pytest-dotenv",
-    "ruff",
-    "ipykernel",
-    "ipython",
-    "bittensor-cli>=9.11.0",
-]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-python_files = "test_*.py"
-addopts = "-v -s --capture=no --log-cli-level=INFO"
-asyncio_mode = "auto"
-markers = [
-    "asyncio: mark test as async",
-]
-filterwarnings = [
-    "ignore::DeprecationWarning",
-    "ignore::PendingDeprecationWarning",
-    "ignore::FutureWarning",
-    "default::RuntimeWarning",
-    "default::UserWarning",
-]
-
-[tool.uv]
-prerelease = "allow"
+where = ["src"]
 
 [tool.ruff]
-exclude = [
-    ".git",
-    "venv",
-    ".venv",
-    "node_modules",
-    "build",
-    "dist",
-    "__pycache__",
-]
+line-length = 100
+target-version = "py311"
 
 [tool.ruff.lint]
-select = ["I"]
-
-[tool.ruff.lint.isort]
-known-first-party = ["hone", "neurons", "tests"]
-known-third-party = ["wandb"]
+select = ["E", "F", "W", "I"]
