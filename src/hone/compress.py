@@ -351,19 +351,25 @@ class TopKCompressor(Generic[Q]):
 
     def _clamp_topk(self, x, topk) -> int:
         """
-        Clamp the top-k value to be within the valid range and ensure it's even.
+        Clamp the top-k value to be within the valid range.
+
+        For dims >= 2 the result is even (required by 12-bit index packing).
+        For dim == 1 the result is 1; the caller pads to even before packing.
 
         Args:
             x (torch.Tensor): The input tensor.
             topk (int): The desired top-k value.
 
         Returns:
-            int: The clamped and even top-k value.
+            int: The clamped top-k value, guaranteed <= dim.
         """
-        topk = min(topk, x.shape[-1])
-        topk = max(topk, 2)
-        # Ensure topk is even for 12-bit packing efficiency
-        topk = topk - (topk % 2)
+        dim = x.shape[-1]
+        topk = min(topk, dim)
+        topk = max(topk, 1)
+        if dim >= 2:
+            # Ensure topk is even for 12-bit packing efficiency
+            topk = topk - (topk % 2)
+            topk = max(topk, 2)
         return int(topk)
 
     # ------------------------------------------------------------------ #
@@ -410,6 +416,13 @@ class TopKCompressor(Generic[Q]):
             x.abs(), k=topk, dim=-1, largest=True, sorted=False
         ).indices
         val = torch.gather(x, dim=-1, index=idx_int64)
+
+        # 12-bit packing requires an even number of indices per row.
+        # For very small dims (e.g. bias of shape (1,)), topk may be odd;
+        # duplicate the last entry so scatter_reduce mean is unchanged.
+        if topk % 2 != 0:
+            idx_int64 = torch.cat([idx_int64, idx_int64[..., -1:]], dim=-1)
+            val = torch.cat([val, val[..., -1:]], dim=-1)
 
         # Pack indices into 12-bit representation for efficient storage
         # This reduces storage by 25% compared to int16
