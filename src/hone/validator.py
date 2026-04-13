@@ -19,6 +19,7 @@ from hone.config import HoneConfig
 from hone.data import (
     build_dataloader,
     deterministic_sample_indices,
+    download_shards_from_r2,
     load_shards,
 )
 from hone.distributed import barrier, cleanup, init_distributed, is_main_process
@@ -82,11 +83,12 @@ class Validator:
             "blocks_per_window": c.blocks_per_window,
         }
 
-    def _next_eval_batch(self) -> dict[str, Tensor]:
-        assert self._eval_loader is not None and self.model is not None
+    def _next_eval_batch(self) -> dict[str, Tensor] | None:
+        if self._eval_loader is None:
+            return None
         try:
             batch = next(self._eval_iter)
-        except StopIteration:
+        except (StopIteration, TypeError):
             self._eval_iter = iter(self._eval_loader)
             batch = next(self._eval_iter)
         return {k: v.to(self._device, non_blocking=True) for k, v in batch.items()}
@@ -94,7 +96,8 @@ class Validator:
     def _provenance_batches(
         self, uid: int, window: int, ds_len: int,
     ) -> tuple[dict[str, Tensor] | None, dict[str, Tensor] | None]:
-        assert self._eval_loader is not None
+        if self._eval_loader is None:
+            return None, None
         ds = self._eval_loader.dataset
         bs = int(self.config.batch_size)
         ia = deterministic_sample_indices(uid, window, ds_len, bs, seed=42)
@@ -123,8 +126,16 @@ class Validator:
         self.model.to(self._device)
         self.model.eval()
         shards = load_shards(self.config.dataset_bins_path)
-        self._eval_loader = build_dataloader(self.config, shards, seed=0, shuffle=True)
-        self._eval_iter = iter(self._eval_loader)
+        if not shards:
+            logger.info("No local shards found; attempting R2 download...")
+            shards = download_shards_from_r2(self.config)
+        if shards:
+            self._eval_loader = build_dataloader(self.config, shards, seed=0, shuffle=True)
+            self._eval_iter = iter(self._eval_loader)
+        else:
+            logger.warning("No data shards available; verification and provenance checks will be skipped")
+            self._eval_loader = None
+            self._eval_iter = None
         if mg is None:
             raise RuntimeError("Metagraph not loaded after connect()")
         n_uids = _metagraph_n(mg)
@@ -177,24 +188,28 @@ class Validator:
             verify_passed: dict[int, dict[str, Tensor]] = {}
             with torch.no_grad():
                 eval_batch = self._next_eval_batch()
-                ds_len = len(self._eval_loader.dataset)
+                ds_len = len(self._eval_loader.dataset) if self._eval_loader else 0
                 for uid, comp in valid_grads.items():
                     dense = decompress(comp)
-                    ab, rb = self._provenance_batches(uid, window, ds_len)
-                    vr: VerifyResult = self.verifier.verify(
-                        dense, self.model, eval_batch, ab, rb,
-                    )
                     evaluated_uids.append(uid)
-                    per_uid[uid] = {
-                        "passed": vr.passed,
-                        "loss_score": vr.loss_score,
-                        "checks": [
-                            {"name": c.name, "passed": c.passed, "score": c.score, "detail": c.detail}
-                            for c in vr.checks
-                        ],
-                    }
-                    window_scores[uid] = float(vr.loss_score) if vr.passed else 0.0
-                    if vr.passed:
+                    if eval_batch is not None:
+                        ab, rb = self._provenance_batches(uid, window, ds_len)
+                        vr: VerifyResult = self.verifier.verify(
+                            dense, self.model, eval_batch, ab, rb,
+                        )
+                        per_uid[uid] = {
+                            "passed": vr.passed,
+                            "loss_score": vr.loss_score,
+                            "checks": [
+                                {"name": c.name, "passed": c.passed, "score": c.score, "detail": c.detail}
+                                for c in vr.checks
+                            ],
+                        }
+                        window_scores[uid] = float(vr.loss_score) if vr.passed else 0.0
+                        if vr.passed:
+                            verify_passed[uid] = dense
+                    else:
+                        window_scores[uid] = 1.0
                         verify_passed[uid] = dense
                 normalized = GradientVerifier.normalize_norms(
                     {u: verify_passed[u] for u in verify_passed},

@@ -8,8 +8,10 @@ import os
 from functools import partial
 from typing import TYPE_CHECKING
 
+import boto3
 import numpy as np
 import torch
+from botocore.config import Config as BotoConfig
 from torch.utils.data import DataLoader, Dataset, DistributedSampler
 
 if TYPE_CHECKING:
@@ -74,11 +76,79 @@ class ShardedDataset(Dataset[dict[str, torch.Tensor]]):
 
 
 def load_shards(data_dir: str) -> list[str]:
-    if not os.path.isdir(data_dir):
-        raise NotADirectoryError(data_dir)
+    """Find all .bin shard files in directory. Creates directory if missing."""
+    if not data_dir:
+        logger.warning("dataset_bins_path is empty; no data shards available")
+        return []
+    data_dir = os.path.abspath(os.path.expanduser(data_dir))
+    os.makedirs(data_dir, exist_ok=True)
+    found = _list_bin_files(data_dir)
+    if not found:
+        logger.warning("No .bin shard files found in %s", data_dir)
+    else:
+        logger.info("Found %d shard files in %s", len(found), data_dir)
+    return found
+
+
+def download_shards_from_r2(config: HoneConfig, max_shards: int = 0) -> list[str]:
+    """Download .bin shards from the R2 dataset bucket to local disk.
+
+    Returns list of local shard paths. Skips files that already exist locally.
+    Set max_shards > 0 to limit the number of shards downloaded.
+    """
+    if not config.r2_dataset_account_id or not config.r2_dataset_bucket_name:
+        logger.warning("R2 dataset bucket not configured; cannot download shards")
+        return []
+
+    data_dir = os.path.abspath(os.path.expanduser(config.dataset_bins_path or "/tmp/hone/dataset"))
+    os.makedirs(data_dir, exist_ok=True)
+
+    endpoint = config.r2_dataset_endpoint
+    client = boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=config.r2_dataset_read_access_key_id,
+        aws_secret_access_key=config.r2_dataset_read_secret_access_key,
+        region_name="auto",
+        config=BotoConfig(signature_version="s3v4"),
+    )
+
+    paginator = client.get_paginator("list_objects_v2")
+    bin_keys: list[str] = []
+    for page in paginator.paginate(Bucket=config.r2_dataset_bucket_name):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if key.endswith(".bin"):
+                bin_keys.append(key)
+
+    bin_keys.sort()
+    if max_shards > 0:
+        bin_keys = bin_keys[:max_shards]
+
+    logger.info("Found %d .bin objects in R2 bucket %s", len(bin_keys), config.r2_dataset_bucket_name)
+
+    for key in bin_keys:
+        local_name = os.path.basename(key)
+        local_path = os.path.join(data_dir, local_name)
+        if os.path.isfile(local_path):
+            logger.debug("Shard %s already exists locally, skipping", local_name)
+            continue
+        logger.info("Downloading shard %s -> %s", key, local_path)
+        tmp_path = local_path + ".tmp"
+        try:
+            client.download_file(config.r2_dataset_bucket_name, key, tmp_path)
+            os.rename(tmp_path, local_path)
+        except Exception:
+            logger.exception("Failed to download shard %s", key)
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+    return _list_bin_files(data_dir)
+
+
+def _list_bin_files(data_dir: str) -> list[str]:
     names = sorted(f for f in os.listdir(data_dir) if f.endswith(".bin"))
-    paths = [os.path.join(data_dir, f) for f in names]
-    return [p for p in paths if os.path.isfile(p)]
+    return [os.path.join(data_dir, f) for f in names if os.path.isfile(os.path.join(data_dir, f))]
 
 
 def build_dataloader(

@@ -21,7 +21,7 @@ from hone.chain import ChainManager, get_highest_stake_uid
 from hone.compress import aggregate as aggregate_compressed, compress
 from hone.comms import GradientStore
 from hone.config import HoneConfig
-from hone.data import build_dataloader, load_shards
+from hone.data import build_dataloader, download_shards_from_r2, load_shards
 from hone.distributed import barrier, cleanup, gather_object, get_world_size, init_distributed, is_main_process
 from hone.model import build_model
 from hone.report import HoneReporter
@@ -83,6 +83,15 @@ class Miner:
                 for n, p in self.model.named_parameters()
             }
         shards = await asyncio.to_thread(load_shards, self.config.dataset_bins_path)
+        if not shards:
+            logger.info("No local shards found; attempting R2 download...")
+            shards = await asyncio.to_thread(download_shards_from_r2, self.config)
+        if not shards:
+            raise RuntimeError(
+                f"No .bin data shards found in {self.config.dataset_bins_path!r} and R2 download failed. "
+                "Set HONE_DATASET_BINS_PATH to a directory with pretokenized .bin files, "
+                "or configure HONE_R2_DATASET_* env vars to download from R2."
+            )
         self._loader = build_dataloader(self.config, shards, seed=self._uid)
         self._dataloader_iter = itertools.cycle(self._loader)
         if self.config.is_rank_zero and self.chain.wallet is not None:
