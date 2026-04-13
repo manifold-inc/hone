@@ -263,7 +263,7 @@ class Validator(BaseNode, Trainer):
         bt.Subtensor.add_args(parser)
         bt.logging.add_args(parser)
         bt.Wallet.add_args(parser)
-        config = bt.config(parser)
+        config = bt.Config(parser)
         if config.debug:
             hone.debug()
         if config.trace:
