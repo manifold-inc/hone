@@ -109,21 +109,32 @@ class ChainManager:
         _retry(lambda: commit_fn(self.wallet, self.config.netuid, data))
 
     def get_commitments(self) -> dict[int, dict[str, str]]:
+        """Read bucket commitments from chain. Falls back to empty dict on errors."""
         if not self.subtensor or not self.metagraph:
-            raise RuntimeError("not connected")
+            return {}
         out: dict[int, dict[str, str]] = {}
         keys = ("account_id", "bucket_name", "access_key_id", "secret_access_key")
         n = int(np.asarray(self.metagraph.n).item())
+        errors = 0
         for uid in range(n):
             try:
                 raw = self.subtensor.get_commitment(self.config.netuid, uid)
             except Exception:
+                errors += 1
+                if errors >= 3:
+                    logger.warning(
+                        "Too many errors reading commitments (%d); stopping at uid %d/%d",
+                        errors, uid, n,
+                    )
+                    break
                 continue
             if not raw:
                 continue
             parts = raw.split(":", 3)
             if len(parts) == 4 and all(parts):
                 out[uid] = dict(zip(keys, parts))
+        if errors > 0:
+            logger.info("Read %d commitments with %d errors", len(out), errors)
         return out
 
     def commit_hparams(self, hparams: dict[str, Any]) -> None:

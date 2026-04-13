@@ -160,8 +160,11 @@ class Miner:
         self.outer_step += 1
         if self.config.is_rank_zero:
             await self.reporter.report_miner(
-                window=window, uid=self._uid, avg_loss=avg_loss, tokens_per_sec=tps,
-                total_tokens=total_tokens, outer_step=self.outer_step,
+                window=window,
+                global_step=self.outer_step,
+                loss=avg_loss,
+                tokens_per_sec=tps,
+                batch_tokens=total_tokens,
             )
 
     def _inner_training(self) -> tuple[float, float, int]:

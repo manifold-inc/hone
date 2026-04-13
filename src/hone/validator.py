@@ -244,17 +244,25 @@ class Validator:
             self.current_window = window
             dt = time.perf_counter() - t0
             if is_main_process():
+                scores_list = [
+                    {
+                        "uid": uid,
+                        "gradientScore": info.get("loss_score"),
+                        "finalScore": float(self.scorer.final_scores[uid].item()) if self.scorer and uid < self.scorer.max_uids else None,
+                        "weight": float(self.scorer.weights[uid].item()) if self.scorer and uid < self.scorer.max_uids else None,
+                    }
+                    for uid, info in per_uid.items()
+                ] if per_uid else None
                 await self.reporter.report_window(
                     window=window,
-                    outer_step=self.outer_step,
-                    wall_time_s=dt,
-                    peer_time_s=t_peer - t0,
-                    gather_time_s=t_gather - t_peer,
-                    eval_time_s=t_eval - t_gather,
-                    update_time_s=t_update - t_eval,
-                    gather_ok=len(valid_grads),
-                    gather_skipped=len(skipped),
-                    per_uid_scores=per_uid,
+                    global_step=self.outer_step,
+                    gather_peers=len(valid_grads),
+                    gather_success_rate=len(valid_grads) / max(len(valid_grads) + len(skipped), 1),
+                    timing_window_total=dt,
+                    timing_gather=t_gather - t_peer,
+                    timing_evaluation=t_eval - t_gather,
+                    timing_model_update=t_update - t_eval,
+                    uid_scores=scores_list,
                     gradient_stats=grad_stats,
                 )
             self.outer_step += 1
