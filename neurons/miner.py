@@ -55,6 +55,11 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+class NullMetricsLogger:
+    def log(self, *_args, **_kwargs) -> None:
+        return
+
+
 class Miner(BaseNode, Trainer):
     def log_gpu_memory(self, stage: str):
         """Log current GPU memory allocation and reservation"""
@@ -313,26 +318,10 @@ class Miner(BaseNode, Trainer):
         # Track additional metrics
         self.total_tokens_processed = 0
 
-        if self.is_master:
-            # Initialize WandB
-            self.wandb = hone.initialize_wandb(
-                run_prefix="M",
-                uid=self.uid,
-                config=self.config,
-                group="miner",
-                job_type="mining",
-            )
-            hone.logger.info("[Init] WandB session started")
-
-            # Initialize metrics logger for InfluxDB
-            self.metrics_logger = hone.metrics.MetricsLogger(
-                prefix="M",
-                uid=self.uid,
-                config=self.config,
-                role="miner",
-                group="miner",
-                job_type="mining",
-            )
+        # Metrics are reported via DashboardReporter → hone-api.
+        # WandB / InfluxDB disabled; use NullMetricsLogger as a no-op sink.
+        self.wandb = NullMetricsLogger()
+        self.metrics_logger = NullMetricsLogger()
 
         # Dashboard reporter
         self.dashboard_reporter = hone.DashboardReporter(

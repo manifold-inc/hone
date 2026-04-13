@@ -470,27 +470,10 @@ class Validator(BaseNode, Trainer):
         self.window_step = 0
         self.eval_count = 0
 
-        # Initialize WandB and metrics logger only on the master rank
-        if self.is_master:
-            self.wandb = hone.initialize_wandb(
-                run_prefix="V",
-                uid=self.uid,
-                config=self.config,
-                group="validator",
-                job_type="validation",
-            )
-
-            self.metrics_logger = hone.metrics.MetricsLogger(
-                prefix="V",
-                uid=self.uid,
-                config=self.config,
-                role="validator",
-                group="validator",
-                job_type="validation",
-            )
-        else:
-            self.wandb = NullMetricsLogger()
-            self.metrics_logger = NullMetricsLogger()
+        # Metrics are reported via DashboardReporter → hone-api.
+        # WandB / InfluxDB disabled; use NullMetricsLogger as a no-op sink.
+        self.wandb = NullMetricsLogger()
+        self.metrics_logger = NullMetricsLogger()
 
         # Dashboard reporter
         self.dashboard_reporter = hone.DashboardReporter(
