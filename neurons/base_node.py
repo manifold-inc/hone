@@ -148,7 +148,7 @@ class BaseNode(abc.ABC):
         max_delay: float = 60.0,
     ) -> float | None:
         if self.subtensor_client is None:
-            self.subtensor_client = bt.subtensor(config=self.config)
+            self.subtensor_client = bt.Subtensor(config=self.config)
 
         delay = init_delay
         for attempt in range(1, retries + 1):
@@ -177,7 +177,7 @@ class BaseNode(abc.ABC):
         backoff, max_backoff = 1, 60
 
         if self.subtensor_rpc is None:
-            self.subtensor_rpc = bt.subtensor(config=self.config)
+            self.subtensor_rpc = bt.Subtensor(config=self.config)
 
         def handler(event):
             try:

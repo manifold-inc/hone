@@ -59,7 +59,7 @@ class ChainManager:
         self.hparams = hparams or SimpleNamespace()
 
         # Bittensor objects
-        self.subtensor = bt.subtensor(config=self.config)
+        self.subtensor = bt.Subtensor(config=self.config)
         self.metagraph = self.subtensor.metagraph(self.netuid)
 
         # Block and window tracking

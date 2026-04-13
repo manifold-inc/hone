@@ -260,7 +260,7 @@ class Validator(BaseNode, Trainer):
             help="Directory to save profiler traces",
         )
 
-        bt.subtensor.add_args(parser)
+        bt.Subtensor.add_args(parser)
         bt.logging.add_args(parser)
         bt.Wallet.add_args(parser)
         config = bt.config(parser)
