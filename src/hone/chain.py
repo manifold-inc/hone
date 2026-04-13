@@ -141,7 +141,7 @@ class ChainManager:
             bucket.account_id + bucket.access_key_id + bucket.secret_access_key
         )
         if self.netuid is not None:
-            self.subtensor.commit(wallet, self.netuid, concatenated)
+            self.subtensor.set_commitment(wallet, self.netuid, concatenated)
             logger.info(
                 f"Committed bucket configuration to chain for hotkey {wallet.hotkey.ss58_address}"
             )
