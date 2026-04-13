@@ -41,7 +41,7 @@ class ChainManager:
         config,
         hparams=None,
         fetch_interval: int = 600,  # Fetch interval in seconds
-        wallet: bt.wallet | None = None,
+        wallet: bt.Wallet | None = None,
         bucket: Bucket | None = None,
     ):
         """
@@ -51,7 +51,7 @@ class ChainManager:
             config: Bittensor config object.
             hparams: Hyperparameters namespace containing model configuration.
             fetch_interval (int): Interval in seconds between fetching commitments.
-            wallet (bt.wallet, optional): Wallet to sign commitments.
+            wallet (bt.Wallet, optional): Wallet to sign commitments.
             bucket (Bucket, optional): Bucket configuration to commit.
         """
         self.config = config
@@ -130,11 +130,11 @@ class ChainManager:
         """
         return {uid: self.get_bucket(uid) for uid in self.metagraph.uids}
 
-    def commit(self, wallet: "bt.wallet", bucket: Bucket) -> None:
+    def commit(self, wallet: "bt.Wallet", bucket: Bucket) -> None:
         """Commits bucket configuration to the chain.
 
         Args:
-            wallet (bt.wallet): Wallet to sign the commitment
+            wallet (bt.Wallet): Wallet to sign the commitment
             bucket (Bucket): Bucket configuration to commit
         """
         concatenated = (
@@ -150,7 +150,7 @@ class ChainManager:
         """Attempts to verify existing commitment matches current bucket config and commits if not.
 
         Args:
-            wallet (bt.wallet): Wallet to sign the commitment
+            wallet (bt.Wallet): Wallet to sign the commitment
             bucket (Bucket): Current bucket configuration to verify/commit
         """
         try:
@@ -321,11 +321,11 @@ class ChainManager:
             self.subtensor.substrate.initialize()
             return
 
-    async def get_bucket_for_neuron(self, wallet: "bt.wallet") -> Bucket | None:
+    async def get_bucket_for_neuron(self, wallet: "bt.Wallet") -> Bucket | None:
         """Get bucket configuration for a specific neuron's wallet
 
         Args:
-            wallet (bt.wallet): The wallet to get bucket for
+            wallet (bt.Wallet): The wallet to get bucket for
 
         Returns:
             Optional[Bucket]: The bucket assigned to this neuron, or None if not found

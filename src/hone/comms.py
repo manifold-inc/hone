@@ -71,7 +71,7 @@ class Comms(ChainManager):
 
     def __init__(
         self,
-        wallet: bt.wallet | None,
+        wallet: bt.Wallet | None,
         save_location: str = "/tmp",
         key_prefix: str = "model",
         config=None,
@@ -84,7 +84,7 @@ class Comms(ChainManager):
         and background tasks for communication.
 
         Args:
-            wallet (bt.wallet | None): The bittensor wallet instance.
+            wallet (bt.Wallet | None): The bittensor wallet instance.
             save_location (str, optional): The base directory for saving local files. Defaults to "/tmp".
             key_prefix (str, optional): A prefix for keys used in storage. Defaults to "model".
             config (object, optional): Configuration object. Defaults to None.

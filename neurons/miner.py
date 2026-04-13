@@ -139,7 +139,7 @@ class Miner(BaseNode, Trainer):
         )
         bt.subtensor.add_args(parser)
         bt.logging.add_args(parser)
-        bt.wallet.add_args(parser)
+        bt.Wallet.add_args(parser)
         config = bt.config(parser)
         if config.debug:
             hone.debug()
@@ -192,7 +192,7 @@ class Miner(BaseNode, Trainer):
             self.hparams.batch_size = self.config.actual_batch_size
 
         # Init bittensor objects
-        self.wallet = bt.wallet(config=self.config)
+        self.wallet = bt.Wallet(config=self.config)
         hone.logger.info("[Init] Bittensor wallet loaded")
         super().__init__()
 
