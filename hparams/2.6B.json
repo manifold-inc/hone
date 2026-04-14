@@ -1,5 +1,5 @@
 {
-    "tokenizer_name": "HuggingFaceTB/SmolLM2-135M",
+    "tokenizer_name": "google/gemma-2-2b",
     "hidden_size": 2048,
     "num_hidden_layers": 48,
     "num_attention_heads": 16,
@@ -9,5 +9,5 @@
     "max_position_embeddings": 4096,
     "rope_theta": 10000.0,
     "rms_norm_eps": 1e-5,
-    "vocab_size": 49152
+    "vocab_size": 256000
 }
