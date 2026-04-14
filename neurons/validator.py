@@ -1110,7 +1110,7 @@ class Validator(BaseNode, Trainer):
         self.weights.zero_()
 
         # --- configurable knobs (with sane defaults) -------------------
-        burn_rate = max(0.0, min(1.0, self.hparams.burn_rate)) if self.burn_uid is not None else 0.0
+        burn_rate = max(0.0, min(1.0, getattr(self.hparams, "incentive_burn_rate", 0.0))) if self.burn_uid is not None else 0.0
         gather_share = getattr(self.hparams, "gather_share", 0.75)
         gather_count = getattr(self.hparams, "gather_peer_count", 15)
         reserve_count = getattr(self.hparams, "reserve_peer_count", 10)
@@ -2403,7 +2403,7 @@ class Validator(BaseNode, Trainer):
                 )
                 if (
                     self.burn_uid is not None
-                    and self.hparams.burn_rate > 0
+                    and getattr(self.hparams, "incentive_burn_rate", 0.0) > 0
                     and self.weights[self.burn_uid] > 0
                     and self.burn_uid not in positive_weighted_uids
                 ):

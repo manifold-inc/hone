@@ -1,18 +1,18 @@
 {
     "spec_version": 1,
     "project": "hone",
-    "model_size": "120M",
+    "model_size": "1.4B",
 
     "tokenizer_name": "google/gemma-2-2b",
     "sequence_length": 4096,
     "micro_batch_size": 1,
     "target_batch_size": 1024,
-    "batch_size": 32,
-    "inner_steps": 20,
+    "batch_size": 192,
+    "inner_steps": 30,
     "outer_learning_rate": 0.4,
     "weight_decay": 0.1,
 
-    "blocks_per_window": 5,
+    "blocks_per_window": 115,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
     "momentum_decay": 0.95,
@@ -48,7 +48,7 @@
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
-    "burn_rate": 1.0,
+    "incentive_burn_rate": 1.0,
     "idx_overlap_threshold": 0.4,
     "consecutive_negative_threshold": 3,
     "exclude_negative_peers": true,
@@ -62,7 +62,7 @@
             "weight_decay": 0.1,
             "learning_rate": 3e-4,
             "scheduler": {
-                "warmup_steps": 1500,
+                "warmup_steps": 1000,
                 "warmup_inner_steps": 30,
                 "t_max": 140000,
                 "eta_min_factor": 0.1
@@ -76,7 +76,7 @@
             "scalar_lr_scale": 0.2,
             "learning_rate": 2e-3,
             "scheduler": {
-                "warmup_steps": 1500,
+                "warmup_steps": 1000,
                 "warmup_inner_steps": 30,
                 "t_max": 140000,
                 "eta_min_factor": 0.1
