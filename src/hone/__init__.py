@@ -13,8 +13,8 @@ from .logging import *
 from .sharded_dataset import SharedShardedDataset
 from .sharded_sampler import EvalSampler, MinerSampler
 from .checkpoint import DCPCheckpointer
-from .model import LoopLM, LoopLMConfig, LoopLMOutput
-from .loss import compute_looplm_loss
+from .model import LoopLM, LoopLMConfig
+from .loss import compute_loss
 from .reporter import DashboardReporter
 from . import muon
 from . import distributed

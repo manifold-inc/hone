@@ -1,18 +1,13 @@
-"""LoopLM — Looped Language Model with adaptive early exit.
+"""LoopLM — Llama-style decoder-only transformer.
 
-Implements the architecture from "Scaling Latent Reasoning via Looped Language
-Models" (arXiv:2510.25741).  A shared stack of N transformer layers is applied
-recurrently T_max times.  At each recurrent step an exit gate produces a halting
-logit and the LM head emits next-token logits.
-
-Parameter naming matches the official Ouro HuggingFace checkpoint
-(ByteDance/Ouro-1.4B) for weight-loading compatibility.
+Standard single-pass pre-norm transformer matching the TorchTitan Llama3
+architecture used in templar.  Building blocks: RoPE, GQA attention, SwiGLU
+feed-forward, RMSNorm.
 """
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 import torch
@@ -37,9 +32,7 @@ class LoopLMConfig:
     norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     max_seq_len: int = 4096
-    t_max: int = 4
     tie_embeddings: bool = True
-    hidden_act: str = "silu"
 
     def __post_init__(self):
         if self.n_kv_heads is None:
@@ -54,18 +47,7 @@ class LoopLMConfig:
 
 
 # ---------------------------------------------------------------------------
-# Output container
-# ---------------------------------------------------------------------------
-
-@dataclass
-class LoopLMOutput:
-    step_logits: list[torch.Tensor] = field(default_factory=list)
-    step_gate_logits: list[torch.Tensor] = field(default_factory=list)
-    final_hidden: torch.Tensor | None = None
-
-
-# ---------------------------------------------------------------------------
-# RMSNorm  (matches OuroRMSNorm)
+# RMSNorm
 # ---------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
@@ -83,7 +65,7 @@ class RMSNorm(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Rotary Position Embeddings  (matches OuroRotaryEmbedding)
+# Rotary Position Embeddings
 # ---------------------------------------------------------------------------
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -135,7 +117,7 @@ class RotaryEmbedding(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Attention  (matches OuroAttention)
+# Attention (GQA + SDPA)
 # ---------------------------------------------------------------------------
 
 class Attention(nn.Module):
@@ -146,7 +128,6 @@ class Attention(nn.Module):
         self.n_heads = config.n_heads
         self.n_kv_heads = config.n_kv_heads or config.n_heads
         self.num_key_value_groups = self.n_heads // self.n_kv_heads
-        self.scaling = self.head_dim ** -0.5
 
         self.q_proj = nn.Linear(config.dim, self.n_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -168,7 +149,6 @@ class Attention(nn.Module):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # GQA: expand KV heads
         if self.num_key_value_groups > 1:
             k = k[:, :, None, :, :].expand(
                 -1, -1, self.num_key_value_groups, -1, -1
@@ -185,7 +165,7 @@ class Attention(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# SwiGLU Feed-Forward  (matches OuroMLP)
+# SwiGLU Feed-Forward
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
@@ -195,34 +175,25 @@ class MLP(nn.Module):
         self.gate_proj = nn.Linear(config.dim, config.intermediate_size, bias=False)
         self.up_proj = nn.Linear(config.dim, config.intermediate_size, bias=False)
         self.down_proj = nn.Linear(config.intermediate_size, config.dim, bias=False)
-        self.act_fn = F.silu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
 # ---------------------------------------------------------------------------
-# Transformer Block with sandwich normalization  (matches OuroDecoderLayer)
+# Transformer Block — standard pre-norm (matches TorchTitan TransformerBlock)
 # ---------------------------------------------------------------------------
 
 class DecoderLayer(nn.Module):
-    """Pre-norm + post-norm ("sandwich") on both attention and FFN sub-layers,
-    following Geiping et al. for recurrent-depth stability.
-
-    Norm naming matches the official Ouro checkpoint:
-      input_layernorm / input_layernorm_2       — around attention
-      post_attention_layernorm / post_attention_layernorm_2 — around FFN
-    """
-
     def __init__(self, config: LoopLMConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx)
         self.mlp = MLP(config)
-
         self.input_layernorm = RMSNorm(config.dim, config.norm_eps)
-        self.input_layernorm_2 = RMSNorm(config.dim, config.norm_eps)
         self.post_attention_layernorm = RMSNorm(config.dim, config.norm_eps)
-        self.post_attention_layernorm_2 = RMSNorm(config.dim, config.norm_eps)
+
+        self.weight_init_std = 0.02 / (2 * (layer_idx + 1)) ** 0.5
 
     def forward(
         self,
@@ -230,36 +201,34 @@ class DecoderLayer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Attention with sandwich norm
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(
-            hidden_states, position_embeddings=position_embeddings,
+        h = hidden_states + self.self_attn(
+            self.input_layernorm(hidden_states),
+            position_embeddings=position_embeddings,
             attention_mask=attention_mask,
         )
-        hidden_states = self.input_layernorm_2(hidden_states)
-        hidden_states = residual + hidden_states
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
 
-        # FFN with sandwich norm
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = self.post_attention_layernorm_2(hidden_states)
-        hidden_states = residual + hidden_states
-
-        return hidden_states
+    def init_weights(self):
+        for norm in (self.input_layernorm, self.post_attention_layernorm):
+            nn.init.ones_(norm.weight)
+        for linear in (self.self_attn.q_proj, self.self_attn.k_proj, self.self_attn.v_proj):
+            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.self_attn.o_proj.weight, mean=0.0, std=self.weight_init_std)
+        nn.init.trunc_normal_(self.mlp.gate_proj.weight, mean=0.0, std=0.02)
+        nn.init.trunc_normal_(self.mlp.up_proj.weight, mean=0.0, std=self.weight_init_std)
+        nn.init.trunc_normal_(self.mlp.down_proj.weight, mean=0.0, std=self.weight_init_std)
 
 
 # ---------------------------------------------------------------------------
-# LoopLM  (matches OuroModel + OuroForCausalLM structure)
+# LoopLM — single-pass Llama-style decoder
 # ---------------------------------------------------------------------------
 
 class LoopLM(nn.Module):
-    """Looped Language Model.
+    """Decoder-only transformer language model.
 
-    A shared stack of ``n_layers`` transformer blocks is applied ``t_max``
-    times.  Each recurrent step produces next-token logits and raw exit-gate
-    logits (sigmoid applied downstream in loss computation).
+    Single pass through ``n_layers`` transformer blocks, then RMSNorm and a
+    linear head to vocabulary logits.
     """
 
     def __init__(self, config: LoopLMConfig):
@@ -272,7 +241,6 @@ class LoopLM(nn.Module):
         )
         self.norm = RMSNorm(config.dim, config.norm_eps)
         self.lm_head = nn.Linear(config.dim, config.vocab_size, bias=False)
-        self.early_exit_gate = nn.Linear(config.dim, 1)
 
         if config.tie_embeddings:
             self.lm_head.weight = self.embed_tokens.weight
@@ -283,97 +251,35 @@ class LoopLM(nn.Module):
             theta=config.rope_theta,
         )
 
-    def forward(
-        self,
-        input_ids: torch.Tensor,
-        t_max: int | None = None,
-    ) -> LoopLMOutput:
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """Returns logits of shape (B, S, V)."""
         B, S = input_ids.shape
-        t_max = t_max if t_max is not None else self.config.t_max
-
-        hidden_states = self.embed_tokens(input_ids)
+        h = self.embed_tokens(input_ids)
 
         position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        position_embeddings = self.rotary_emb(h, position_ids)
 
-        step_logits: list[torch.Tensor] = []
-        step_gate_logits: list[torch.Tensor] = []
+        for layer in self.layers:
+            h = layer(h, position_embeddings)
 
-        for _t in range(t_max):
-            for layer in self.layers:
-                hidden_states = layer(hidden_states, position_embeddings)
-
-            hidden_states = self.norm(hidden_states)
-            step_logits.append(self.lm_head(hidden_states))
-            step_gate_logits.append(self.early_exit_gate(hidden_states))
-
-        return LoopLMOutput(
-            step_logits=step_logits,
-            step_gate_logits=step_gate_logits,
-            final_hidden=hidden_states,
-        )
-
-    # ------------------------------------------------------------------
-    # Inference helper with early exit
-    # ------------------------------------------------------------------
-    @torch.inference_mode()
-    def generate_with_early_exit(
-        self,
-        input_ids: torch.Tensor,
-        q_threshold: float = 0.5,
-        t_max: int | None = None,
-    ) -> tuple[torch.Tensor, int]:
-        """Run forward with early exit based on cumulative exit probability.
-
-        Returns the logits from the exit step and the step index used.
-        """
-        t_max = t_max if t_max is not None else self.config.t_max
-        B, S = input_ids.shape
-        hidden_states = self.embed_tokens(input_ids)
-        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
-
-        cdf = torch.zeros(B, S, device=hidden_states.device)
-        survival = torch.ones(B, S, device=hidden_states.device)
-
-        for t in range(t_max):
-            for layer in self.layers:
-                hidden_states = layer(hidden_states, position_embeddings)
-
-            hidden_states = self.norm(hidden_states)
-            logits = self.lm_head(hidden_states)
-            lam = torch.sigmoid(self.early_exit_gate(hidden_states).squeeze(-1))
-
-            if t < t_max - 1:
-                p_t = lam * survival
-                survival = survival * (1 - lam)
-            else:
-                p_t = survival
-
-            cdf = cdf + p_t
-
-            if cdf.mean() >= q_threshold:
-                return logits, t + 1
-
-        return logits, t_max
+        h = self.norm(h)
+        return self.lm_head(h)
 
     def init_weights(self):
-        """Initialize weights following the Ouro convention.
+        """Initialize weights following the TorchTitan Llama convention.
 
-        Embedding uses normal(0, 0.02).  Linear layers use Xavier-uniform,
-        but the lm_head is skipped when weights are tied to the embedding
-        (otherwise the lm_head Xavier init overwrites the embedding init,
-        producing very small embedding norms that amplify gradients through
-        the first RMSNorm by ~170x with a 256K vocabulary).
+        Embedding: normal(0, 1.0).  Attention q/k/v: trunc_normal(0, 0.02).
+        Output projections (o_proj, down_proj, up_proj): depth-scaled std.
+        Final lm_head: trunc_normal(0, dim^-0.5), skipped when tied.
         """
-        for name, module in self.named_modules():
-            if isinstance(module, nn.Linear):
-                if name == "lm_head" and self.config.tie_embeddings:
-                    continue
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.zeros_(module.bias)
-            elif isinstance(module, nn.Embedding):
-                nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            elif isinstance(module, RMSNorm):
-                nn.init.ones_(module.weight)
+        nn.init.normal_(self.embed_tokens.weight)
+        for layer in self.layers:
+            layer.init_weights()
+        nn.init.ones_(self.norm.weight)
+        if not self.config.tie_embeddings:
+            final_std = self.config.dim ** -0.5
+            cutoff = 3 * final_std
+            nn.init.trunc_normal_(
+                self.lm_head.weight, mean=0.0, std=final_std,
+                a=-cutoff, b=cutoff,
+            )

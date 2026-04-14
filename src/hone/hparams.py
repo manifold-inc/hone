@@ -48,12 +48,6 @@ DEFAULT_HPARAMS = {
     "rope_theta": 10000.0,
     "rms_norm_eps": 1e-5,
 
-    "t_max": 4,
-    "kl_beta": 0.05,
-    "training_stage": "pretrain",
-    "gate_k": 50.0,
-    "gate_gamma": 0.005,
-
     "bucket_name": "your-default-bucket-name",
 
     "warmup_steps": 250,
@@ -83,7 +77,6 @@ def create_namespace(hparams: dict) -> SimpleNamespace:
     )
     ns.tokenizer.pad_token = ns.tokenizer.eos_token
 
-    # Build LoopLMConfig
     ns.model_config = LoopLMConfig(
         vocab_size=getattr(ns, "vocab_size", ns.tokenizer.vocab_size),
         dim=ns.hidden_size,
@@ -94,7 +87,6 @@ def create_namespace(hparams: dict) -> SimpleNamespace:
         norm_eps=getattr(ns, "rms_norm_eps", 1e-5),
         rope_theta=getattr(ns, "rope_theta", 10000.0),
         max_seq_len=ns.sequence_length,
-        t_max=getattr(ns, "t_max", 4),
         tie_embeddings=getattr(ns, "tie_embeddings", True),
     )
 

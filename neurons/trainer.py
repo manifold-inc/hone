@@ -1,6 +1,4 @@
-"""LoopLM Trainer — handles local training with recurrent forward passes
-and stage-aware loss computation.
-"""
+"""Trainer — handles local training with standard cross-entropy loss."""
 
 from __future__ import annotations
 
@@ -19,15 +17,14 @@ from torch.utils.data import DataLoader
 
 import hone
 from hone.distributed import dist_helper
-from hone.loss import compute_looplm_loss
+from hone.loss import compute_loss
 from hone.model import LoopLM, LoopLMConfig
 from hone.muon import Muon, SingleDeviceMuonWithAuxAdam
 from neurons.base_node import CPU_COUNT
 
 
 class Trainer:
-    """Manages model creation, optimizers, and the inner training loop
-    for LoopLM with stage-aware loss dispatch."""
+    """Manages model creation, optimizers, and the inner training loop."""
 
     def __init__(self):
         self.inner_scheduler_step_count = 0
@@ -282,18 +279,12 @@ class Trainer:
                     continue
 
                 with autocast(device_type=device.type, dtype=torch.bfloat16):
-                    output = model(input_ids, t_max=self.hparams.t_max)
+                    logits = model(input_ids)
 
-                loss = compute_looplm_loss(
-                    output, labels,
-                    stage=self.hparams.training_stage,
-                    beta=getattr(self.hparams, "kl_beta", 0.05),
-                    gate_k=getattr(self.hparams, "gate_k", 50.0),
-                    gate_gamma=getattr(self.hparams, "gate_gamma", 0.005),
-                )
+                loss = compute_loss(logits, labels)
                 total_loss += loss.item()
                 n_batches += 1
-                del input_ids, labels, output
+                del input_ids, labels, logits
                 torch.cuda.empty_cache()
                 await asyncio.sleep(0)
 
@@ -441,17 +432,11 @@ class Trainer:
                 del input_ids, labels
                 continue
 
-            # 3. Forward + backward (LoopLM recurrent)
+            # 3. Forward + backward
             with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                output = self.model(input_ids, t_max=self.hparams.t_max)
+                logits = self.model(input_ids)
 
-            calculated_loss = compute_looplm_loss(
-                output, labels,
-                stage=self.hparams.training_stage,
-                beta=getattr(self.hparams, "kl_beta", 0.05),
-                gate_k=getattr(self.hparams, "gate_k", 50.0),
-                gate_gamma=getattr(self.hparams, "gate_gamma", 0.005),
-            )
+            calculated_loss = compute_loss(logits, labels)
 
             loss = calculated_loss / self.sampler.grad_accum_steps
             loss_item = calculated_loss.detach().item()

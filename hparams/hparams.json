@@ -12,12 +12,6 @@
     "outer_learning_rate": 0.4,
     "weight_decay": 0.1,
 
-    "t_max": 4,
-    "kl_beta": 0.05,
-    "training_stage": "pretrain",
-    "gate_k": 50.0,
-    "gate_gamma": 0.005,
-
     "blocks_per_window": 20,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
