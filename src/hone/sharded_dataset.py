@@ -314,15 +314,14 @@ class ShardedDatasetManager:
             f"Preparing shard {shard_index} (remapped to {remapped_shard}) at {tokens_file}"
         )
 
-        if os.path.exists(tokens_file) and os.path.exists(ids_file):
-            # if exist, return completed task
-            print(f"Shard {shard_index} already exists on disk. Loading...")
+        missing = [f for f in (tokens_file, ids_file) if not os.path.exists(f)]
+        if not missing:
+            hone.logger.info(f"Shard {shard_index} already exists on disk. Loading...")
             task = asyncio.create_task(asyncio.sleep(0))
-
         else:
             bucket = self.comms.get_own_bucket("dataset", "read")
             task = asyncio.create_task(
-                self.download_files(bucket, tokens_file, ids_file)
+                self.download_files(bucket, missing)
             )
 
         return task
@@ -330,29 +329,27 @@ class ShardedDatasetManager:
     async def download_files(
         self,
         bucket: hone.schemas.Bucket,
-        tokens_file: os.PathLike,
-        ids_file: os.PathLike,
-    ) -> asyncio.TaskGroup:
-        """
-        Downloads the shard and its indices
+        files: list[os.PathLike],
+    ) -> None:
+        """Downloads missing shard files from R2.
 
         Args:
-            bucket: The (shared shard) r2 storage bucket
-            tokens_file: The path to the tokens file in bucket
-            ids_file: The path to the tokens file's indices in bucket
+            bucket: The R2 storage bucket.
+            files: List of file paths to download (used as both S3 keys and
+                   local destinations).
         """
-        return await asyncio.gather(
-            self.comms.s3_get_object(
-                tokens_file,
-                bucket,
-                load_data=False,
-            ),
-            self.comms.s3_get_object(
-                ids_file,
-                bucket,
-                load_data=False,
-            ),
+        results = await asyncio.gather(
+            *(
+                self.comms.s3_get_object(f, bucket, load_data=False)
+                for f in files
+            )
         )
+        for f, result in zip(files, results):
+            if result is None:
+                raise FileNotFoundError(
+                    f"Failed to download {f} from bucket '{bucket.name}'. "
+                    f"Verify the file exists in the bucket at key '{f}'."
+                )
 
     async def create_dataset(self, shard_index: int) -> SharedShardedDataset:
         """Creates a `SharedShardedDataset` instance for a given shard index.
