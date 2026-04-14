@@ -1,7 +1,10 @@
 """Dashboard metrics reporter -- async HTTP client that POSTs training data to hone-api."""
 
 import asyncio
+import hashlib
+import json
 import os
+import time
 import uuid
 from typing import Any
 
@@ -12,6 +15,10 @@ from .logging import logger
 
 class DashboardReporter:
     """Fire-and-forget reporter that sends metrics to the hone-api ingest endpoints.
+
+    Authentication uses Bittensor sr25519 hotkey signatures. Each request is signed
+    with the miner/validator's hotkey so the API can verify identity without a shared
+    secret.
 
     Never raises or blocks the training loop -- all errors are logged and swallowed.
     """
@@ -26,10 +33,10 @@ class DashboardReporter:
         version: str | None = None,
         config: dict[str, Any] | None = None,
         api_url: str | None = None,
-        api_key: str | None = None,
+        wallet: Any | None = None,
     ):
         self.api_url = (api_url or os.environ.get("DASHBOARD_API_URL", "")).rstrip("/")
-        self.api_key = api_key or os.environ.get("DASHBOARD_API_KEY", "")
+        self.wallet = wallet
         self.enabled = bool(self.api_url)
 
         self.run_id = str(uuid.uuid4())
@@ -44,12 +51,33 @@ class DashboardReporter:
 
         if not self.enabled:
             logger.info("[DashboardReporter] disabled (no DASHBOARD_API_URL set)")
+        elif not self.wallet:
+            logger.warning(
+                "[DashboardReporter] no wallet provided -- requests will be unsigned"
+            )
 
-    def _headers(self) -> dict[str, str]:
-        h: dict[str, str] = {"Content-Type": "application/json"}
-        if self.api_key:
-            h["x-api-key"] = self.api_key
-        return h
+    def _sign_payload(self, body_bytes: bytes) -> dict[str, str]:
+        """Create auth headers by signing a nonce + body hash with the hotkey."""
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+
+        if not self.wallet:
+            return headers
+
+        try:
+            nonce = str(int(time.time()))
+            body_hash = hashlib.sha256(body_bytes).hexdigest()
+            message = f"{nonce}:{body_hash}"
+
+            signature = self.wallet.hotkey.sign(message.encode("utf-8"))
+            sig_hex = signature.hex() if isinstance(signature, bytes) else str(signature)
+
+            headers["x-hotkey"] = self.hotkey
+            headers["x-nonce"] = nonce
+            headers["x-signature"] = sig_hex
+        except Exception as e:
+            logger.warning(f"[DashboardReporter] failed to sign request: {e}")
+
+        return headers
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -63,7 +91,9 @@ class DashboardReporter:
         try:
             session = await self._get_session()
             url = f"{self.api_url}{path}"
-            async with session.post(url, json=payload, headers=self._headers()) as resp:
+            body_bytes = json.dumps(payload).encode("utf-8")
+            headers = self._sign_payload(body_bytes)
+            async with session.post(url, data=body_bytes, headers=headers) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
                     logger.warning(
@@ -71,6 +101,8 @@ class DashboardReporter:
                     )
         except Exception as e:
             logger.warning(f"[DashboardReporter] POST {path} failed: {e}")
+
+    # ── Run registration ─────────────────────────────────────────────────
 
     async def register_run(self) -> None:
         await self._post(
@@ -85,6 +117,8 @@ class DashboardReporter:
                 "config": self.config,
             },
         )
+
+    # ── Validator window metrics ──────────────────────────────────────────
 
     async def report_window(
         self,
@@ -108,6 +142,12 @@ class DashboardReporter:
         overlap_mean: float | None = None,
         overlap_max: float | None = None,
         overlap_pairs_checked: int | None = None,
+        overlap_pairs_over_threshold: int | None = None,
+        overlap_ratio_over_threshold: float | None = None,
+        compress_min_median_norm: float | None = None,
+        compress_max_median_norm: float | None = None,
+        gather_intended_mean_final: float | None = None,
+        gather_actual_mean_final: float | None = None,
         timing_window_total: float | None = None,
         timing_peer_update: float | None = None,
         timing_gather: float | None = None,
@@ -143,6 +183,12 @@ class DashboardReporter:
             "overlap_mean": "overlapMean",
             "overlap_max": "overlapMax",
             "overlap_pairs_checked": "overlapPairsChecked",
+            "overlap_pairs_over_threshold": "overlapPairsOverThreshold",
+            "overlap_ratio_over_threshold": "overlapRatioOverThreshold",
+            "compress_min_median_norm": "compressMinMedianNorm",
+            "compress_max_median_norm": "compressMaxMedianNorm",
+            "gather_intended_mean_final": "gatherIntendedMeanFinal",
+            "gather_actual_mean_final": "gatherActualMeanFinal",
             "timing_window_total": "timingWindowTotal",
             "timing_peer_update": "timingPeerUpdate",
             "timing_gather": "timingGather",
@@ -176,6 +222,8 @@ class DashboardReporter:
 
         await self._post("/ingest/window", payload)
 
+    # ── Miner metrics ─────────────────────────────────────────────────────
+
     async def report_miner(
         self,
         *,
@@ -194,6 +242,10 @@ class DashboardReporter:
         gpu_memory_cached: float | None = None,
         inner_lr: float | None = None,
         timing: dict[str, float] | None = None,
+        gradient_l2_norm: float | None = None,
+        gradient_total_elements: int | None = None,
+        cpu_usage: float | None = None,
+        gpu_utilization: float | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "runId": self.run_id,
@@ -214,6 +266,10 @@ class DashboardReporter:
             "gpu_memory_cached": "gpuMemoryCached",
             "inner_lr": "innerLr",
             "timing": "timing",
+            "gradient_l2_norm": "gradientL2Norm",
+            "gradient_total_elements": "gradientTotalElements",
+            "cpu_usage": "cpuUsage",
+            "gpu_utilization": "gpuUtilization",
         }
         local_vars = locals()
         for py_name, js_name in field_map.items():
@@ -222,6 +278,69 @@ class DashboardReporter:
                 payload[js_name] = val
 
         await self._post("/ingest/miner", payload)
+
+    # ── Sync scores (validator → per-UID sync data) ───────────────────────
+
+    async def report_sync_scores(
+        self,
+        *,
+        window: int,
+        scores: list[dict[str, Any]],
+    ) -> None:
+        await self._post(
+            "/ingest/sync-scores",
+            {
+                "runId": self.run_id,
+                "window": window,
+                "scores": scores,
+            },
+        )
+
+    # ── Slash events ──────────────────────────────────────────────────────
+
+    async def report_slash_event(
+        self,
+        *,
+        window: int,
+        uid: int,
+        score_before: float,
+        score_after: float,
+        reason: str,
+    ) -> None:
+        await self._post(
+            "/ingest/slash",
+            {
+                "runId": self.run_id,
+                "window": window,
+                "uid": uid,
+                "scoreBefore": score_before,
+                "scoreAfter": score_after,
+                "reason": reason,
+            },
+        )
+
+    # ── Inactivity events ─────────────────────────────────────────────────
+
+    async def report_inactivity(
+        self,
+        *,
+        window: int,
+        uid: int,
+        score_before: float,
+        score_after: float,
+    ) -> None:
+        await self._post(
+            "/ingest/inactivity",
+            {
+                "runId": self.run_id,
+                "window": window,
+                "uid": uid,
+                "scoreBefore": score_before,
+                "scoreAfter": score_after,
+            },
+        )
+
+    # ── Cleanup ───────────────────────────────────────────────────────────
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

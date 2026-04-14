@@ -335,6 +335,7 @@ class Miner(BaseNode, Trainer):
             netuid=self.config.netuid,
             uid=self.uid,
             version=hone.__version__,
+            wallet=self.wallet,
         )
 
         # Initialize peer related attributes
@@ -995,6 +996,8 @@ class Miner(BaseNode, Trainer):
                             "put": float(put_time),
                             "model_update": float(model_update_time),
                         },
+                        gradient_l2_norm=float(gradient_fingerprint["global_l2_norm"]) if gradient_fingerprint else None,
+                        gradient_total_elements=int(gradient_fingerprint["total_elements"]) if gradient_fingerprint else None,
                     )
                 )
 

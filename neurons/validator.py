@@ -485,6 +485,7 @@ class Validator(BaseNode, Trainer):
             netuid=self.config.netuid,
             uid=self.uid,
             version=hone.__version__,
+            wallet=self.wallet,
         )
 
         # Weighted selection counters for fair picking of eval peers
@@ -900,6 +901,19 @@ class Validator(BaseNode, Trainer):
                 },
                 with_system_metrics=True,
                 with_gpu_metrics=True,
+            )
+
+            asyncio.create_task(
+                self.dashboard_reporter.report_sync_scores(
+                    window=int(self.sync_window),
+                    scores=[{
+                        "uid": int(eval_uid),
+                        "l2Norm": l2_norm,
+                        "avgAbsDiff": avg_abs_diff,
+                        "avgStepsBehind": avg_steps_behind,
+                        "maxStepsBehind": int(max_steps_behind),
+                    }],
+                )
             )
 
     def update_openskill_ratings(self) -> None:
@@ -3205,6 +3219,15 @@ class Validator(BaseNode, Trainer):
                     with_system_metrics=True,
                     with_gpu_metrics=True,
                 )
+
+                asyncio.create_task(
+                    self.dashboard_reporter.report_inactivity(
+                        window=int(self.current_window),
+                        uid=int(uid),
+                        score_before=float(old_score),
+                        score_after=float(new_score),
+                    )
+                )
         return
 
     async def evaluate_miner_sync(
@@ -3557,11 +3580,22 @@ class Validator(BaseNode, Trainer):
             fields={
                 "score_before": float(old_score),
                 "score_after": float(self.final_scores[eval_uid].item()),
-                "reason": str(error)[:255],  # Truncate long error messages
+                "reason": str(error)[:255],
             },
             with_system_metrics=True,
             with_gpu_metrics=True,
         )
+
+        if self.is_master:
+            asyncio.create_task(
+                self.dashboard_reporter.report_slash_event(
+                    window=int(self.sync_window),
+                    uid=int(eval_uid),
+                    score_before=float(old_score),
+                    score_after=float(self.final_scores[eval_uid].item()),
+                    reason=str(error)[:256],
+                )
+            )
 
     def validate_gradient_data(
         self,
