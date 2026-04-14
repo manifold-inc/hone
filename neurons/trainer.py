@@ -501,10 +501,12 @@ class Trainer:
                     loss_item, op=ReduceOp.AVG, device=self.device
                 )
 
-                grad_norm = None
                 if not null_round:
                     self.scaler.unscale_(self.inner_optimizer)
 
+                    # Skip step if gradients contain NaN/Inf to prevent
+                    # permanent model corruption from bf16 overflow in the
+                    # 96-layer effective backward path.
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 1.0
                     )
@@ -551,7 +553,7 @@ class Trainer:
                                 batch_size=int(accum_batch_size),
                                 batch_tokens=int(tokens_this),
                                 inner_lr=float(current_lr) if current_lr else None,
-                                grad_norm=float(grad_norm) if grad_norm is not None and torch.isfinite(grad_norm) else None,
+                                grad_norm=float(grad_norm) if not null_round and torch.isfinite(grad_norm) else None,
                             )
                         )
                 if window_entry_loss == 0.0:
