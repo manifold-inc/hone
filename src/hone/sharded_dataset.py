@@ -251,6 +251,7 @@ class ShardedDatasetManager:
         token_dtype: npt.DTypeLike = np.uint32,
         file_prefix: str = "train",
         anneal_mode: bool = False,
+        local_data: bool = False,
     ):
         """Initializes the dataset manager.
 
@@ -262,6 +263,7 @@ class ShardedDatasetManager:
             token_dtype: The numpy data type of the tokens.
             file_prefix: The prefix for shard files (e.g., "train", "anneal").
             anneal_mode: If True, lock to single shard with no cycling.
+            local_data: If True, use only local files; skip R2 downloads and shard swapping.
         """
         self.sequence_length = sequence_length
         self.rank = rank
@@ -270,18 +272,22 @@ class ShardedDatasetManager:
         self.file_prefix = file_prefix
         self.shard_index = 0
         self.anneal_mode = anneal_mode
+        self.local_data = local_data
 
         self.active_dataset: SharedShardedDataset | None = None
         self.upcoming_dataset: asyncio.Task | None = None
 
         self.comms = comms
 
-        # should comms glob to know all file paths?
-        self.max_dataset_idx = 14  # bucket_glob_files_idx
+        self.max_dataset_idx = 14
 
         if anneal_mode:
             hone.logger.info(
                 "[Dataset] Anneal mode: locked to single shard, no cycling"
+            )
+        if local_data:
+            hone.logger.info(
+                "[Dataset] Local-data mode: using only on-disk files, no R2 downloads"
             )
 
     @staticmethod
@@ -318,6 +324,11 @@ class ShardedDatasetManager:
         if not missing:
             hone.logger.info(f"Shard {shard_index} already exists on disk. Loading...")
             task = asyncio.create_task(asyncio.sleep(0))
+        elif self.local_data:
+            raise FileNotFoundError(
+                f"--local-data mode: missing files for shard {shard_index}: "
+                + ", ".join(missing)
+            )
         else:
             bucket = self.comms.get_own_bucket("dataset", "read")
             task = asyncio.create_task(
@@ -393,8 +404,8 @@ class ShardedDatasetManager:
 
         self.active_dataset = await self.create_dataset(current_shard_index)
 
-        # In anneal mode, don't prepare next shard (we stay on one shard)
-        if self.anneal_mode:
+        # In anneal or local-data mode, don't prepare next shard
+        if self.anneal_mode or self.local_data:
             self.upcoming_dataset = asyncio.create_task(asyncio.sleep(0))
             return
 
@@ -415,8 +426,8 @@ class ShardedDatasetManager:
         active dataset, and starts preparing the next one. It also cleans up
         the files of the old dataset.
         """
-        if self.anneal_mode:
-            hone.logger.info("[Dataset] Anneal mode: skipping shard swap")
+        if self.anneal_mode or self.local_data:
+            hone.logger.info("[Dataset] Skipping shard swap (anneal/local-data mode)")
             return self.shard_index
 
         self.shard_index += 1

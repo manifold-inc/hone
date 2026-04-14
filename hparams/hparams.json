@@ -54,7 +54,7 @@
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
-    "burn_rate": 0.5,
+    "burn_rate": 1.0,
     "idx_overlap_threshold": 0.4,
     "consecutive_negative_threshold": 3,
     "exclude_negative_peers": true,

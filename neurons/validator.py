@@ -68,6 +68,9 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
 
+BURN_HOTKEY_SS58 = "5GZ2KuT2TtLbYTtsMcgAtazo6KQ4bc57ykZgyQv9oit3y7iq"
+
+
 class NullMetricsLogger:
     def log(self, *_args, **_kwargs) -> None:
         return
@@ -534,7 +537,14 @@ class Validator(BaseNode, Trainer):
             anneal_mode=anneal_enabled,
         )
 
-        self.burn_uid = 1
+        try:
+            self.burn_uid = self.comms.metagraph.hotkeys.index(BURN_HOTKEY_SS58)
+            hone.logger.info(f"Burn UID resolved to {self.burn_uid} from hotkey {BURN_HOTKEY_SS58}")
+        except ValueError:
+            hone.logger.warning(
+                f"Burn hotkey {BURN_HOTKEY_SS58} not found in metagraph. Disabling burn."
+            )
+            self.burn_uid = None
 
         # Track negative evaluation history for each peer (last 20 evaluations)
         self.peer_eval_history: dict[int, Deque[bool]] = {}
@@ -1086,7 +1096,7 @@ class Validator(BaseNode, Trainer):
         self.weights.zero_()
 
         # --- configurable knobs (with sane defaults) -------------------
-        burn_rate = max(0.0, min(1.0, self.hparams.burn_rate))
+        burn_rate = max(0.0, min(1.0, self.hparams.burn_rate)) if self.burn_uid is not None else 0.0
         gather_share = getattr(self.hparams, "gather_share", 0.75)
         gather_count = getattr(self.hparams, "gather_peer_count", 15)
         reserve_count = getattr(self.hparams, "reserve_peer_count", 10)
@@ -1141,18 +1151,17 @@ class Validator(BaseNode, Trainer):
                 factor = min_gather / max_reserve * decay_ratio
                 self.weights[reserve_uids] *= factor
 
-        # --- burn weight -------------------------------------------------
-        self.weights[self.burn_uid] = burn_rate
+        # --- burn weight + normalization -----------------------------------
+        if self.burn_uid is not None and burn_rate > 0:
+            self.weights[self.burn_uid] = burn_rate
 
-        # sum of the non‑burn weights currently assigned
         non_burn_sum = self.weights.sum() - burn_rate
-
         if non_burn_sum > 0:
             scale = (1.0 - burn_rate) / non_burn_sum
-            self.weights *= scale  # rescale gather+reserve only
-            self.weights[self.burn_uid] = burn_rate  # restore exact burn
-        else:
-            # fall‑back: allocate all non‑burn weight to burn_uid
+            self.weights *= scale
+            if self.burn_uid is not None and burn_rate > 0:
+                self.weights[self.burn_uid] = burn_rate
+        elif self.burn_uid is not None and burn_rate > 0:
             self.weights[self.burn_uid] = 1.0
 
     async def run(self):
@@ -2377,7 +2386,8 @@ class Validator(BaseNode, Trainer):
                     [uid for uid in self.evaluated_uids if self.weights[uid] > 0]
                 )
                 if (
-                    self.hparams.burn_rate > 0
+                    self.burn_uid is not None
+                    and self.hparams.burn_rate > 0
                     and self.weights[self.burn_uid] > 0
                     and self.burn_uid not in positive_weighted_uids
                 ):

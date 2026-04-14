@@ -131,6 +131,11 @@ class Miner(BaseNode, Trainer):
             help="Local run - use toy model, small enough for a laptop.",
         )
         parser.add_argument(
+            "--local-data",
+            action="store_true",
+            help="Use only local dataset files. Skip R2 downloads and shard swapping.",
+        )
+        parser.add_argument(
             "--profile-iters",
             type=int,
             default=0,
@@ -349,9 +354,10 @@ class Miner(BaseNode, Trainer):
             rank=self.local_rank,
             world_size=self.world_size,
             comms=self.comms,
-            token_dtype=np.uint32,  # Match preprocessing script dtype
+            token_dtype=np.uint32,
             file_prefix=anneal_prefix,
             anneal_mode=anneal_enabled,
+            local_data=getattr(self.config, "local_data", False),
         )
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
         self.shard_reset_outer_step = getattr(
