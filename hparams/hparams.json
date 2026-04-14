@@ -3,7 +3,7 @@
     "project": "hone",
     "model_size": "1.4B",
 
-    "tokenizer_name": "HuggingFaceTB/SmolLM2-135M",
+    "tokenizer_name": "ByteDance/Ouro-1.4B",
     "sequence_length": 4096,
     "micro_batch_size": 1,
     "target_batch_size": 1024,

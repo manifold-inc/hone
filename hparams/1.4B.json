@@ -1,5 +1,5 @@
 {
-    "tokenizer_name": "HuggingFaceTB/SmolLM2-135M",
+    "tokenizer_name": "ByteDance/Ouro-1.4B",
     "hidden_size": 2048,
     "num_hidden_layers": 24,
     "num_attention_heads": 16,
