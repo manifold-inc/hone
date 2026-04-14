@@ -553,7 +553,7 @@ class Miner(BaseNode, Trainer):
             no_peers_null = len(self.comms.peers) == 0
 
             # Broadcast null round decision to all ranks - all ranks must agree to do null round
-            null_round = dist_helper.all_agree(
+            null_round = dist_helper.all_ok(
                 warmup_null or no_peers_null, self.device, "null_round_check"
             )
 
