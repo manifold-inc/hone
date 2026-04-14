@@ -1,14 +1,14 @@
 {
     "spec_version": 1,
     "project": "hone",
-    "model_size": "1.4B",
+    "model_size": "120M",
 
     "tokenizer_name": "google/gemma-2-2b",
     "sequence_length": 4096,
     "micro_batch_size": 1,
     "target_batch_size": 1024,
-    "batch_size": 192,
-    "inner_steps": 30,
+    "batch_size": 32,
+    "inner_steps": 5,
     "outer_learning_rate": 0.4,
     "weight_decay": 0.1,
 
@@ -18,7 +18,7 @@
     "gate_k": 50.0,
     "gate_gamma": 0.005,
 
-    "blocks_per_window": 115,
+    "blocks_per_window": 20,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
     "momentum_decay": 0.95,
@@ -42,7 +42,7 @@
     "validator_sample_micro_bs": 8,
     "gather_peers_slash_threshold": 0.4,
     "uids_per_window": 20,
-    "time_window_delta_seconds": 70,
+    "time_window_delta_seconds": 15,
     "reset_inactivity_windows": 3,
     "sync_max_steps_behind": 2,
     "binary_score_ma_alpha": 0.05,
