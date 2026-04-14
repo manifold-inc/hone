@@ -1,7 +1,7 @@
 # ruff: noqa
 # type: ignore
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 from .chain import *
 from .comms import *
