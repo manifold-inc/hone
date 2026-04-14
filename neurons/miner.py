@@ -591,7 +591,7 @@ class Miner(BaseNode, Trainer):
             window_tokens = res["batch_tokens"]
             global_grad_norm = res["global_grad_norm"]
             global_weight_norm = res["global_weight_norm"]
-            adam_metrics = res["adam_metrics"]
+            adam_metrics = res.get("adam_metrics", {})
 
             # Free VRAM pressure during compression by offloading inner opt states to CPU
             # (they are not needed until the next inner_steps call).
