@@ -1,4 +1,4 @@
-"""Dashboard metrics reporter -- async HTTP client that POSTs training data to hone-api."""
+"""Dashboard metrics reporter -- async HTTP + WebSocket client for hone-api."""
 
 import asyncio
 import hashlib
@@ -16,10 +16,10 @@ from .logging import logger
 class DashboardReporter:
     """Fire-and-forget reporter that sends metrics to the hone-api ingest endpoints.
 
-    Authentication uses Bittensor sr25519 hotkey signatures. Each request is signed
-    with the miner/validator's hotkey so the API can verify identity without a shared
-    secret.
+    Prefers a persistent WebSocket connection for low-latency streaming and
+    liveness tracking. Falls back to HTTP POST if the WebSocket is unavailable.
 
+    Authentication uses Bittensor sr25519 hotkey signatures.
     Never raises or blocks the training loop -- all errors are logged and swallowed.
     """
 
@@ -49,6 +49,14 @@ class DashboardReporter:
 
         self._session: aiohttp.ClientSession | None = None
 
+        # WebSocket state
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._ws_authenticated = False
+        self._ws_connect_failures = 0
+        self._ws_max_failures = 5
+        self._ws_heartbeat_task: asyncio.Task | None = None
+        self._ws_connecting = False
+
         if not self.enabled:
             logger.info("[DashboardReporter] disabled (no DASHBOARD_API_URL set)")
         elif not self.wallet:
@@ -56,27 +64,107 @@ class DashboardReporter:
                 "[DashboardReporter] no wallet provided -- requests will be unsigned"
             )
 
-    def _sign_payload(self, body_bytes: bytes) -> dict[str, str]:
-        """Create auth headers by signing a nonce + body hash with the hotkey."""
-        headers: dict[str, str] = {"Content-Type": "application/json"}
+    # ── WebSocket connection ──────────────────────────────────────────────
 
+    def _ws_url(self) -> str:
+        url = self.api_url.replace("https://", "wss://").replace("http://", "ws://")
+        return f"{url}/ws/ingest"
+
+    async def _connect_ws(self) -> bool:
+        if not self.enabled or not self.wallet:
+            return False
+        if self._ws_connecting:
+            return False
+        if self._ws_connect_failures >= self._ws_max_failures:
+            return False
+
+        self._ws_connecting = True
+        try:
+            session = await self._get_session()
+            ws_url = self._ws_url()
+            self._ws = await session.ws_connect(ws_url, timeout=10)
+
+            nonce = str(int(time.time()))
+            message = f"{nonce}:ws-auth"
+            signature = self.wallet.hotkey.sign(message.encode("utf-8"))
+            sig_hex = signature.hex() if isinstance(signature, bytes) else str(signature)
+
+            await self._ws.send_json({
+                "type": "auth",
+                "hotkey": self.hotkey,
+                "nonce": nonce,
+                "signature": sig_hex,
+                "runId": self.run_id,
+            })
+
+            resp = await asyncio.wait_for(self._ws.receive_json(), timeout=5)
+            if resp.get("type") == "auth-ok":
+                self._ws_authenticated = True
+                self._ws_connect_failures = 0
+                self._start_heartbeat()
+                logger.info("[DashboardReporter] WebSocket connected and authenticated")
+                return True
+            else:
+                logger.warning(f"[DashboardReporter] WS auth rejected: {resp}")
+                await self._ws.close()
+                self._ws = None
+                self._ws_connect_failures += 1
+                return False
+
+        except Exception as e:
+            logger.warning(f"[DashboardReporter] WS connect failed: {e}")
+            self._ws = None
+            self._ws_authenticated = False
+            self._ws_connect_failures += 1
+            return False
+        finally:
+            self._ws_connecting = False
+
+    def _start_heartbeat(self):
+        if self._ws_heartbeat_task and not self._ws_heartbeat_task.done():
+            return
+
+        async def heartbeat_loop():
+            while self._ws and not self._ws.closed and self._ws_authenticated:
+                try:
+                    await self._ws.send_json({"type": "heartbeat"})
+                except Exception:
+                    break
+                await asyncio.sleep(15)
+
+        self._ws_heartbeat_task = asyncio.create_task(heartbeat_loop())
+
+    async def _send_ws(self, msg_type: str, data: dict[str, Any]) -> bool:
+        if not self._ws or self._ws.closed or not self._ws_authenticated:
+            if not await self._connect_ws():
+                return False
+
+        try:
+            await self._ws.send_json({"type": msg_type, "data": data})  # type: ignore
+            return True
+        except Exception as e:
+            logger.warning(f"[DashboardReporter] WS send failed: {e}")
+            self._ws_authenticated = False
+            self._ws = None
+            return False
+
+    # ── HTTP fallback ─────────────────────────────────────────────────────
+
+    def _sign_payload(self, body_bytes: bytes) -> dict[str, str]:
+        headers: dict[str, str] = {"Content-Type": "application/json"}
         if not self.wallet:
             return headers
-
         try:
             nonce = str(int(time.time()))
             body_hash = hashlib.sha256(body_bytes).hexdigest()
             message = f"{nonce}:{body_hash}"
-
             signature = self.wallet.hotkey.sign(message.encode("utf-8"))
             sig_hex = signature.hex() if isinstance(signature, bytes) else str(signature)
-
             headers["x-hotkey"] = self.hotkey
             headers["x-nonce"] = nonce
             headers["x-signature"] = sig_hex
         except Exception as e:
             logger.warning(f"[DashboardReporter] failed to sign request: {e}")
-
         return headers
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -102,7 +190,16 @@ class DashboardReporter:
         except Exception as e:
             logger.warning(f"[DashboardReporter] POST {path} failed: {e}")
 
-    # ── Run registration ─────────────────────────────────────────────────
+    # ── Unified send: try WS first, fall back to HTTP ─────────────────────
+
+    async def _send(self, msg_type: str, http_path: str, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        if await self._send_ws(msg_type, payload):
+            return
+        await self._post(http_path, payload)
+
+    # ── Run registration (always HTTP -- must exist before WS auth) ───────
 
     async def register_run(self) -> None:
         await self._post(
@@ -117,6 +214,7 @@ class DashboardReporter:
                 "config": self.config,
             },
         )
+        await self._connect_ws()
 
     # ── Validator window metrics ──────────────────────────────────────────
 
@@ -220,7 +318,7 @@ class DashboardReporter:
                 gs_map.get(k, k): v for k, v in gradient_stats.items() if v is not None
             }
 
-        await self._post("/ingest/window", payload)
+        await self._send("window", "/ingest/window", payload)
 
     # ── Miner metrics ─────────────────────────────────────────────────────
 
@@ -277,9 +375,9 @@ class DashboardReporter:
             if val is not None:
                 payload[js_name] = val
 
-        await self._post("/ingest/miner", payload)
+        await self._send("miner", "/ingest/miner", payload)
 
-    # ── Sync scores (validator → per-UID sync data) ───────────────────────
+    # ── Sync scores ───────────────────────────────────────────────────────
 
     async def report_sync_scores(
         self,
@@ -287,14 +385,12 @@ class DashboardReporter:
         window: int,
         scores: list[dict[str, Any]],
     ) -> None:
-        await self._post(
-            "/ingest/sync-scores",
-            {
-                "runId": self.run_id,
-                "window": window,
-                "scores": scores,
-            },
-        )
+        payload = {
+            "runId": self.run_id,
+            "window": window,
+            "scores": scores,
+        }
+        await self._send("sync-scores", "/ingest/sync-scores", payload)
 
     # ── Slash events ──────────────────────────────────────────────────────
 
@@ -307,17 +403,15 @@ class DashboardReporter:
         score_after: float,
         reason: str,
     ) -> None:
-        await self._post(
-            "/ingest/slash",
-            {
-                "runId": self.run_id,
-                "window": window,
-                "uid": uid,
-                "scoreBefore": score_before,
-                "scoreAfter": score_after,
-                "reason": reason,
-            },
-        )
+        payload = {
+            "runId": self.run_id,
+            "window": window,
+            "uid": uid,
+            "scoreBefore": score_before,
+            "scoreAfter": score_after,
+            "reason": reason,
+        }
+        await self._send("slash", "/ingest/slash", payload)
 
     # ── Inactivity events ─────────────────────────────────────────────────
 
@@ -329,19 +423,21 @@ class DashboardReporter:
         score_before: float,
         score_after: float,
     ) -> None:
-        await self._post(
-            "/ingest/inactivity",
-            {
-                "runId": self.run_id,
-                "window": window,
-                "uid": uid,
-                "scoreBefore": score_before,
-                "scoreAfter": score_after,
-            },
-        )
+        payload = {
+            "runId": self.run_id,
+            "window": window,
+            "uid": uid,
+            "scoreBefore": score_before,
+            "scoreAfter": score_after,
+        }
+        await self._send("inactivity", "/ingest/inactivity", payload)
 
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     async def close(self) -> None:
+        if self._ws_heartbeat_task and not self._ws_heartbeat_task.done():
+            self._ws_heartbeat_task.cancel()
+        if self._ws and not self._ws.closed:
+            await self._ws.close()
         if self._session and not self._session.closed:
             await self._session.close()

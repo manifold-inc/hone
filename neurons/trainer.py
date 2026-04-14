@@ -500,12 +500,23 @@ class Trainer:
                 log_loss = dist_helper.ddp_reduce(
                     loss_item, op=ReduceOp.AVG, device=self.device
                 )
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
                 if not null_round:
                     self.scaler.unscale_(self.inner_optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.scaler.step(self.inner_optimizer)
+
+                    # Skip step if gradients contain NaN/Inf to prevent
+                    # permanent model corruption from bf16 overflow in the
+                    # 96-layer effective backward path.
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 1.0
+                    )
+                    if torch.isfinite(grad_norm):
+                        self.scaler.step(self.inner_optimizer)
+                    else:
+                        hone.logger.warning(
+                            f"NaN/Inf grad_norm ({grad_norm:.4f}) at inner "
+                            f"step {inner_step_count + 1} — skipping optimizer step"
+                        )
                     self.scaler.update()
                     self.inner_scheduler.step()
                     self.inner_scheduler_step_count += 1

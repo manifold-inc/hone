@@ -358,9 +358,18 @@ class LoopLM(nn.Module):
         return logits, t_max
 
     def init_weights(self):
-        """Xavier-uniform for linear layers, normal for embeddings."""
-        for module in self.modules():
+        """Initialize weights following the Ouro convention.
+
+        Embedding uses normal(0, 0.02).  Linear layers use Xavier-uniform,
+        but the lm_head is skipped when weights are tied to the embedding
+        (otherwise the lm_head Xavier init overwrites the embedding init,
+        producing very small embedding norms that amplify gradients through
+        the first RMSNorm by ~170x with a 256K vocabulary).
+        """
+        for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
+                if name == "lm_head" and self.config.tie_embeddings:
+                    continue
                 nn.init.xavier_uniform_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)

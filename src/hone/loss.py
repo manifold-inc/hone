@@ -28,12 +28,14 @@ def _gate_logits_to_lambdas(
 ) -> torch.Tensor:
     """Convert raw gate logits to per-step exit probabilities lambda_t.
 
+    All computation is in float32 for numerical stability during backward
+    through the looped architecture.
+
     Returns:
-        lam: (T, B, S) tensor with values in (0, 1).
+        lam: (T, B, S) float32 tensor with values in (0, 1).
     """
-    # Each gate logit is (B, S, 1); squeeze and sigmoid
     return torch.stack(
-        [torch.sigmoid(g.squeeze(-1)) for g in step_gate_logits], dim=0
+        [torch.sigmoid(g.squeeze(-1).float()) for g in step_gate_logits], dim=0
     )  # (T, B, S)
 
 
@@ -85,13 +87,13 @@ def _per_step_cross_entropy(
         labels:      (B, S) with -100 for ignored positions.
 
     Returns:
-        losses: (T,) tensor of mean cross-entropy at each recurrent step.
+        losses: (T,) float32 tensor of mean cross-entropy at each recurrent step.
     """
     losses = []
     for logits in step_logits:
         B, S, V = logits.shape
         loss = F.cross_entropy(
-            logits.reshape(-1, V),
+            logits.float().reshape(-1, V),
             labels.reshape(-1),
             ignore_index=-100,
             reduction="mean",
@@ -106,14 +108,17 @@ def _per_step_per_token_cross_entropy(
 ) -> torch.Tensor:
     """Per-step, per-token cross-entropy (unreduced).
 
+    Logits are cast to float32 to avoid bf16 overflow in the softmax
+    backward (especially harmful with large vocabularies like 256K).
+
     Returns:
-        losses: (T, B, S) tensor.
+        losses: (T, B, S) float32 tensor.
     """
     out = []
     for logits in step_logits:
         B, S, V = logits.shape
         loss = F.cross_entropy(
-            logits.reshape(-1, V),
+            logits.float().reshape(-1, V),
             labels.reshape(-1),
             ignore_index=-100,
             reduction="none",
@@ -225,7 +230,7 @@ def looplm_sft_loss(
     labels: torch.Tensor,
 ) -> torch.Tensor:
     """Standard SFT loss using the final recurrent step's logits."""
-    logits = output.step_logits[-1]  # (B, S, V)
+    logits = output.step_logits[-1].float()  # (B, S, V)
     B, S, V = logits.shape
     return F.cross_entropy(
         logits.reshape(-1, V),
