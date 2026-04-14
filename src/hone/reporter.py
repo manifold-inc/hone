@@ -432,6 +432,41 @@ class DashboardReporter:
         }
         await self._send("inactivity", "/ingest/inactivity", payload)
 
+    # ── Inner step metrics (high frequency, per optimizer step) ─────────
+
+    async def report_inner_step(
+        self,
+        *,
+        window: int,
+        inner_step: int,
+        global_step: int,
+        loss: float | None = None,
+        batch_size: int | None = None,
+        batch_tokens: int | None = None,
+        inner_lr: float | None = None,
+        grad_norm: float | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "runId": self.run_id,
+            "window": window,
+            "innerStep": inner_step,
+            "globalStep": global_step,
+        }
+        field_map = {
+            "loss": "loss",
+            "batch_size": "batchSize",
+            "batch_tokens": "batchTokens",
+            "inner_lr": "innerLr",
+            "grad_norm": "gradNorm",
+        }
+        local_vars = locals()
+        for py_name, js_name in field_map.items():
+            val = local_vars.get(py_name)
+            if val is not None:
+                payload[js_name] = val
+
+        await self._send("inner-step", "/ingest/inner-step", payload)
+
     # ── Cleanup ───────────────────────────────────────────────────────────
 
     async def close(self) -> None:

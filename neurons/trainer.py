@@ -501,12 +501,10 @@ class Trainer:
                     loss_item, op=ReduceOp.AVG, device=self.device
                 )
 
+                grad_norm = None
                 if not null_round:
                     self.scaler.unscale_(self.inner_optimizer)
 
-                    # Skip step if gradients contain NaN/Inf to prevent
-                    # permanent model corruption from bf16 overflow in the
-                    # 96-layer effective backward path.
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 1.0
                     )
@@ -537,6 +535,25 @@ class Trainer:
                         f"Batch {batch_count}, loss: {log_loss:.4f}, "
                         f"accum: {accum_batch_size}/{self.hparams.batch_size}"
                     )
+
+                    if hasattr(self, "dashboard_reporter"):
+                        current_lr = (
+                            self.inner_scheduler.get_last_lr()[0]
+                            if hasattr(self.inner_scheduler, "get_last_lr")
+                            else None
+                        )
+                        asyncio.create_task(
+                            self.dashboard_reporter.report_inner_step(
+                                window=step_window,
+                                inner_step=inner_step_count,
+                                global_step=getattr(self, "global_step", 0),
+                                loss=float(log_loss),
+                                batch_size=int(accum_batch_size),
+                                batch_tokens=int(tokens_this),
+                                inner_lr=float(current_lr) if current_lr else None,
+                                grad_norm=float(grad_norm) if grad_norm is not None and torch.isfinite(grad_norm) else None,
+                            )
+                        )
                 if window_entry_loss == 0.0:
                     total_first = int(
                         dist_helper.ddp_reduce(batch_count, device=self.device)

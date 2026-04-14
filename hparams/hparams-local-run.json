@@ -1,0 +1,31 @@
+{
+    "model_size": "tiny",
+    "sequence_length": 512,
+    "micro_batch_size": 1,
+    "batch_size": 4,
+    "target_batch_size": 8,
+    "inner_steps": 3,
+    "t_max": 2,
+
+    "blocks_per_window": 115,
+    "topk_compression": 32,
+    "target_chunk": 32,
+
+    "offload_optimizer_states": false,
+
+    "optimizer": {
+        "type": "adamw",
+        "adamw": {
+            "betas": [0.9, 0.95],
+            "eps": 1e-8,
+            "weight_decay": 0.1,
+            "learning_rate": 3e-4,
+            "scheduler": {
+                "warmup_steps": 5,
+                "warmup_inner_steps": 3,
+                "t_max": 1000,
+                "eta_min_factor": 0.1
+            }
+        }
+    }
+}
