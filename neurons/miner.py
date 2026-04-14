@@ -212,8 +212,8 @@ class Miner(BaseNode, Trainer):
         self.tp_degree = 1
         self.pp_degree = 1
         self.cp_degree = 1
-        self.dp_replicate = int(getattr(tt, "dp_replicate", 1))
-        self.dp_shard = int(getattr(tt, "dp_shard", 1))
+        self.dp_replicate = int(getattr(fsdp_cfg, "dp_replicate", 1))
+        self.dp_shard = int(getattr(fsdp_cfg, "dp_shard", 1))
 
         # Init compression
         self.transformer = hone.compress.ChunkingTransformer(
