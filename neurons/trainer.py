@@ -162,6 +162,36 @@ class Trainer:
         )
         return scheduler
 
+    def should_skip_scheduler_step(self) -> bool:
+        """Check if we're in the LR flatten window and should skip scheduler stepping.
+
+        flatten_start_step and flatten_duration are in outer steps (windows),
+        but we check against inner_scheduler_step_count which tracks individual
+        scheduler steps.
+        """
+        optimizer_config = getattr(self.hparams, "optimizer", {})
+        opt_type = optimizer_config.get("type", "adamw").lower()
+        opt_cfg = optimizer_config.get(opt_type, {})
+        sched_cfg = opt_cfg.get("scheduler", {})
+
+        flatten_start_window = sched_cfg.get("flatten_start_step", None)
+        if flatten_start_window is None or flatten_start_window <= 0:
+            return False
+
+        flatten_duration_windows = sched_cfg.get("flatten_duration", 0)
+        if flatten_duration_windows <= 0:
+            return False
+
+        inner_steps_per_window = self.hparams.inner_steps
+        flatten_start_inner = flatten_start_window * inner_steps_per_window
+        flatten_end_inner = (
+            flatten_start_window + flatten_duration_windows
+        ) * inner_steps_per_window
+
+        return (
+            flatten_start_inner <= self.inner_scheduler_step_count < flatten_end_inner
+        )
+
     def _build_inner_optimizer(self, validator: bool):
         optimizer_config = getattr(self.hparams, "optimizer", {})
         opt_type = optimizer_config.get("type", "adamw").lower()
