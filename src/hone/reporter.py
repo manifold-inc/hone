@@ -1,4 +1,4 @@
-"""Dashboard metrics reporter -- async HTTP + WebSocket client for hone-api."""
+"""Dashboard metrics reporter -- async HTTP + WebSocket + Redis client for hone-api."""
 
 import asyncio
 import hashlib
@@ -16,10 +16,15 @@ from .logging import logger
 class DashboardReporter:
     """Fire-and-forget reporter that sends metrics to the hone-api ingest endpoints.
 
-    Prefers a persistent WebSocket connection for low-latency streaming and
-    liveness tracking. Falls back to HTTP POST if the WebSocket is unavailable.
+    Transport priority:
+      1. Redis Streams (if REDIS_URL is set) -- simplest, most reliable
+      2. WebSocket to hone-api /ws/ingest -- low-latency, keeps liveness
+      3. HTTP POST to hone-api /ingest/* -- universal fallback
 
-    Authentication uses Bittensor sr25519 hotkey signatures.
+    Each Redis message carries an SR25519 signature so hone-api verifies
+    authenticity before persisting. Even if Redis is compromised, forged
+    messages are rejected without a valid Bittensor hotkey.
+
     Never raises or blocks the training loop -- all errors are logged and swallowed.
     """
 
@@ -49,6 +54,12 @@ class DashboardReporter:
 
         self._session: aiohttp.ClientSession | None = None
 
+        # Redis state
+        self._redis_url = os.environ.get("REDIS_URL", "")
+        self._redis: Any | None = None
+        self._redis_available = bool(self._redis_url)
+        self._redis_stream_key = f"metrics:{netuid}:{hotkey}"
+
         # WebSocket state
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_authenticated = False
@@ -57,12 +68,73 @@ class DashboardReporter:
         self._ws_heartbeat_task: asyncio.Task | None = None
         self._ws_connecting = False
 
-        if not self.enabled:
-            logger.info("[DashboardReporter] disabled (no DASHBOARD_API_URL set)")
+        if not self.enabled and not self._redis_available:
+            logger.info("[DashboardReporter] disabled (no DASHBOARD_API_URL or REDIS_URL set)")
         elif not self.wallet:
             logger.warning(
                 "[DashboardReporter] no wallet provided -- requests will be unsigned"
             )
+        if self._redis_available:
+            logger.info(f"[DashboardReporter] Redis transport enabled → {self._redis_stream_key}")
+
+    # ── Redis Streams transport ──────────────────────────────────────────
+
+    async def _get_redis(self) -> Any:
+        if self._redis is not None:
+            return self._redis
+        try:
+            import redis.asyncio as aioredis
+
+            self._redis = aioredis.from_url(
+                self._redis_url,
+                decode_responses=True,
+                socket_connect_timeout=5,
+            )
+            await self._redis.ping()
+            logger.info("[DashboardReporter] Redis connection established")
+            return self._redis
+        except Exception as e:
+            logger.warning(f"[DashboardReporter] Redis connect failed: {e}")
+            self._redis = None
+            self._redis_available = False
+            return None
+
+    def _sign_message(self, data_json: str) -> tuple[str, str, str]:
+        """Sign data_json and return (nonce, body_hash, signature_hex)."""
+        nonce = str(int(time.time()))
+        body_hash = hashlib.sha256(data_json.encode("utf-8")).hexdigest()
+        message = f"{nonce}:{body_hash}"
+        sig = self.wallet.hotkey.sign(message.encode("utf-8"))
+        sig_hex = sig.hex() if isinstance(sig, bytes) else str(sig)
+        return nonce, body_hash, sig_hex
+
+    async def _send_redis(self, msg_type: str, data: dict[str, Any]) -> bool:
+        if not self._redis_available or not self.wallet:
+            return False
+        try:
+            r = await self._get_redis()
+            if r is None:
+                return False
+
+            data_json = json.dumps(data, default=str)
+            nonce, _, sig_hex = self._sign_message(data_json)
+
+            await r.xadd(
+                self._redis_stream_key,
+                {
+                    "type": msg_type,
+                    "hotkey": self.hotkey,
+                    "runId": self.run_id,
+                    "nonce": nonce,
+                    "signature": sig_hex,
+                    "data": data_json,
+                },
+                maxlen=10000,
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[DashboardReporter] Redis XADD failed: {e}")
+            return False
 
     # ── WebSocket connection ──────────────────────────────────────────────
 
@@ -190,10 +262,12 @@ class DashboardReporter:
         except Exception as e:
             logger.warning(f"[DashboardReporter] POST {path} failed: {e}")
 
-    # ── Unified send: try WS first, fall back to HTTP ─────────────────────
+    # ── Unified send: try Redis → WS → HTTP ────────────────────────────
 
     async def _send(self, msg_type: str, http_path: str, payload: dict[str, Any]) -> None:
-        if not self.enabled:
+        if not self.enabled and not self._redis_available:
+            return
+        if await self._send_redis(msg_type, payload):
             return
         if await self._send_ws(msg_type, payload):
             return
@@ -476,3 +550,9 @@ class DashboardReporter:
             await self._ws.close()
         if self._session and not self._session.closed:
             await self._session.close()
+        if self._redis is not None:
+            try:
+                await self._redis.aclose()
+            except Exception:
+                pass
+            self._redis = None

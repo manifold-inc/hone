@@ -1702,7 +1702,8 @@ class Comms(ChainManager):
 
         aggregated_state_dict = {}
         valid_uids = []
-        skipped_uids = []  # Retain UIDs that are skipped.
+        skipped_uids = []
+        skip_reasons: dict[int, str] = {}
         global_steps = []
 
         # Ensure deterministic order across processes/ranks
@@ -1754,10 +1755,12 @@ class Comms(ChainManager):
                             current_window=window,
                         )
                         skipped_uids.append(uid)
+                        skip_reasons[uid] = f"error response: {str(response)[:200]}"
                         continue
                     if response is None:
                         hone.logger.info(f"Skipped UID {uid} - gradient not found.")
                         skipped_uids.append(uid)
+                        skip_reasons[uid] = "gradient not found"
                         continue
 
                     try:
@@ -1777,15 +1780,18 @@ class Comms(ChainManager):
                             current_window=window,
                         )
                         skipped_uids.append(uid)
+                        skip_reasons[uid] = f"invalid response: {str(e)[:200]}"
                         continue
 
                     if state_dict_resp is None:
                         hone.logger.debug(f"Empty state dict from UID {uid}")
                         skipped_uids.append(uid)
+                        skip_reasons[uid] = "empty state dict"
                         continue
 
                     # ---------- Begin Compressed Indices and Values Check ----------
                     valid_response = True
+                    validation_failure = ""
                     for param_name, tensor in state_dict_resp.items():
                         received_compressed_params.add(param_name)
 
@@ -1807,6 +1813,7 @@ class Comms(ChainManager):
                                     f"Bad quant‑params in {param_name} from UID {uid}; "
                                     f"shift={shift}, scale={scale}"
                                 )
+                                validation_failure = f"bad quant params in {param_name}"
                                 valid_response = False
                                 break
                             if torch.is_tensor(lookup) and (
@@ -1816,6 +1823,7 @@ class Comms(ChainManager):
                                     f"Lookup table contains non‑finite values in {param_name} "
                                     f"from UID {uid}"
                                 )
+                                validation_failure = f"non-finite lookup table in {param_name}"
                                 valid_response = False
                                 break
 
@@ -1826,6 +1834,7 @@ class Comms(ChainManager):
                                 hone.logger.warning(
                                     f"Missing totalk for parameter {base_name} from UID {uid}, skipping UID."
                                 )
+                                validation_failure = f"missing totalk for {base_name}"
                                 valid_response = False
                                 break
                             # totalks stores integers, not tensors
@@ -1848,21 +1857,21 @@ class Comms(ChainManager):
                                 hone.logger.warning(
                                     f"Compressed indices check failed for parameter {param_name} from UID {uid}: {e}"
                                 )
+                                validation_failure = f"compressed indices check failed for {param_name}: {str(e)[:150]}"
                                 valid_response = False
                                 break
                         # Check if values are valid (not NaN, not Inf) - validate without dequantizing
                         elif param_name.endswith("vals"):
                             # Only move to device for validation if needed
                             if tensor.dtype == torch.uint8:
-                                # For quantized values, do a quick check on the raw bytes
                                 if tensor.nelement() == 0:
                                     hone.logger.warning(
                                         f"Empty tensor in {param_name} from UID {uid}, skipping"
                                     )
+                                    validation_failure = f"empty tensor in {param_name}"
                                     valid_response = False
                                     break
                             else:
-                                # For non-quantized tensors, check for NaN/Inf
                                 tensor_to_check = tensor.to(device)
                                 if (
                                     torch.isnan(tensor_to_check).any()
@@ -1871,6 +1880,7 @@ class Comms(ChainManager):
                                     hone.logger.warning(
                                         f"NaN/Inf in {param_name} from UID {uid}, skipping"
                                     )
+                                    validation_failure = f"NaN/Inf in {param_name}"
                                     valid_response = False
                                     break
                                 # Clean up temporary tensor
@@ -1886,6 +1896,7 @@ class Comms(ChainManager):
                                 hone.logger.warning(
                                     f"Missing quant_params for quantized {param_name} from UID {uid}"
                                 )
+                                validation_failure = f"missing quant_params for {param_name}"
                                 valid_response = False
                                 break
 
@@ -1913,6 +1924,10 @@ class Comms(ChainManager):
                                             f"expected shape prefix {expected_vals_prefix}, "
                                             f"got {actual_vals_prefix} (likely sharded gradient)"
                                         )
+                                        validation_failure = (
+                                            f"shape mismatch for {param_name}: "
+                                            f"expected {expected_vals_prefix}, got {actual_vals_prefix}"
+                                        )
                                         valid_response = False
                                         break
 
@@ -1923,14 +1938,15 @@ class Comms(ChainManager):
                         hone.logger.warning(
                             f"UID {uid} missing compressed parameters: {missing_params}, skipping UID."
                         )
+                        validation_failure = f"missing compressed parameters: {sorted(missing_params)}"
                         valid_response = False
 
-                    # If any check failed, skip this UID entirely
                     if not valid_response:
                         hone.logger.info(
                             f"Skipping UID {uid} due to validation failures"
                         )
                         skipped_uids.append(uid)
+                        skip_reasons[uid] = validation_failure or "validation failure"
                         continue
                     # ---------- End Compressed Indices and Values Check ----------
 
@@ -1991,6 +2007,7 @@ class Comms(ChainManager):
             uids=valid_uids,
             global_steps=global_steps,
             skipped_uids=skipped_uids,
+            skip_reasons=skip_reasons,
         )
         return result
 
@@ -2049,7 +2066,6 @@ class Comms(ChainManager):
             **kwargs,
         )
 
-        # Normalise to an empty shell if absolutely nothing came back
         if primary is None:
             primary = SimpleNamespace(
                 time=0.0,
@@ -2060,6 +2076,7 @@ class Comms(ChainManager):
                 uids=[],
                 global_steps=[],
                 skipped_uids=gather_uids.copy(),
+                skip_reasons={uid: "no valid gradients received" for uid in gather_uids},
             )
 
         context_log(
@@ -2091,6 +2108,7 @@ class Comms(ChainManager):
                     primary.uids.extend(fallback.uids)
                     primary.global_steps.extend(fallback.global_steps)
                     primary.skipped_uids.extend(fallback.skipped_uids)
+                    primary.skip_reasons.update(fallback.skip_reasons)
                     primary.upload_bytes += fallback.upload_bytes
                     primary.download_bytes += fallback.download_bytes
 

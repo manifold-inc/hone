@@ -1500,6 +1500,7 @@ class Validator(BaseNode, Trainer):
 
             gather_start = hone.T()
             skipped_uids: list[int] = []
+            skip_reasons: dict[int, str] = {}
             success_rate = 0.0
             gather_result = None
             skip_window = False
@@ -1614,6 +1615,7 @@ class Validator(BaseNode, Trainer):
                 self.offload_gather_results(gather_result, log=True)
 
                 skipped_uids = gather_result.skipped_uids
+                skip_reasons = getattr(gather_result, "skip_reasons", {})
                 success_rate = gather_result.success_rate
 
             # Synchronize all ranks after gather processing
@@ -1695,7 +1697,7 @@ class Validator(BaseNode, Trainer):
             # Only master evaluates miner sync and applies slashing
             if self.is_master:
                 await self.slash_for_poor_sync()
-                self.slash_for_missing_gradients(skipped_uids, success_rate)
+                self.slash_for_missing_gradients(skipped_uids, success_rate, skip_reasons)
 
                 # Reset consecutive missing gradient count for successful gather peers
                 for uid in actual_gather_uids:
@@ -4298,7 +4300,10 @@ class Validator(BaseNode, Trainer):
                     self.binary_moving_averages[uid] *= self.sync_score_slash_rate
 
     def slash_for_missing_gradients(
-        self, skipped_uids: list[int], success_rate: float
+        self,
+        skipped_uids: list[int],
+        success_rate: float,
+        skip_reasons: dict[int, str] | None = None,
     ) -> None:
         """
         Slash peers that failed to submit gradients during gather with escalating penalties.
@@ -4306,7 +4311,10 @@ class Validator(BaseNode, Trainer):
         Args:
             skipped_uids: List of UIDs that were skipped during gather
             success_rate: Success rate of the gather operation
+            skip_reasons: Per-UID reason strings from the gather phase
         """
+        if skip_reasons is None:
+            skip_reasons = {}
         for uid in skipped_uids:
             if 0 <= uid < self.final_scores.size(0):
                 old_score = self.final_scores[uid].item()
@@ -4346,16 +4354,25 @@ class Validator(BaseNode, Trainer):
                         sync_window=self.sync_window,
                         current_window=self.current_window,
                     )
-                    # Always add to naughty list
                     self.naughty_peers[uid] = self.naughty_peer_timeout
-                    # Only reset if score is positive
+                    new_score = 0.0
                     if old_score > 0:
                         self.reset_peer(uid)
                     self.evaluated_uids.add(uid)
                     self.peers_last_eval_window[uid] = self.sync_window
-
-                    # Record missing gradient for OpenSkill scoring
                     self.record_missing_gradient_for_openskill(uid)
+
+                    if hasattr(self, "dashboard_reporter"):
+                        reason = skip_reasons.get(uid, "missing gradient in gather")
+                        asyncio.create_task(
+                            self.dashboard_reporter.report_slash_event(
+                                window=int(self.sync_window),
+                                uid=int(uid),
+                                score_before=float(old_score),
+                                score_after=float(new_score),
+                                reason=f"mega slash: {reason}"[:256],
+                            )
+                        )
                     continue
 
                 # Determine slash multiplier based on success rate and consecutive count
@@ -4402,6 +4419,18 @@ class Validator(BaseNode, Trainer):
                         sync_window=self.sync_window,
                         current_window=self.current_window,
                     )
+
+                    if hasattr(self, "dashboard_reporter"):
+                        reason = skip_reasons.get(uid, "missing gradient in gather")
+                        asyncio.create_task(
+                            self.dashboard_reporter.report_slash_event(
+                                window=int(self.sync_window),
+                                uid=int(uid),
+                                score_before=float(old_score),
+                                score_after=float(new_score),
+                                reason=reason[:256],
+                            )
+                        )
                 else:
                     hone.log_with_context(
                         level="info",
@@ -4411,8 +4440,6 @@ class Validator(BaseNode, Trainer):
                     )
                 self.evaluated_uids.add(uid)
                 self.peers_last_eval_window[uid] = self.sync_window
-
-                # Record missing gradient for OpenSkill scoring
                 self.record_missing_gradient_for_openskill(uid)
             else:
                 hone.log_with_context(
