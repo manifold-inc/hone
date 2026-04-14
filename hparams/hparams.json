@@ -8,7 +8,7 @@
     "micro_batch_size": 1,
     "target_batch_size": 1024,
     "batch_size": 32,
-    "inner_steps": 5,
+    "inner_steps": 20,
     "outer_learning_rate": 0.4,
     "weight_decay": 0.1,
 
@@ -52,6 +52,7 @@
     "idx_overlap_threshold": 0.4,
     "consecutive_negative_threshold": 3,
     "exclude_negative_peers": true,
+    "eval_lr_factor": 0.5,
 
     "optimizer": {
         "type": "adamw",

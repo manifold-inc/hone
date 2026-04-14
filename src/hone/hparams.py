@@ -54,6 +54,7 @@ DEFAULT_HPARAMS = {
     "alpha_f": 0.1,
     "t_max_scheduler": 20000,
     "outer_steps_per_shard": 455,
+    "eval_lr_factor": 0.5,
 }
 
 
