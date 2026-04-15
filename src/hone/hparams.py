@@ -142,3 +142,22 @@ def load_hparams(
         f"Model size: '{hparams.get('model_size')}'"
     )
     return create_namespace(hparams)
+
+
+def hparams_to_json_dict(ns: SimpleNamespace) -> dict:
+    """Extract a JSON-serializable dict from a hparams namespace.
+
+    Skips non-serializable objects like tokenizer, model_config, and FSDP
+    sub-namespaces (the latter is converted back to a plain dict).
+    """
+    out: dict = {}
+    for k, v in vars(ns).items():
+        if k in ("tokenizer", "model_config"):
+            continue
+        if isinstance(v, SimpleNamespace):
+            out[k] = vars(v)
+        elif isinstance(v, (str, int, float, bool, type(None), list)):
+            out[k] = v
+        elif isinstance(v, dict):
+            out[k] = v
+    return out

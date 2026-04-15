@@ -337,6 +337,9 @@ class Miner(BaseNode, Trainer):
                 netuid=self.config.netuid,
                 uid=self.uid,
                 version=hone.__version__,
+                project=getattr(self.hparams, "project", None),
+                model_size=getattr(self.hparams, "model_size", None),
+                config=hone.hparams_to_json_dict(self.hparams),
                 wallet=self.wallet,
             )
         else:

@@ -36,6 +36,8 @@ class DashboardReporter:
         netuid: int,
         uid: int | None = None,
         version: str | None = None,
+        project: str | None = None,
+        model_size: str | None = None,
         config: dict[str, Any] | None = None,
         api_url: str | None = None,
         wallet: Any | None = None,
@@ -50,6 +52,8 @@ class DashboardReporter:
         self.netuid = netuid
         self.uid = uid
         self.version = version
+        self.project = project
+        self.model_size = model_size
         self.config = config
 
         self._session: aiohttp.ClientSession | None = None
@@ -286,6 +290,10 @@ class DashboardReporter:
             payload["uid"] = self.uid
         if self.version is not None:
             payload["version"] = self.version
+        if self.project is not None:
+            payload["project"] = self.project
+        if self.model_size is not None:
+            payload["modelSize"] = self.model_size
         if self.config is not None:
             payload["config"] = self.config
 

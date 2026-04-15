@@ -13,7 +13,7 @@
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
 
-    "blocks_per_window": 25,
+    "blocks_per_window": 26,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
     "momentum_decay": 0.95,
@@ -37,7 +37,7 @@
     "validator_sample_micro_bs": 8,
     "gather_peers_slash_threshold": 0.4,
     "uids_per_window": 20,
-    "time_window_delta_seconds": 15,
+    "time_window_delta_seconds": 70,
     "reset_inactivity_windows": 3,
     "sync_max_steps_behind": 2,
     "binary_score_ma_alpha": 0.05,
