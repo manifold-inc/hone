@@ -418,6 +418,13 @@ class DashboardReporter:
         gradient_total_elements: int | None = None,
         cpu_usage: float | None = None,
         gpu_utilization: float | None = None,
+        outer_step_applied: bool | None = None,
+        compressed_size_mb: float | None = None,
+        upload_size_mb: float | None = None,
+        offload_time: float | None = None,
+        restore_time: float | None = None,
+        skipped_peers: int | None = None,
+        gather_peer_list: list[int] | None = None,
     ) -> None:
         payload: dict[str, Any] = {
             "runId": self.run_id,
@@ -442,6 +449,13 @@ class DashboardReporter:
             "gradient_total_elements": "gradientTotalElements",
             "cpu_usage": "cpuUsage",
             "gpu_utilization": "gpuUtilization",
+            "outer_step_applied": "outerStepApplied",
+            "compressed_size_mb": "compressedSizeMb",
+            "upload_size_mb": "uploadSizeMb",
+            "offload_time": "offloadTime",
+            "restore_time": "restoreTime",
+            "skipped_peers": "skippedPeers",
+            "gather_peer_list": "gatherPeerList",
         }
         local_vars = locals()
         for py_name, js_name in field_map.items():
@@ -540,6 +554,21 @@ class DashboardReporter:
                 payload[js_name] = val
 
         await self._send("inner-step", "/ingest/inner-step", payload)
+
+    # ── Gather status (per-UID gather outcome) ─────────────────────────
+
+    async def report_gather_status(
+        self,
+        *,
+        window: int,
+        results: list[dict[str, Any]],
+    ) -> None:
+        payload = {
+            "runId": self.run_id,
+            "window": window,
+            "results": results,
+        }
+        await self._send("gather-status", "/ingest/gather-status", payload)
 
     # ── Cleanup ───────────────────────────────────────────────────────────
 

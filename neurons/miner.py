@@ -970,6 +970,8 @@ class Miner(BaseNode, Trainer):
                     },
                 )
                 # Dashboard reporter
+                _skipped = gather_result.skipped_uids if gather_result else []
+                _gathered = list(gather_result.uids) if gather_result else []
                 asyncio.create_task(
                     self.dashboard_reporter.report_miner(
                         window=int(self.current_window),
@@ -998,6 +1000,13 @@ class Miner(BaseNode, Trainer):
                         },
                         gradient_l2_norm=float(gradient_fingerprint["global_l2_norm"]) if gradient_fingerprint else None,
                         gradient_total_elements=int(gradient_fingerprint["total_elements"]) if gradient_fingerprint else None,
+                        outer_step_applied=bool(should_update),
+                        compressed_size_mb=float(upload_size / 1e6) if upload_size else None,
+                        upload_size_mb=float(upload_size / 1e6) if upload_size else None,
+                        offload_time=float(offload_time),
+                        restore_time=float(restore_time),
+                        skipped_peers=int(len(_skipped)),
+                        gather_peer_list=[int(u) for u in _gathered] if _gathered else None,
                     )
                 )
 

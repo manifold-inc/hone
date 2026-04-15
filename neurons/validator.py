@@ -1630,6 +1630,33 @@ class Validator(BaseNode, Trainer):
                     current_window=self.current_window,
                 )
 
+                # Report per-UID gather status to dashboard
+                if hasattr(self, "dashboard_reporter") and gather_result is not None:
+                    gather_status_results = []
+                    for uid in gather_result.uids:
+                        gather_status_results.append({
+                            "uid": int(uid), "status": "success",
+                        })
+                    for uid in skipped_uids:
+                        reason = skip_reasons.get(uid, "unknown")
+                        gather_status_results.append({
+                            "uid": int(uid), "status": "skipped",
+                            "reason": str(reason)[:256],
+                        })
+                    for uid in self.excluded_from_gather:
+                        if uid not in skipped_uids:
+                            gather_status_results.append({
+                                "uid": int(uid), "status": "excluded",
+                                "reason": "consecutive negative evals",
+                            })
+                    if gather_status_results:
+                        asyncio.create_task(
+                            self.dashboard_reporter.report_gather_status(
+                                window=int(self.sync_window),
+                                results=gather_status_results,
+                            )
+                        )
+
             # Compute gather-quality metrics (only on master)
             intended_gather_uids = list(self.comms.peers)
             actual_gather_uids = []
@@ -1894,6 +1921,9 @@ class Validator(BaseNode, Trainer):
                     current_window=self.current_window,
                 )
 
+            # Per-UID evaluation details for dashboard reporting
+            uid_eval_details: dict[int, dict] = {}
+
             # Process each UID with sliding window loading
             for eval_uid in evaluation_uids:
                 uid_eval_start = time.time()
@@ -1984,6 +2014,11 @@ class Validator(BaseNode, Trainer):
 
                 # All ranks skip if gradient is invalid
                 if not gradient_valid:
+                    if self.is_master:
+                        uid_eval_details[eval_uid] = {
+                            "evalStatus": "invalid",
+                            "evalSkipReason": "gradient fetch failed or invalid",
+                        }
                     continue
 
                 # Synchronize all ranks after gradient validation
@@ -2014,6 +2049,11 @@ class Validator(BaseNode, Trainer):
                         tag=f"skip_uid_own_before_{eval_uid}",
                         local_rank=self.local_rank,
                     )
+                    if self.is_master:
+                        uid_eval_details[eval_uid] = {
+                            "evalStatus": "skipped",
+                            "evalSkipReason": "eval model failed (own/before)",
+                        }
                     continue
                 # (if ok, loss_before_own/n_batches exist)
 
@@ -2080,6 +2120,11 @@ class Validator(BaseNode, Trainer):
                     dist_helper.safe_barrier(
                         tag=f"skip_uid_{eval_uid}", local_rank=self.local_rank
                     )
+                    if self.is_master:
+                        uid_eval_details[eval_uid] = {
+                            "evalStatus": "invalid",
+                            "evalSkipReason": "gradient application failed",
+                        }
                     continue
 
                 # Synchronize all ranks after gradient application
@@ -2112,6 +2157,11 @@ class Validator(BaseNode, Trainer):
                     dist_helper.safe_barrier(
                         tag=f"skip_uid_own_after_{eval_uid}", local_rank=self.local_rank
                     )
+                    if self.is_master:
+                        uid_eval_details[eval_uid] = {
+                            "evalStatus": "skipped",
+                            "evalSkipReason": "eval model failed (own/after)",
+                        }
                     continue
 
                 # evaluate_model now handles averaging across ranks
@@ -2189,6 +2239,11 @@ class Validator(BaseNode, Trainer):
                         tag=f"skip_uid_random_after_{eval_uid}",
                         local_rank=self.local_rank,
                     )
+                    if self.is_master:
+                        uid_eval_details[eval_uid] = {
+                            "evalStatus": "skipped",
+                            "evalSkipReason": "eval model failed (random/after)",
+                        }
                     continue
                 # evaluate_model now handles averaging across ranks
 
@@ -2306,6 +2361,16 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                         eval_uid=eval_uid,
                     )
+
+                    uid_eval_details[eval_uid] = {
+                        "evalStatus": "evaluated",
+                        "lossOwnBefore": float(self.loss_before_per_batch_own),
+                        "lossOwnAfter": float(self.loss_after_per_batch_own),
+                        "lossRandomBefore": float(self.loss_before_per_batch_random),
+                        "lossRandomAfter": float(self.loss_after_per_batch_random),
+                        "improvementOwn": float(improvement_own),
+                        "improvementRandom": float(improvement_random),
+                    }
 
                     # Update binary moving average using exponential moving average formula:
                     # new_avg = (1-alpha) * old_avg + alpha * new_value
@@ -2770,29 +2835,58 @@ class Validator(BaseNode, Trainer):
                     with_gpu_metrics=True,
                 )
                 # Dashboard reporter
+                bma_threshold = getattr(self.hparams, "bma_threshold", 0.10)
+                bma_warmup_windows = getattr(self.hparams, "bma_warmup_windows", 10)
+                windows_since_start = self.current_window - self.start_window
+                past_warmup = windows_since_start >= bma_warmup_windows
+
                 dashboard_uid_scores = []
                 for eval_uid in sorted(self.evaluated_uids):
                     if 0 <= eval_uid < self.gradient_scores.numel():
-                        dashboard_uid_scores.append(
-                            {
-                                "uid": int(eval_uid),
-                                "gradientScore": float(self.gradient_scores[eval_uid].item()),
-                                "binaryIndicator": float(self.binary_indicator_scores[eval_uid].item()),
-                                "binaryMovingAvg": float(self.binary_moving_averages[eval_uid].item()),
-                                "syncScore": float(self.sync_scores[eval_uid].item()),
-                                "finalScore": float(self.final_scores[eval_uid].item()),
-                                "weight": float(self.weights[eval_uid].item()),
-                            }
-                        )
+                        entry = {
+                            "uid": int(eval_uid),
+                            "gradientScore": float(self.gradient_scores[eval_uid].item()),
+                            "binaryIndicator": float(self.binary_indicator_scores[eval_uid].item()),
+                            "binaryMovingAvg": float(self.binary_moving_averages[eval_uid].item()),
+                            "syncScore": float(self.sync_scores[eval_uid].item()),
+                            "finalScore": float(self.final_scores[eval_uid].item()),
+                            "weight": float(self.weights[eval_uid].item()),
+                        }
                         if eval_uid in self.openskill_ratings:
                             r = self.openskill_ratings[eval_uid]
-                            dashboard_uid_scores[-1].update(
-                                {
-                                    "openskillMu": float(r.mu),
-                                    "openskillSigma": float(r.sigma),
-                                    "openskillOrdinal": float(r.ordinal()),
-                                }
-                            )
+                            entry.update({
+                                "openskillMu": float(r.mu),
+                                "openskillSigma": float(r.sigma),
+                                "openskillOrdinal": float(r.ordinal()),
+                            })
+
+                        # Per-UID eval details
+                        details = uid_eval_details.get(eval_uid, {})
+                        entry["evalStatus"] = details.get("evalStatus", "evaluated")
+                        if "evalSkipReason" in details:
+                            entry["evalSkipReason"] = details["evalSkipReason"]
+                        if "lossOwnBefore" in details:
+                            entry["lossOwnBefore"] = details["lossOwnBefore"]
+                            entry["lossOwnAfter"] = details["lossOwnAfter"]
+                            entry["lossRandomBefore"] = details["lossRandomBefore"]
+                            entry["lossRandomAfter"] = details["lossRandomAfter"]
+                            entry["improvementOwn"] = details["improvementOwn"]
+                            entry["improvementRandom"] = details["improvementRandom"]
+
+                        # Negative eval history
+                        consec = self.consecutive_negative_count.get(eval_uid, 0)
+                        entry["consecutiveNegatives"] = consec
+                        hist = self.peer_eval_history.get(eval_uid)
+                        if hist and len(hist) > 0:
+                            entry["negativeFrequency"] = float(sum(hist) / len(hist))
+                        else:
+                            entry["negativeFrequency"] = 0.0
+
+                        # BMA threshold
+                        bma_val = max(0, self.binary_moving_averages[eval_uid].item())
+                        entry["bmaThresholdApplied"] = past_warmup and bma_val < bma_threshold
+
+                        dashboard_uid_scores.append(entry)
 
                 asyncio.create_task(
                     self.dashboard_reporter.report_window(
@@ -3480,6 +3574,16 @@ class Validator(BaseNode, Trainer):
                 current_window=self.current_window,
                 eval_uid=eval_uid,
             )
+            if hasattr(self, "dashboard_reporter"):
+                asyncio.create_task(
+                    self.dashboard_reporter.report_slash_event(
+                        window=int(self.sync_window),
+                        uid=int(eval_uid),
+                        score_before=float(old_score),
+                        score_after=float(new_score),
+                        reason="missing gradient (eval fetch)"[:256],
+                    )
+                )
         else:
             hone.log_with_context(
                 level="info",
@@ -4296,8 +4400,23 @@ class Validator(BaseNode, Trainer):
                     current_window=self.current_window,
                 )
                 if self.final_scores[uid] > 0:
+                    old_score = self.final_scores[uid].item()
                     self.final_scores[uid] *= self.sync_score_slash_rate
                     self.binary_moving_averages[uid] *= self.sync_score_slash_rate
+                    new_score = self.final_scores[uid].item()
+                    if self.is_master and hasattr(self, "dashboard_reporter"):
+                        reason = f"poor sync: avg_steps_behind={avg_steps_behind:.2f}"
+                        if not success:
+                            reason = f"sync eval failed for uid {uid}"
+                        asyncio.create_task(
+                            self.dashboard_reporter.report_slash_event(
+                                window=int(self.sync_window),
+                                uid=int(uid),
+                                score_before=float(old_score),
+                                score_after=float(new_score),
+                                reason=reason[:256],
+                            )
+                        )
 
     def slash_for_missing_gradients(
         self,
@@ -4491,6 +4610,16 @@ class Validator(BaseNode, Trainer):
                     sync_window=self.sync_window,
                     current_window=self.current_window,
                 )
+                if self.is_master and hasattr(self, "dashboard_reporter"):
+                    asyncio.create_task(
+                        self.dashboard_reporter.report_slash_event(
+                            window=int(self.sync_window),
+                            uid=int(uid),
+                            score_before=float(old_score),
+                            score_after=float(new_score),
+                            reason=f"gradient overlap: level={level}, multiplier={slash_multiplier}"[:256],
+                        )
+                    )
 
             else:
                 hone.log_with_context(
