@@ -523,7 +523,8 @@ class Trainer:
                     # permanent model corruption from bf16 overflow in the
                     # 96-layer effective backward path.
                     grad_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 1.0
+                        self.model.parameters(),
+                        getattr(self.hparams, "max_grad_norm", 1.0),
                     )
                     if torch.isfinite(grad_norm):
                         self.scaler.step(self.inner_optimizer)

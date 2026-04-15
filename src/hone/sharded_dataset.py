@@ -419,6 +419,13 @@ class ShardedDatasetManager:
             self.upcoming_dataset = asyncio.create_task(asyncio.sleep(0))
         return
 
+    @staticmethod
+    def _shard_index_from_path(filepath: str | os.PathLike) -> int | None:
+        """Extract the numeric shard index from a filename like train_000003.npy."""
+        import re
+        m = re.search(r"_(\d{6})\.", os.path.basename(str(filepath)))
+        return int(m.group(1)) if m else None
+
     async def swap_datasets(self) -> int:
         """Swaps the active dataset with the upcoming one.
 
@@ -441,13 +448,19 @@ class ShardedDatasetManager:
         hone.logger.info("successfully swapped datasets.")
 
         if old_dataset and self.rank == 0:
-            filenames = ["tokens_file", "ids_file"]
-            files_to_delete = [old_dataset.tokens_file, old_dataset.ids_file]
-            for name, filepath in zip(filenames, files_to_delete):
-                try:
-                    os.remove(filepath)
-                except FileNotFoundError:
-                    hone.logger.error(f"{name} file not available for deletion")
+            old_shard = self._shard_index_from_path(old_dataset.tokens_file)
+            if old_shard is not None and old_shard in (0, 1):
+                hone.logger.info(
+                    f"[Dataset] Keeping shard {old_shard} on disk (pinned)"
+                )
+            else:
+                filenames = ["tokens_file", "ids_file"]
+                files_to_delete = [old_dataset.tokens_file, old_dataset.ids_file]
+                for name, filepath in zip(filenames, files_to_delete):
+                    try:
+                        os.remove(filepath)
+                    except FileNotFoundError:
+                        hone.logger.error(f"{name} file not available for deletion")
 
         del old_dataset
 

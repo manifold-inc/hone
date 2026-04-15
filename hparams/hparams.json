@@ -11,6 +11,7 @@
     "inner_steps": 30,
     "outer_learning_rate": 0.4,
     "weight_decay": 0.1,
+    "max_grad_norm": 1.0,
 
     "blocks_per_window": 115,
     "windows_per_weights": 3,
