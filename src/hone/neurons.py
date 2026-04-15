@@ -168,7 +168,11 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         # --- 6) Decode & error-feedback update (owner only) ---
         transmit_grad = miner.transformer.decode(decompressed, use_dct=use_dct)
         del decompressed
-        error_feedback.sub_(transmit_grad)
+        alpha = getattr(miner.hparams, "momentum_subtraction_alpha", 1.0)
+        if alpha == 1.0:
+            error_feedback.sub_(transmit_grad)
+        else:
+            error_feedback.sub_(transmit_grad, alpha=alpha)
         # Keep error feedback on GPU for now, batch offload later
         miner.error_feedback[n] = error_feedback
         del transmit_grad, error_feedback

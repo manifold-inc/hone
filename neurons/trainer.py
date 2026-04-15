@@ -35,11 +35,14 @@ class Trainer:
     def set_dataloader(self, validator: bool = False) -> None:
         self.dataset = self.dataset_manager.active_dataset
 
+        max_steps = getattr(self.hparams, "max_inner_steps", None) or self.hparams.inner_steps
+        pool_steps = max_steps if not validator else self.hparams.inner_steps
+
         shared_args = dict(
             dataset=self.dataset,
             uid=self.uid,
             window=self.current_window,
-            steps_per_window=self.hparams.inner_steps,
+            steps_per_window=pool_steps,
             micro_bs=self.hparams.micro_batch_size,
             rank=self.rank,
             world_size=self.world_size,
@@ -93,6 +96,16 @@ class Trainer:
             # FSDP2 wrapping when distributed
             if self.world_size > 1 and dist_helper.is_distributed():
                 self._apply_fsdp()
+
+            fsdp_cfg = getattr(self.hparams, "fsdp", None) or {}
+            if isinstance(fsdp_cfg, dict):
+                do_compile = fsdp_cfg.get("compile", False)
+            else:
+                do_compile = getattr(fsdp_cfg, "compile", False)
+
+            if do_compile:
+                self.model = torch.compile(self.model)
+                hone.logger.info("[Model] torch.compile applied")
 
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
@@ -517,6 +530,21 @@ class Trainer:
                 )
 
                 if not null_round:
+                    # Manual warm-up: scale LR by (k+1)/N for the first
+                    # warmup_inner_steps optimizer steps so Adam's running
+                    # estimates can stabilise before full LR kicks in.
+                    original_lrs = []
+                    in_manual_warmup = (
+                        self.warmup_steps_taken < self.warmup_inner_steps
+                    )
+                    if in_manual_warmup:
+                        warmup_scale = (
+                            self.warmup_steps_taken + 1
+                        ) / self.warmup_inner_steps
+                        for pg in self.inner_optimizer.param_groups:
+                            original_lrs.append(pg["lr"])
+                            pg["lr"] *= warmup_scale
+
                     self.scaler.unscale_(self.inner_optimizer)
 
                     # Skip step if gradients contain NaN/Inf to prevent
@@ -534,7 +562,14 @@ class Trainer:
                             f"step {inner_step_count + 1} — skipping optimizer step"
                         )
                     self.scaler.update()
-                    self.inner_scheduler.step()
+
+                    if in_manual_warmup:
+                        for i, pg in enumerate(self.inner_optimizer.param_groups):
+                            pg["lr"] = original_lrs[i]
+                        self.warmup_steps_taken += 1
+
+                    if not self.should_skip_scheduler_step():
+                        self.inner_scheduler.step()
                     self.inner_scheduler_step_count += 1
                 else:
                     self.scaler.update()
@@ -548,11 +583,20 @@ class Trainer:
                     dist_helper.ddp_reduce(accum_batch_size, device=self.device)
                 )
                 if self.is_master:
-                    hone.logger.info(
+                    step_msg = (
                         f"Inner Step {inner_step_count}, "
                         f"Batch {batch_count}, loss: {log_loss:.4f}, "
                         f"accum: {accum_batch_size}/{self.hparams.batch_size}"
                     )
+                    if not null_round and self.warmup_steps_taken <= self.warmup_inner_steps:
+                        sched_lr = self.inner_scheduler.get_last_lr()[0] if hasattr(self.inner_scheduler, "get_last_lr") else None
+                        step_msg += (
+                            f" | warmup {self.warmup_steps_taken}/{self.warmup_inner_steps}"
+                            f", sched_lr={sched_lr:.2e}"
+                            f", grad_norm={grad_norm:.4f}"
+                            f", scaler_scale={self.scaler.get_scale():.0f}"
+                        )
+                    hone.logger.info(step_msg)
 
                     if hasattr(self, "dashboard_reporter"):
                         current_lr = (
@@ -580,8 +624,9 @@ class Trainer:
                 accum_batch_size = 0
 
             # 5. Window control
+            max_inner = getattr(self.hparams, "max_inner_steps", None) or self.hparams.inner_steps
             need_sync = (
-                window_changed or inner_step_count == self.hparams.inner_steps
+                window_changed or inner_step_count >= max_inner
             )
             if self.world_size > 1:
                 from torch.distributed import ReduceOp
@@ -598,7 +643,8 @@ class Trainer:
                     hone.logger.info("<Exhausted window: exiting synchronously>")
                 if not null_round:
                     for _ in range(inner_step_count, self.hparams.inner_steps):
-                        self.inner_scheduler.step()
+                        if not self.should_skip_scheduler_step():
+                            self.inner_scheduler.step()
                         self.inner_scheduler_step_count += 1
                 break
 

@@ -5,10 +5,11 @@
 
     "tokenizer_name": "google/gemma-2-2b",
     "sequence_length": 4096,
-    "micro_batch_size": 1,
+    "micro_batch_size": 4,
     "target_batch_size": 1024,
     "batch_size": 192,
     "inner_steps": 30,
+    "max_inner_steps": 300,
     "outer_learning_rate": 0.4,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
@@ -16,7 +17,8 @@
     "blocks_per_window": 26,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
-    "momentum_decay": 0.95,
+    "momentum_decay": 0.999,
+    "momentum_subtraction_alpha": 0.2,
     "topk_compression": 64,
     "target_chunk": 64,
     "use_dct": false,
@@ -56,7 +58,7 @@
     "eval_lr_factor": 0.5,
 
     "optimizer": {
-        "type": "adamw",
+        "type": "muon",
         "adamw": {
             "betas": [0.9, 0.95],
             "eps": 1e-8,
