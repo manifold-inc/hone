@@ -34,6 +34,14 @@ class LoopLMConfig:
     max_seq_len: int = 4096
     tie_embeddings: bool = True
 
+    use_moe: bool = False
+    num_experts: int = 8
+    moe_top_k: int = 2
+    moe_intermediate_size: int | None = None
+    shared_expert_intermediate_size: int | None = None
+    moe_layers: list[int] | None = None
+    moe_aux_loss_coeff: float = 0.01
+
     def __post_init__(self):
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
@@ -169,15 +177,85 @@ class Attention(nn.Module):
 # ---------------------------------------------------------------------------
 
 class MLP(nn.Module):
-    def __init__(self, config: LoopLMConfig):
+    def __init__(self, config: LoopLMConfig, intermediate_size: int | None = None):
         super().__init__()
-        assert config.intermediate_size is not None
-        self.gate_proj = nn.Linear(config.dim, config.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(config.dim, config.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(config.intermediate_size, config.dim, bias=False)
+        ffn_dim = intermediate_size or config.intermediate_size
+        assert ffn_dim is not None
+        self.gate_proj = nn.Linear(config.dim, ffn_dim, bias=False)
+        self.up_proj = nn.Linear(config.dim, ffn_dim, bias=False)
+        self.down_proj = nn.Linear(ffn_dim, config.dim, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MoEMLP(nn.Module):
+    """Mixture-of-Experts MLP with top-k gating, shared expert, and load-balancing loss.
+
+    Supports the Qwen/DeepSeek-style architecture where each routed expert
+    has a smaller intermediate_size than the dense MLP, and an optional
+    shared expert processes all tokens unconditionally.
+    """
+
+    def __init__(self, config: LoopLMConfig):
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.top_k = config.moe_top_k
+        self.aux_loss_coeff = config.moe_aux_loss_coeff
+
+        expert_ffn = config.moe_intermediate_size or config.intermediate_size
+        self.gate = nn.Linear(config.dim, config.num_experts, bias=False)
+        self.experts = nn.ModuleList(
+            [MLP(config, intermediate_size=expert_ffn) for _ in range(config.num_experts)]
+        )
+
+        self.shared_expert: MLP | None = None
+        if config.shared_expert_intermediate_size is not None:
+            self.shared_expert = MLP(
+                config, intermediate_size=config.shared_expert_intermediate_size
+            )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (output, aux_loss)."""
+        orig_shape = x.shape
+        x_flat = x.view(-1, orig_shape[-1])  # (B*S, D)
+        num_tokens = x_flat.shape[0]
+
+        gate_logits = self.gate(x_flat)  # (B*S, E)
+        gate_probs = F.softmax(gate_logits, dim=-1)
+
+        topk_weights, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
+
+        # Load balancing auxiliary loss
+        tokens_per_expert = torch.zeros(self.num_experts, device=x.device, dtype=x.dtype)
+        tokens_per_expert.scatter_add_(
+            0, topk_indices.view(-1),
+            torch.ones(topk_indices.numel(), device=x.device, dtype=x.dtype),
+        )
+        f = tokens_per_expert / (num_tokens * self.top_k)
+        p = gate_probs.mean(dim=0)
+        aux_loss = self.aux_loss_coeff * self.num_experts * (f * p).sum()
+
+        # Dispatch tokens to routed experts
+        output = torch.zeros_like(x_flat)
+        for k_idx in range(self.top_k):
+            expert_indices = topk_indices[:, k_idx]  # (B*S,)
+            weights = topk_weights[:, k_idx]          # (B*S,)
+
+            for e_idx in range(self.num_experts):
+                mask = expert_indices == e_idx
+                if not mask.any():
+                    continue
+                expert_input = x_flat[mask]
+                expert_output = self.experts[e_idx](expert_input)
+                output[mask] += weights[mask].unsqueeze(-1) * expert_output
+
+        # Shared expert processes all tokens unconditionally
+        if self.shared_expert is not None:
+            output = output + self.shared_expert(x_flat)
+
+        return output.view(orig_shape), aux_loss
 
 
 # ---------------------------------------------------------------------------
@@ -189,7 +267,13 @@ class DecoderLayer(nn.Module):
         super().__init__()
         self.layer_idx = layer_idx
         self.self_attn = Attention(config, layer_idx)
-        self.mlp = MLP(config)
+
+        use_moe_here = config.use_moe and (
+            config.moe_layers is None or layer_idx in config.moe_layers
+        )
+        self.use_moe = use_moe_here
+        self.mlp = MoEMLP(config) if use_moe_here else MLP(config)
+
         self.input_layernorm = RMSNorm(config.dim, config.norm_eps)
         self.post_attention_layernorm = RMSNorm(config.dim, config.norm_eps)
 
@@ -200,14 +284,19 @@ class DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         h = hidden_states + self.self_attn(
             self.input_layernorm(hidden_states),
             position_embeddings=position_embeddings,
             attention_mask=attention_mask,
         )
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        if self.use_moe:
+            mlp_out, aux_loss = self.mlp(self.post_attention_layernorm(h))
+            out = h + mlp_out
+            return out, aux_loss
+        else:
+            out = h + self.mlp(self.post_attention_layernorm(h))
+            return out
 
     def init_weights(self):
         for norm in (self.input_layernorm, self.post_attention_layernorm):
@@ -215,9 +304,20 @@ class DecoderLayer(nn.Module):
         for linear in (self.self_attn.q_proj, self.self_attn.k_proj, self.self_attn.v_proj):
             nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
         nn.init.trunc_normal_(self.self_attn.o_proj.weight, mean=0.0, std=self.weight_init_std)
-        nn.init.trunc_normal_(self.mlp.gate_proj.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.mlp.up_proj.weight, mean=0.0, std=self.weight_init_std)
-        nn.init.trunc_normal_(self.mlp.down_proj.weight, mean=0.0, std=self.weight_init_std)
+        if self.use_moe:
+            nn.init.trunc_normal_(self.mlp.gate.weight, mean=0.0, std=0.02)
+            for expert in self.mlp.experts:
+                nn.init.trunc_normal_(expert.gate_proj.weight, mean=0.0, std=0.02)
+                nn.init.trunc_normal_(expert.up_proj.weight, mean=0.0, std=self.weight_init_std)
+                nn.init.trunc_normal_(expert.down_proj.weight, mean=0.0, std=self.weight_init_std)
+            if self.mlp.shared_expert is not None:
+                nn.init.trunc_normal_(self.mlp.shared_expert.gate_proj.weight, mean=0.0, std=0.02)
+                nn.init.trunc_normal_(self.mlp.shared_expert.up_proj.weight, mean=0.0, std=self.weight_init_std)
+                nn.init.trunc_normal_(self.mlp.shared_expert.down_proj.weight, mean=0.0, std=self.weight_init_std)
+        else:
+            nn.init.trunc_normal_(self.mlp.gate_proj.weight, mean=0.0, std=0.02)
+            nn.init.trunc_normal_(self.mlp.up_proj.weight, mean=0.0, std=self.weight_init_std)
+            nn.init.trunc_normal_(self.mlp.down_proj.weight, mean=0.0, std=self.weight_init_std)
 
 
 # ---------------------------------------------------------------------------
@@ -251,19 +351,32 @@ class LoopLM(nn.Module):
             theta=config.rope_theta,
         )
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        """Returns logits of shape (B, S, V)."""
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Returns logits (dense) or (logits, aux_loss) when MoE is active."""
         B, S = input_ids.shape
         h = self.embed_tokens(input_ids)
 
         position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
         position_embeddings = self.rotary_emb(h, position_ids)
 
+        total_aux_loss = torch.tensor(0.0, device=h.device, dtype=h.dtype)
+        has_moe = False
+
         for layer in self.layers:
-            h = layer(h, position_embeddings)
+            result = layer(h, position_embeddings)
+            if isinstance(result, tuple):
+                h, aux_loss = result
+                total_aux_loss = total_aux_loss + aux_loss
+                has_moe = True
+            else:
+                h = result
 
         h = self.norm(h)
-        return self.lm_head(h)
+        logits = self.lm_head(h)
+
+        if has_moe:
+            return logits, total_aux_loss
+        return logits
 
     def init_weights(self):
         """Initialize weights following the TorchTitan Llama convention.

@@ -225,6 +225,108 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
     return gradient, xshapes, totalks
 
 
+def prepare_gradient_buckets(
+    gradient: dict,
+    num_buckets: int = 4,
+) -> list[dict]:
+    """Split a gradient dict into N buckets for streaming upload.
+
+    Instead of uploading all compressed gradients at once at end-of-window,
+    this allows streaming parameter subsets during training to reduce
+    peak upload bandwidth by num_buckets-fold.
+
+    Args:
+        gradient: The full gradient dict from prepare_gradient_dict
+        num_buckets: Number of buckets to split into
+
+    Returns:
+        List of gradient sub-dicts, each containing a subset of parameters.
+        Each bucket includes the metadata key.
+    """
+    metadata = gradient.get("metadata", {})
+
+    param_keys: list[str] = []
+    for key in gradient:
+        if key.endswith("idxs"):
+            base = key[:-4]
+            param_keys.append(base)
+
+    # Distribute parameters across buckets round-robin
+    buckets: list[dict] = [{} for _ in range(num_buckets)]
+    for i, base in enumerate(param_keys):
+        bucket_idx = i % num_buckets
+        for suffix in ("idxs", "vals", "quant_params"):
+            k = base + suffix
+            if k in gradient:
+                buckets[bucket_idx][k] = gradient[k]
+
+    # Attach metadata and bucket index to each bucket
+    for i, bucket in enumerate(buckets):
+        bucket["metadata"] = {**metadata, "bucket_idx": i, "num_buckets": num_buckets}
+
+    return buckets
+
+
+class AsyncGatherBuffer:
+    """Double-buffered gather for overlapping communication with training.
+
+    Allows downloading peer gradients from window N-1 while training
+    proceeds on window N, reducing wall-clock time by overlapping
+    communication with compute.
+    """
+
+    def __init__(self):
+        self._pending_result: asyncio.Future | None = None
+        self._ready_result: SimpleNamespace | None = None
+        self._ready_xshapes: dict | None = None
+        self._ready_totalks: dict | None = None
+
+    def submit_gather(
+        self,
+        comms,
+        window: int,
+        xshapes: dict,
+        totalks: dict,
+    ):
+        """Start an async gather in the background.
+
+        Args:
+            comms: The Comms instance with gather capability
+            window: Window number to gather for
+            xshapes: Parameter shapes dict
+            totalks: Total-k dict per parameter
+        """
+        self._ready_xshapes = xshapes
+        self._ready_totalks = totalks
+
+        async def _do_gather():
+            return await comms.gather(window)
+
+        loop = asyncio.get_event_loop()
+        self._pending_result = asyncio.ensure_future(_do_gather())
+
+    async def get_result(self) -> tuple[SimpleNamespace | None, dict | None, dict | None]:
+        """Wait for and return the gathered result.
+
+        Returns:
+            (gather_result, xshapes, totalks) or (None, None, None) if nothing pending
+        """
+        if self._pending_result is None:
+            return None, None, None
+
+        try:
+            result = await self._pending_result
+        except Exception:
+            result = None
+
+        self._pending_result = None
+        return result, self._ready_xshapes, self._ready_totalks
+
+    @property
+    def has_pending(self) -> bool:
+        return self._pending_result is not None and not self._pending_result.done()
+
+
 @torch.no_grad()
 def outer_step(
     model: nn.Module,

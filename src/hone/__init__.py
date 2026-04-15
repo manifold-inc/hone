@@ -18,3 +18,4 @@ from .loss import compute_loss
 from .reporter import DashboardReporter
 from . import muon
 from . import distributed
+from . import pipeline

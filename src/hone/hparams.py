@@ -89,6 +89,13 @@ def create_namespace(hparams: dict) -> SimpleNamespace:
         rope_theta=getattr(ns, "rope_theta", 10000.0),
         max_seq_len=ns.sequence_length,
         tie_embeddings=getattr(ns, "tie_embeddings", True),
+        use_moe=getattr(ns, "use_moe", False),
+        num_experts=getattr(ns, "num_experts", 8),
+        moe_top_k=getattr(ns, "moe_top_k", 2),
+        moe_intermediate_size=getattr(ns, "moe_intermediate_size", None),
+        shared_expert_intermediate_size=getattr(ns, "shared_expert_intermediate_size", None),
+        moe_layers=getattr(ns, "moe_layers", None),
+        moe_aux_loss_coeff=getattr(ns, "moe_aux_loss_coeff", 0.01),
     )
 
     return ns

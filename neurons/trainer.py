@@ -129,7 +129,12 @@ class Trainer:
     # ------------------------------------------------------------------
     def init_optimizers_schedulers(self, validator=False):
         self.lr = float(self.hparams.outer_learning_rate)
-        self.outer_optimizer = SGD(self.model.parameters(), lr=self.lr)
+        self.outer_optimizer = SGD(
+            self.model.parameters(),
+            lr=self.lr,
+            momentum=0.9,
+            nesterov=True,
+        )
         self.inner_optimizer = self._build_inner_optimizer(validator)
         self.inner_scheduler = self._build_inner_scheduler()
         self.inner_scheduler_step_count = 0
@@ -322,7 +327,12 @@ class Trainer:
                     continue
 
                 with autocast(device_type=device.type, dtype=torch.bfloat16):
-                    logits = model(input_ids)
+                    model_output = model(input_ids)
+
+                if isinstance(model_output, tuple):
+                    logits = model_output[0]
+                else:
+                    logits = model_output
 
                 loss = compute_loss(logits, labels)
                 total_loss += loss.item()
@@ -477,9 +487,17 @@ class Trainer:
 
             # 3. Forward + backward
             with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                logits = self.model(input_ids)
+                model_output = self.model(input_ids)
+
+            if isinstance(model_output, tuple):
+                logits, aux_loss = model_output
+            else:
+                logits = model_output
+                aux_loss = None
 
             calculated_loss = compute_loss(logits, labels)
+            if aux_loss is not None:
+                calculated_loss = calculated_loss + aux_loss
 
             loss = calculated_loss / self.sampler.grad_accum_steps
             loss_item = calculated_loss.detach().item()

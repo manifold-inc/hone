@@ -1,7 +1,7 @@
 {
     "spec_version": 1,
-    "project": "hone",
-    "model_size": "1.4B",
+    "project": "genesis_moe",
+    "model_size": "35B-A3B",
 
     "tokenizer_name": "google/gemma-2-2b",
     "sequence_length": 4096,
@@ -19,9 +19,9 @@
     "outer_steps_per_shard": 455,
     "momentum_decay": 0.999,
     "momentum_subtraction_alpha": 0.2,
-    "topk_compression": 64,
+    "topk_compression": 32,
     "target_chunk": 64,
-    "use_dct": false,
+    "use_dct": true,
 
     "validator_offset": 1,
     "checkpoint_frequency": 10,
@@ -89,8 +89,14 @@
 
     "offload_optimizer_states": true,
     "fsdp": {
-        "dp_shard": 8,
+        "dp_shard": 4,
         "compile": true,
         "mixed_precision": "bfloat16"
+    },
+
+    "pipeline": {
+        "enabled": false,
+        "num_stages": 4,
+        "bottleneck_dim": 16
     }
 }
