@@ -478,15 +478,24 @@ class Validator(BaseNode, Trainer):
         self.wandb = NullMetricsLogger()
         self.metrics_logger = NullMetricsLogger()
 
-        # Dashboard reporter
-        self.dashboard_reporter = hone.DashboardReporter(
-            hotkey=str(self.wallet.hotkey.ss58_address),
-            role="validator",
-            netuid=self.config.netuid,
-            uid=self.uid,
-            version=hone.__version__,
-            wallet=self.wallet,
-        )
+        # Dashboard reporter (master rank only — other ranks get a disabled stub
+        # to avoid nonce collisions from multiple ranks signing with the same hotkey)
+        if self.is_master:
+            self.dashboard_reporter = hone.DashboardReporter(
+                hotkey=str(self.wallet.hotkey.ss58_address),
+                role="validator",
+                netuid=self.config.netuid,
+                uid=self.uid,
+                version=hone.__version__,
+                wallet=self.wallet,
+            )
+        else:
+            self.dashboard_reporter = hone.DashboardReporter(
+                hotkey=str(self.wallet.hotkey.ss58_address),
+                role="validator",
+                netuid=self.config.netuid,
+                api_url="",
+            )
 
         # Weighted selection counters for fair picking of eval peers
         self.eval_peers = defaultdict(lambda: 1)
@@ -1184,7 +1193,8 @@ class Validator(BaseNode, Trainer):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=CPU_COUNT)
         self.loop.set_default_executor(self.executor)
 
-        await self.dashboard_reporter.register_run()
+        if self.is_master:
+            await self.dashboard_reporter.register_run()
 
         # Use config peers if provided
         if self.config.peers:

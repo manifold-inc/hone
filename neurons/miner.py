@@ -328,15 +328,24 @@ class Miner(BaseNode, Trainer):
         self.wandb = NullMetricsLogger()
         self.metrics_logger = NullMetricsLogger()
 
-        # Dashboard reporter
-        self.dashboard_reporter = hone.DashboardReporter(
-            hotkey=str(self.wallet.hotkey.ss58_address),
-            role="miner",
-            netuid=self.config.netuid,
-            uid=self.uid,
-            version=hone.__version__,
-            wallet=self.wallet,
-        )
+        # Dashboard reporter (master rank only — other ranks get a no-op stub
+        # to avoid nonce collisions from multiple ranks signing with the same hotkey)
+        if self.is_master:
+            self.dashboard_reporter = hone.DashboardReporter(
+                hotkey=str(self.wallet.hotkey.ss58_address),
+                role="miner",
+                netuid=self.config.netuid,
+                uid=self.uid,
+                version=hone.__version__,
+                wallet=self.wallet,
+            )
+        else:
+            self.dashboard_reporter = hone.DashboardReporter(
+                hotkey=str(self.wallet.hotkey.ss58_address),
+                role="miner",
+                netuid=self.config.netuid,
+                api_url="",
+            )
 
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
@@ -374,7 +383,8 @@ class Miner(BaseNode, Trainer):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=CPU_COUNT)
         self.loop.set_default_executor(self.executor)
 
-        await self.dashboard_reporter.register_run()
+        if self.is_master:
+            await self.dashboard_reporter.register_run()
 
         # Use config peers if provided
         if self.config.peers:
