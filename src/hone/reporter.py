@@ -276,18 +276,44 @@ class DashboardReporter:
     # ── Run registration (always HTTP -- must exist before WS auth) ───────
 
     async def register_run(self) -> None:
-        await self._post(
-            "/ingest/run",
-            {
-                "id": self.run_id,
-                "hotkey": self.hotkey,
-                "role": self.role,
-                "netuid": self.netuid,
-                "uid": self.uid,
-                "version": self.version,
-                "config": self.config,
-            },
-        )
+        payload = {
+            "id": self.run_id,
+            "hotkey": self.hotkey,
+            "role": self.role,
+            "netuid": self.netuid,
+        }
+        if self.uid is not None:
+            payload["uid"] = self.uid
+        if self.version is not None:
+            payload["version"] = self.version
+        if self.config is not None:
+            payload["config"] = self.config
+
+        for attempt in range(3):
+            try:
+                if not self.enabled:
+                    logger.warning("[DashboardReporter] Cannot register run: no DASHBOARD_API_URL")
+                    return
+                session = await self._get_session()
+                url = f"{self.api_url}/ingest/run"
+                body_bytes = json.dumps(payload).encode("utf-8")
+                headers = self._sign_payload(body_bytes)
+                async with session.post(url, data=body_bytes, headers=headers) as resp:
+                    body = await resp.text()
+                    if resp.status < 400:
+                        logger.info(f"[DashboardReporter] Run registered: {self.run_id}")
+                        break
+                    logger.error(
+                        f"[DashboardReporter] register_run attempt {attempt + 1}/3 "
+                        f"returned {resp.status}: {body[:300]}"
+                    )
+            except Exception as e:
+                logger.error(
+                    f"[DashboardReporter] register_run attempt {attempt + 1}/3 failed: {e}"
+                )
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+
         await self._connect_ws()
 
     # ── Validator window metrics ──────────────────────────────────────────
