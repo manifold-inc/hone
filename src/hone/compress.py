@@ -236,8 +236,8 @@ class ChunkingTransformer:
         if len(x.shape) > 1:  # 2D weights
             n1 = self.shape_dict[x.shape[0]]
             n2 = self.shape_dict[x.shape[1]]
-            n1w = self.f_dict[n1].to(x.device)
-            n2w = self.f_dict[n2].to(x.device)
+            n1w = self.f_dict[n1].to(device=x.device, dtype=x.dtype)
+            n2w = self.f_dict[n2].to(device=x.device, dtype=x.dtype)
             self.f_dict[n1] = n1w
             self.f_dict[n2] = n2w
 
@@ -247,7 +247,7 @@ class ChunkingTransformer:
 
         else:  # 1D weights
             n1 = self.shape_dict[x.shape[0]]
-            n1w = self.f_dict[n1].to(x.device)
+            n1w = self.f_dict[n1].to(device=x.device, dtype=x.dtype)
             self.f_dict[n1] = n1w
 
             x = rearrange(x, "(x w) -> x w", w=n1)
@@ -272,8 +272,8 @@ class ChunkingTransformer:
             if use_dct:
                 n1 = x.shape[2]
                 n2 = x.shape[3]
-                n1w = self.b_dict[n1].to(x.device)
-                n2w = self.b_dict[n2].to(x.device)
+                n1w = self.b_dict[n1].to(device=x.device, dtype=x.dtype)
+                n2w = self.b_dict[n2].to(device=x.device, dtype=x.dtype)
                 self.b_dict[n1] = n1w
                 self.b_dict[n2] = n2w
 
@@ -283,7 +283,7 @@ class ChunkingTransformer:
         else:  # 1D weights
             if use_dct:
                 n1 = x.shape[1]
-                n1w = self.b_dict[n1].to(x.device)
+                n1w = self.b_dict[n1].to(device=x.device, dtype=x.dtype)
                 self.b_dict[n1] = n1w
 
                 x = self.einsum_2d_t(x, n1w)
