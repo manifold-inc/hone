@@ -72,7 +72,7 @@ Same `.env` setup as dense miner -- R2 credentials, wallet, HF token.
 python neurons/miner.py \
   --wallet.name my_wallet \
   --wallet.hotkey my_miner_hotkey \
-  --netuid 268
+  --netuid 5
 ```
 
 ### 1.4B-moe on 2 GPUs (FSDP)
@@ -81,7 +81,7 @@ python neurons/miner.py \
 torchrun --nproc_per_node=2 neurons/miner.py \
   --wallet.name my_wallet \
   --wallet.hotkey my_miner_hotkey \
-  --netuid 268
+  --netuid 5
 ```
 
 ### qwen-moe on 8 GPUs (FSDP)
@@ -90,7 +90,7 @@ torchrun --nproc_per_node=2 neurons/miner.py \
 torchrun --nproc_per_node=8 neurons/miner.py \
   --wallet.name my_wallet \
   --wallet.hotkey my_miner_hotkey \
-  --netuid 268
+  --netuid 5
 ```
 
 ### Test mode
@@ -99,7 +99,7 @@ torchrun --nproc_per_node=8 neurons/miner.py \
 python neurons/miner.py \
   --wallet.name my_wallet \
   --wallet.hotkey my_miner_hotkey \
-  --netuid 268 \
+  --netuid 5 \
   --test
 ```
 
