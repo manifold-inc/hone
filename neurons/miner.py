@@ -116,6 +116,10 @@ class Miner(BaseNode, Trainer):
         parser.add_argument("--debug", action="store_true", help="Enable debug logging")
         parser.add_argument("--trace", action="store_true", help="Enable trace logging")
         parser.add_argument(
+            "--pp-stages", type=int, default=1,
+            help="Number of pipeline-parallel stages. 1 = no PP (default).",
+        )
+        parser.add_argument(
             "--store-gathers",
             action="store_true",
             help="Store gathered gradients in R2",
@@ -215,7 +219,7 @@ class Miner(BaseNode, Trainer):
         # Store parallelization parameters for later use
         fsdp_cfg = getattr(self.hparams, "fsdp", SimpleNamespace())
         self.tp_degree = 1
-        self.pp_degree = 1
+        self.pp_degree = getattr(self.config, "pp_stages", 1)
         self.cp_degree = 1
         self.dp_replicate = int(getattr(fsdp_cfg, "dp_replicate", 1))
         self.dp_shard = int(getattr(fsdp_cfg, "dp_shard", 1))

@@ -15,11 +15,14 @@ from torch.distributed.tensor import DTensor as DT
 from torch.optim import SGD, lr_scheduler
 from torch.utils.data import DataLoader
 
+import torch.distributed as dist
+
 import hone
 from hone.distributed import dist_helper
 from hone.loss import compute_loss
 from hone.model import LoopLM, LoopLMConfig
 from hone.muon import Muon, SingleDeviceMuonWithAuxAdam
+from hone.pipeline import PipelineStage, PipelineStageBoundary, create_pipeline_stages
 from neurons.base_node import CPU_COUNT
 
 
@@ -84,17 +87,24 @@ class Trainer:
 
     def init_model(self, validator=False, meta=False):
         config: LoopLMConfig = self.hparams.model_config
+        pp_stages = getattr(self, "pp_degree", 1)
 
         if meta:
             with torch.device("meta"):
                 self.model = LoopLM(config)
+            self._pp_setup(pp_stages)
         else:
             self.model = LoopLM(config)
             self.model.init_weights()
             self.model.to(self.device)
 
-            # FSDP2 wrapping when distributed
-            if self.world_size > 1 and dist_helper.is_distributed():
+            self._pp_setup(pp_stages)
+            if pp_stages > 1:
+                self._init_pp_model(config, pp_stages)
+
+            # FSDP2 wrapping when distributed (within each PP stage's ranks)
+            ranks_in_stage = self.world_size // max(pp_stages, 1)
+            if ranks_in_stage > 1 and dist_helper.is_distributed():
                 self._apply_fsdp()
 
             fsdp_cfg = getattr(self.hparams, "fsdp", None) or {}
@@ -110,6 +120,99 @@ class Trainer:
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
 
+    def _pp_setup(self, pp_stages: int):
+        """Compute pipeline parallelism rank assignments."""
+        self.pp_stages = pp_stages
+        if pp_stages <= 1:
+            self.pp_stage_id = 0
+            self.pp_is_first_stage = True
+            self.pp_is_last_stage = True
+            self.pp_stage_ranks = list(range(self.world_size))
+            self.pp_send_rank = -1
+            self.pp_recv_rank = -1
+            self.pp_stage: PipelineStage | None = None
+            self.pp_stage_group = None
+            return
+
+        ranks_per_stage = self.world_size // pp_stages
+        if ranks_per_stage < 1:
+            raise ValueError(
+                f"pp_stages={pp_stages} exceeds world_size={self.world_size}. "
+                f"Need at least 1 rank per stage."
+            )
+
+        self.pp_stage_id = self.rank // ranks_per_stage
+        self.pp_stage_ranks = list(range(
+            self.pp_stage_id * ranks_per_stage,
+            (self.pp_stage_id + 1) * ranks_per_stage,
+        ))
+        self.pp_is_first_stage = self.pp_stage_id == 0
+        self.pp_is_last_stage = self.pp_stage_id == pp_stages - 1
+
+        self.pp_send_rank = (
+            (self.pp_stage_id + 1) * ranks_per_stage
+            if not self.pp_is_last_stage else -1
+        )
+        self.pp_recv_rank = (
+            self.pp_stage_id * ranks_per_stage - 1
+            if not self.pp_is_first_stage else -1
+        )
+
+        if dist_helper.is_distributed():
+            self.pp_stage_group = dist.new_group(self.pp_stage_ranks)
+        else:
+            self.pp_stage_group = None
+
+        hone.logger.info(
+            f"[PP] stage={self.pp_stage_id}/{pp_stages}, "
+            f"ranks={self.pp_stage_ranks}, "
+            f"send_to={self.pp_send_rank}, recv_from={self.pp_recv_rank}"
+        )
+
+    def _init_pp_model(self, config: LoopLMConfig, pp_stages: int):
+        """Partition the full model into pipeline stages and keep only this rank's stage."""
+        pipeline_cfg = getattr(self.hparams, "pipeline", None)
+        if pipeline_cfg is not None:
+            if hasattr(pipeline_cfg, "bottleneck_dim"):
+                bottleneck_dim = pipeline_cfg.bottleneck_dim
+            else:
+                bottleneck_dim = pipeline_cfg.get("bottleneck_dim", 16)
+        else:
+            bottleneck_dim = 16
+
+        stages = create_pipeline_stages(
+            model_layers=self.model.layers,
+            num_stages=pp_stages,
+            hidden_dim=config.dim,
+            bottleneck_dim=bottleneck_dim,
+        )
+
+        my_stage = stages[self.pp_stage_id]
+        my_stage.init_weights()
+
+        new_model = nn.Module()
+        new_model.stage = my_stage
+
+        if self.pp_is_first_stage:
+            new_model.embed_tokens = self.model.embed_tokens
+        if self.pp_is_last_stage:
+            new_model.norm = self.model.norm
+            new_model.lm_head = self.model.lm_head
+
+        new_model.rotary_emb = self.model.rotary_emb
+        new_model.config = config
+
+        del self.model
+        torch.cuda.empty_cache()
+        self.model = new_model.to(self.device)
+        self.pp_stage = my_stage
+
+        n_params = sum(p.numel() for p in self.model.parameters())
+        hone.logger.info(
+            f"[PP] Stage {self.pp_stage_id}: {len(my_stage.layers)} layers, "
+            f"{n_params/1e6:.1f}M params, bottleneck_dim={bottleneck_dim}"
+        )
+
     def _apply_fsdp(self):
         """Apply FSDP2 wrapping at the TransformerBlock level."""
         try:
@@ -117,12 +220,134 @@ class Trainer:
         except ImportError:
             from torch.distributed._composable.fsdp import fully_shard
 
-        for layer in self.model.layers:
-            fully_shard(layer)
-        fully_shard(self.model)
+        if self.pp_stages > 1 and self.pp_stage is not None:
+            for layer in self.pp_stage.layers:
+                fully_shard(layer, process_group=self.pp_stage_group)
+            fully_shard(self.model, process_group=self.pp_stage_group)
+        else:
+            for layer in self.model.layers:
+                fully_shard(layer)
+            fully_shard(self.model)
         hone.logger.info(
-            f"[Model] FSDP2 applied, world_size={self.world_size}"
+            f"[Model] FSDP2 applied, world_size={self.world_size}, "
+            f"pp_stages={self.pp_stages}"
         )
+
+    # ------------------------------------------------------------------
+    # Pipeline-parallel forward + backward
+    # ------------------------------------------------------------------
+    def _pp_forward_backward(
+        self,
+        input_ids: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run forward/backward across pipeline stages with ResBM compression.
+
+        All stages must call this synchronously. The first stage runs embedding
+        + its layers + encodes + sends. The last stage receives + decodes + its
+        layers + computes loss + backward + sends gradients back. Middle stages
+        (if any) relay in both directions.
+
+        Returns the scalar loss (only meaningful on the last stage; other
+        stages return 0.0 as a placeholder).
+        """
+        assert self.pp_stage is not None
+        config = self.model.config
+        bottleneck_dim = self.pp_stage.output_boundary.bottleneck_dim if self.pp_stage.output_boundary else (
+            self.pp_stage.input_boundary.bottleneck_dim if self.pp_stage.input_boundary else 16
+        )
+
+        B, S = input_ids.shape
+        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        position_embeddings = self.model.rotary_emb(
+            torch.empty(1, 1, config.dim, device=self.device), position_ids
+        )
+
+        if self.pp_is_first_stage:
+            h = self.model.embed_tokens(input_ids)
+            h.requires_grad_(True)
+
+            for layer in self.pp_stage.layers:
+                result = layer(h, position_embeddings)
+                h = result[0] if isinstance(result, tuple) else result
+
+            compressed = self.pp_stage.output_boundary.encode(h)
+            dist.send(compressed.contiguous(), dst=self.pp_send_rank)
+
+            grad_compressed = torch.empty(
+                B, S, bottleneck_dim, device=self.device, dtype=compressed.dtype
+            )
+            dist.recv(grad_compressed, src=self.pp_send_rank)
+
+            grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
+            h.backward(grad_h)
+
+            return torch.tensor(0.0, device=self.device)
+
+        elif self.pp_is_last_stage:
+            assert self.pp_stage.input_boundary is not None
+            ib = self.pp_stage.input_boundary
+
+            compressed = torch.empty(
+                B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
+            )
+            dist.recv(compressed, src=self.pp_recv_rank)
+            compressed.requires_grad_(True)
+
+            h = ib.decode(compressed)
+
+            for layer in self.pp_stage.layers:
+                result = layer(h, position_embeddings)
+                h = result[0] if isinstance(result, tuple) else result
+
+            h = self.model.norm(h)
+            logits = self.model.lm_head(h)
+            loss = compute_loss(logits, labels)
+
+            loss.backward()
+
+            grad_compressed = compressed.grad
+            if grad_compressed is None:
+                grad_compressed = torch.zeros(
+                    B, S, ib.bottleneck_dim,
+                    device=self.device, dtype=self.amp_dtype,
+                )
+            dist.send(grad_compressed.contiguous(), dst=self.pp_recv_rank)
+
+            return loss.detach()
+
+        else:
+            assert self.pp_stage.input_boundary is not None
+            assert self.pp_stage.output_boundary is not None
+            ib = self.pp_stage.input_boundary
+            ob = self.pp_stage.output_boundary
+
+            compressed_in = torch.empty(
+                B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
+            )
+            dist.recv(compressed_in, src=self.pp_recv_rank)
+            compressed_in.requires_grad_(True)
+
+            h = ib.decode(compressed_in)
+
+            for layer in self.pp_stage.layers:
+                result = layer(h, position_embeddings)
+                h = result[0] if isinstance(result, tuple) else result
+
+            compressed_out = ob.encode(h)
+            dist.send(compressed_out.contiguous(), dst=self.pp_send_rank)
+
+            grad_compressed_out = torch.empty_like(compressed_out)
+            dist.recv(grad_compressed_out, src=self.pp_send_rank)
+
+            compressed_out.backward(grad_compressed_out)
+
+            grad_compressed_in = compressed_in.grad
+            if grad_compressed_in is None:
+                grad_compressed_in = torch.zeros_like(compressed_in)
+            dist.send(grad_compressed_in.contiguous(), dst=self.pp_recv_rank)
+
+            return torch.tensor(0.0, device=self.device)
 
     # ------------------------------------------------------------------
     # Optimizers & Schedulers
@@ -486,36 +711,41 @@ class Trainer:
                 continue
 
             # 3. Forward + backward
-            with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                model_output = self.model(input_ids)
-
-            if isinstance(model_output, tuple):
-                logits, aux_loss = model_output
+            if self.pp_stages > 1:
+                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                    calculated_loss = self._pp_forward_backward(input_ids, labels)
+                loss_item = calculated_loss.item()
             else:
-                logits = model_output
-                aux_loss = None
+                with autocast(device_type=self.device.type, dtype=self.amp_dtype):
+                    model_output = self.model(input_ids)
 
-            calculated_loss = compute_loss(logits, labels)
-            if aux_loss is not None:
-                calculated_loss = calculated_loss + aux_loss
+                if isinstance(model_output, tuple):
+                    logits, aux_loss = model_output
+                else:
+                    logits = model_output
+                    aux_loss = None
 
-            loss = calculated_loss / self.sampler.grad_accum_steps
-            loss_item = calculated_loss.detach().item()
+                calculated_loss = compute_loss(logits, labels)
+                if aux_loss is not None:
+                    calculated_loss = calculated_loss + aux_loss
 
-            corrected_accum = max(self.sampler.grad_accum_steps, 1)
-            final_micro = (batch_count + 1) % corrected_accum == 0
+                loss = calculated_loss / self.sampler.grad_accum_steps
+                loss_item = calculated_loss.detach().item()
 
-            if (
-                hasattr(self.model, "no_sync")
-                and self.world_size > 1
-                and not final_micro
-            ):
-                sync_ctx = self.model.no_sync()
-            else:
-                sync_ctx = nullcontext()
+                corrected_accum = max(self.sampler.grad_accum_steps, 1)
+                final_micro = (batch_count + 1) % corrected_accum == 0
 
-            with sync_ctx:
-                self.scaler.scale(loss).backward()
+                if (
+                    hasattr(self.model, "no_sync")
+                    and self.world_size > 1
+                    and not final_micro
+                ):
+                    sync_ctx = self.model.no_sync()
+                else:
+                    sync_ctx = nullcontext()
+
+                with sync_ctx:
+                    self.scaler.scale(loss).backward()
 
             total_loss += loss_item
             local_loss_sum += loss_item
