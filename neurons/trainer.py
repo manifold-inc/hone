@@ -498,11 +498,17 @@ class Trainer:
                 )
             return t
 
-        # Use dedicated 2-rank groups built in ``_pp_setup`` so NCCL keeps
-        # one cached communicator per cross-stage pair instead of relaunching
-        # the world-group P2P sub-comm dance on every send/recv.
-        send_grp = self.pp_p2p_group_send
-        recv_grp = self.pp_p2p_group_recv
+        # NOTE: We do NOT pass ``group=`` to ``dist.send``/``dist.recv``.
+        # In several PyTorch versions, when both ``dst``/``src`` and
+        # ``group=`` are supplied, the rank argument is interpreted as the
+        # in-group rank rather than the global rank, which silently
+        # mis-routes the message and leaves the receiver hung. NCCL's
+        # default world group handles cross-stage P2P just fine: it lazily
+        # builds a 2-rank sub-communicator on first use (one "unbatched
+        # P2P op" warning per pair) and caches it for all subsequent
+        # sends/recvs. The pre-created ``self.pp_p2p_group_*`` groups are
+        # kept available for the future batched/async path (Phase 4) but
+        # are not used here.
         # ------------------------------------------------------------------------------
 
         if self.pp_is_first_stage:
@@ -522,17 +528,13 @@ class Trainer:
             compressed = self.pp_stage.output_boundary.encode(h)
             t = _phase("s0 after_encode", t)
 
-            dist.send(
-                compressed.contiguous(), dst=self.pp_send_rank, group=send_grp
-            )
+            dist.send(compressed.contiguous(), dst=self.pp_send_rank)
             t = _phase("s0 after_send", t)
 
             grad_compressed = torch.empty(
                 B, S, bottleneck_dim, device=self.device, dtype=compressed.dtype
             )
-            dist.recv(
-                grad_compressed, src=self.pp_send_rank, group=send_grp
-            )
+            dist.recv(grad_compressed, src=self.pp_send_rank)
             t = _phase("s0 after_recv_grad", t)
 
             grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
@@ -552,7 +554,7 @@ class Trainer:
             compressed = torch.empty(
                 B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
             )
-            dist.recv(compressed, src=self.pp_recv_rank, group=recv_grp)
+            dist.recv(compressed, src=self.pp_recv_rank)
             t = _phase("sN after_recv_act", t)
 
             compressed.requires_grad_(True)
@@ -578,11 +580,7 @@ class Trainer:
                     B, S, ib.bottleneck_dim,
                     device=self.device, dtype=self.amp_dtype,
                 )
-            dist.send(
-                grad_compressed.contiguous(),
-                dst=self.pp_recv_rank,
-                group=recv_grp,
-            )
+            dist.send(grad_compressed.contiguous(), dst=self.pp_recv_rank)
             _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
             return loss.detach()
