@@ -248,6 +248,14 @@ class Trainer:
             self.rank - ranks_per_stage if not self.pp_is_first_stage else -1
         )
 
+        # Pre-created dedicated 2-rank groups for each cross-stage pair.
+        # Without these, every dist.send/recv over the size-4 world group
+        # forces NCCL to lazily create a new 2-rank sub-communicator,
+        # producing the "unbatched P2P op" warning and adding O(seconds)
+        # of setup overhead the first time a pair communicates.
+        self.pp_p2p_group_send = None  # group with my pp_send_rank peer
+        self.pp_p2p_group_recv = None  # group with my pp_recv_rank peer
+
         if dist_helper.is_distributed():
             try:
                 from torch.distributed.device_mesh import init_device_mesh
@@ -268,11 +276,31 @@ class Trainer:
             self.pp_mesh = self.world_mesh["pp"]
             self.pp_stage_group = self.dp_mesh.get_group()
 
+            # Build dedicated P2P groups for every (stage S, stage S+1)
+            # pair across all ranks. dist.new_group must be called by
+            # *every* rank in the world (even ranks not in the new group)
+            # to stay collective; non-member ranks receive None.
+            for src_stage in range(pp_stages - 1):
+                for rank_in_stage in range(ranks_per_stage):
+                    rank_a = src_stage * ranks_per_stage + rank_in_stage
+                    rank_b = (src_stage + 1) * ranks_per_stage + rank_in_stage
+                    pair_group = dist.new_group(
+                        ranks=[rank_a, rank_b], backend="nccl"
+                    )
+                    if self.rank == rank_a:
+                        # rank_a is "send-side" toward rank_b in stage S+1.
+                        self.pp_p2p_group_send = pair_group
+                    if self.rank == rank_b:
+                        # rank_b is "recv-side" from rank_a in stage S.
+                        self.pp_p2p_group_recv = pair_group
+
         hone.logger.info(
             f"[PP] stage={self.pp_stage_id}/{pp_stages}, "
             f"ranks={self.pp_stage_ranks}, "
             f"send_to={self.pp_send_rank}, recv_from={self.pp_recv_rank}, "
-            f"dp_mesh={'set' if self.dp_mesh is not None else 'unset'}"
+            f"dp_mesh={'set' if self.dp_mesh is not None else 'unset'}, "
+            f"p2p_send_grp={'set' if self.pp_p2p_group_send is not None else 'none'}, "
+            f"p2p_recv_grp={'set' if self.pp_p2p_group_recv is not None else 'none'}"
         )
 
     def _init_pp_model(
@@ -447,9 +475,10 @@ class Trainer:
             torch.empty(1, 1, config.dim, device=self.device), position_ids
         )
 
-        # ---------------- DIAGNOSTIC: per-microbatch + per-phase timing ----------------
-        # Only the first rank of each stage logs, so we get exactly two lines
-        # per microbatch (one per stage) in the output.
+        # ---------------- DIAGNOSTIC: per-phase progress (start + end) ----------------
+        # First rank of each stage logs every microbatch; one line per phase
+        # boundary so we see live progress even when the per-microbatch wall
+        # time is large. ``cuda.synchronize`` makes wall times accurate.
         diag_log = self.rank == self.pp_stage_ranks[0]
         if not hasattr(self, "_pp_microbatch_idx"):
             self._pp_microbatch_idx = 0
@@ -461,44 +490,54 @@ class Trainer:
                 torch.cuda.synchronize(self.device)
             return time.time()
 
-        t_start = _now()
-        # -------------------------------------------------------------------------------
+        def _phase(tag: str, t_prev: float) -> float:
+            t = _now()
+            if diag_log:
+                hone.logger.info(
+                    f"[Diag/PP {tag} mb={mb}] +{t - t_prev:.3f}s"
+                )
+            return t
+
+        # Use dedicated 2-rank groups built in ``_pp_setup`` so NCCL keeps
+        # one cached communicator per cross-stage pair instead of relaunching
+        # the world-group P2P sub-comm dance on every send/recv.
+        send_grp = self.pp_p2p_group_send
+        recv_grp = self.pp_p2p_group_recv
+        # ------------------------------------------------------------------------------
 
         if self.pp_is_first_stage:
+            t = _now()
+            if diag_log:
+                hone.logger.info(f"[Diag/PP s0 mb={mb}] enter")
+
             h = self.model.embed_tokens(input_ids)
             h.requires_grad_(True)
+            t = _phase("s0 after_embed", t)
 
             for layer in self.pp_stage.layers:
                 result = layer(h, position_embeddings)
                 h = result[0] if isinstance(result, tuple) else result
-
-            t_after_fwd = _now()
+            t = _phase("s0 after_layers", t)
 
             compressed = self.pp_stage.output_boundary.encode(h)
-            t_after_encode = _now()
+            t = _phase("s0 after_encode", t)
 
-            dist.send(compressed.contiguous(), dst=self.pp_send_rank)
-            t_after_send = _now()
+            dist.send(
+                compressed.contiguous(), dst=self.pp_send_rank, group=send_grp
+            )
+            t = _phase("s0 after_send", t)
 
             grad_compressed = torch.empty(
                 B, S, bottleneck_dim, device=self.device, dtype=compressed.dtype
             )
-            dist.recv(grad_compressed, src=self.pp_send_rank)
-            t_after_recv = _now()
+            dist.recv(
+                grad_compressed, src=self.pp_send_rank, group=send_grp
+            )
+            t = _phase("s0 after_recv_grad", t)
 
             grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
             h.backward(grad_h)
-            t_after_bwd = _now()
-
-            if diag_log:
-                hone.logger.info(
-                    f"[Diag/PP s0 mb={mb}] fwd={t_after_fwd - t_start:.3f}s "
-                    f"encode={t_after_encode - t_after_fwd:.3f}s "
-                    f"send={t_after_send - t_after_encode:.3f}s "
-                    f"recv_wait={t_after_recv - t_after_send:.3f}s "
-                    f"bwd={t_after_bwd - t_after_recv:.3f}s "
-                    f"total={t_after_bwd - t_start:.3f}s"
-                )
+            _phase("s0 after_bwd", t)
 
             return torch.tensor(0.0, device=self.device)
 
@@ -506,11 +545,16 @@ class Trainer:
             assert self.pp_stage.input_boundary is not None
             ib = self.pp_stage.input_boundary
 
+            t = _now()
+            if diag_log:
+                hone.logger.info(f"[Diag/PP sN mb={mb}] enter")
+
             compressed = torch.empty(
                 B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
             )
-            dist.recv(compressed, src=self.pp_recv_rank)
-            t_after_recv = _now()
+            dist.recv(compressed, src=self.pp_recv_rank, group=recv_grp)
+            t = _phase("sN after_recv_act", t)
+
             compressed.requires_grad_(True)
 
             h = ib.decode(compressed)
@@ -518,14 +562,15 @@ class Trainer:
             for layer in self.pp_stage.layers:
                 result = layer(h, position_embeddings)
                 h = result[0] if isinstance(result, tuple) else result
+            t = _phase("sN after_layers", t)
 
             h = self.model.norm(h)
             logits = self.model.lm_head(h)
             loss = compute_loss(logits, labels)
-            t_after_fwd = _now()
+            t = _phase("sN after_loss", t)
 
             loss.backward()
-            t_after_bwd = _now()
+            t = _phase("sN after_bwd", t)
 
             grad_compressed = compressed.grad
             if grad_compressed is None:
@@ -533,18 +578,12 @@ class Trainer:
                     B, S, ib.bottleneck_dim,
                     device=self.device, dtype=self.amp_dtype,
                 )
-            dist.send(grad_compressed.contiguous(), dst=self.pp_recv_rank)
-            t_after_send = _now()
-
-            if diag_log:
-                hone.logger.info(
-                    f"[Diag/PP sN mb={mb}] recv_wait={t_after_recv - t_start:.3f}s "
-                    f"fwd={t_after_fwd - t_after_recv:.3f}s "
-                    f"bwd={t_after_bwd - t_after_fwd:.3f}s "
-                    f"send={t_after_send - t_after_bwd:.3f}s "
-                    f"loss={loss.item():.4f} "
-                    f"total={t_after_send - t_start:.3f}s"
-                )
+            dist.send(
+                grad_compressed.contiguous(),
+                dst=self.pp_recv_rank,
+                group=recv_grp,
+            )
+            _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
             return loss.detach()
 

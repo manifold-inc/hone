@@ -224,42 +224,86 @@ class MoEMLP(nn.Module):
             )
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (output, aux_loss)."""
-        orig_shape = x.shape
-        x_flat = x.view(-1, orig_shape[-1])  # (B*S, D)
-        num_tokens = x_flat.shape[0]
+        """Returns (output, aux_loss).
 
-        gate_logits = self.gate(x_flat)  # (B*S, E)
+        Permutation-based dispatch: tokens are repeated ``top_k`` times,
+        sorted by chosen expert id, and each expert sees a contiguous slice
+        of its own routed tokens. This removes the K*E boolean-masking loop
+        of the naive implementation (K*E small kernel launches per layer
+        with mostly-empty masks) and replaces it with a single sort + ``E``
+        contiguous-slice expert calls.
+
+        Memory + parameter layout is unchanged so DeMo compression and
+        checkpointing keep working with the same parameter names.
+        """
+        orig_shape = x.shape
+        x_flat = x.view(-1, orig_shape[-1])  # (N, D)
+        num_tokens = x_flat.shape[0]
+        K = self.top_k
+        E = self.num_experts
+
+        gate_logits = self.gate(x_flat)  # (N, E)
         gate_probs = F.softmax(gate_logits, dim=-1)
 
-        topk_weights, topk_indices = torch.topk(gate_probs, self.top_k, dim=-1)
+        topk_weights, topk_indices = torch.topk(gate_probs, K, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
         # Load balancing auxiliary loss
-        tokens_per_expert = torch.zeros(self.num_experts, device=x.device, dtype=x.dtype)
+        tokens_per_expert = torch.zeros(E, device=x.device, dtype=x.dtype)
         tokens_per_expert.scatter_add_(
             0, topk_indices.view(-1),
             torch.ones(topk_indices.numel(), device=x.device, dtype=x.dtype),
         )
-        f = tokens_per_expert / (num_tokens * self.top_k)
+        f = tokens_per_expert / (num_tokens * K)
         p = gate_probs.mean(dim=0)
-        aux_loss = self.aux_loss_coeff * self.num_experts * (f * p).sum()
+        aux_loss = self.aux_loss_coeff * E * (f * p).sum()
 
-        # Dispatch tokens to routed experts
-        output = torch.zeros_like(x_flat)
-        for k_idx in range(self.top_k):
-            expert_indices = topk_indices[:, k_idx]  # (B*S,)
-            weights = topk_weights[:, k_idx]          # (B*S,)
+        # ---- Permutation dispatch ----
+        # Repeat each token K times so each (token, choice) is its own row.
+        expanded_input = x_flat.repeat_interleave(K, dim=0)        # (N*K, D)
+        expanded_indices = topk_indices.reshape(-1)                # (N*K,)
+        expanded_weights = topk_weights.reshape(-1)                # (N*K,)
 
-            for e_idx in range(self.num_experts):
-                mask = expert_indices == e_idx
-                if not mask.any():
-                    continue
-                expert_input = x_flat[mask]
-                expert_output = self.experts[e_idx](expert_input)
-                output[mask] += weights[mask].unsqueeze(-1) * expert_output
+        # Stable sort so equal expert ids preserve original order; this
+        # gives us per-expert contiguous slices.
+        sorted_indices, sort_perm = torch.sort(expanded_indices, stable=True)
+        sorted_input = expanded_input.index_select(0, sort_perm)
+        sorted_weights = expanded_weights.index_select(0, sort_perm)
 
-        # Shared expert processes all tokens unconditionally
+        # Per-expert token counts; offsets gives [start, start+count] slices.
+        counts = torch.bincount(sorted_indices, minlength=E)        # (E,)
+        offsets = torch.zeros(E + 1, dtype=torch.long, device=counts.device)
+        offsets[1:] = counts.cumsum(0)
+        # One device->host sync per layer to drive Python-side slicing.
+        offsets_cpu = offsets.tolist()
+
+        # Run each expert on its contiguous slice; concat preserves order
+        # without in-place writes (cleaner for autograd than slice-assign).
+        expert_outputs = []
+        for e in range(E):
+            start = offsets_cpu[e]
+            end = offsets_cpu[e + 1]
+            if start == end:
+                continue
+            expert_outputs.append(self.experts[e](sorted_input[start:end]))
+
+        if expert_outputs:
+            sorted_output = torch.cat(expert_outputs, dim=0)
+        else:
+            # Edge case: zero tokens routed (should be impossible in
+            # practice but guards against degenerate routing).
+            sorted_output = torch.zeros_like(sorted_input)
+
+        sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
+
+        # Inverse permutation: pure functional, autograd-safe.
+        inv_perm = torch.argsort(sort_perm)
+        output_expanded = sorted_output.index_select(0, inv_perm)
+
+        # Sum the K choices per token.
+        output = output_expanded.view(num_tokens, K, -1).sum(dim=1)
+
+        # Shared expert processes all tokens unconditionally.
         if self.shared_expert is not None:
             output = output + self.shared_expert(x_flat)
 
