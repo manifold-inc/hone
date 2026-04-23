@@ -447,6 +447,23 @@ class Trainer:
             torch.empty(1, 1, config.dim, device=self.device), position_ids
         )
 
+        # ---------------- DIAGNOSTIC: per-microbatch + per-phase timing ----------------
+        # Only the first rank of each stage logs, so we get exactly two lines
+        # per microbatch (one per stage) in the output.
+        diag_log = self.rank == self.pp_stage_ranks[0]
+        if not hasattr(self, "_pp_microbatch_idx"):
+            self._pp_microbatch_idx = 0
+        self._pp_microbatch_idx += 1
+        mb = self._pp_microbatch_idx
+
+        def _now() -> float:
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            return time.time()
+
+        t_start = _now()
+        # -------------------------------------------------------------------------------
+
         if self.pp_is_first_stage:
             h = self.model.embed_tokens(input_ids)
             h.requires_grad_(True)
@@ -455,16 +472,33 @@ class Trainer:
                 result = layer(h, position_embeddings)
                 h = result[0] if isinstance(result, tuple) else result
 
+            t_after_fwd = _now()
+
             compressed = self.pp_stage.output_boundary.encode(h)
+            t_after_encode = _now()
+
             dist.send(compressed.contiguous(), dst=self.pp_send_rank)
+            t_after_send = _now()
 
             grad_compressed = torch.empty(
                 B, S, bottleneck_dim, device=self.device, dtype=compressed.dtype
             )
             dist.recv(grad_compressed, src=self.pp_send_rank)
+            t_after_recv = _now()
 
             grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
             h.backward(grad_h)
+            t_after_bwd = _now()
+
+            if diag_log:
+                hone.logger.info(
+                    f"[Diag/PP s0 mb={mb}] fwd={t_after_fwd - t_start:.3f}s "
+                    f"encode={t_after_encode - t_after_fwd:.3f}s "
+                    f"send={t_after_send - t_after_encode:.3f}s "
+                    f"recv_wait={t_after_recv - t_after_send:.3f}s "
+                    f"bwd={t_after_bwd - t_after_recv:.3f}s "
+                    f"total={t_after_bwd - t_start:.3f}s"
+                )
 
             return torch.tensor(0.0, device=self.device)
 
@@ -476,6 +510,7 @@ class Trainer:
                 B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
             )
             dist.recv(compressed, src=self.pp_recv_rank)
+            t_after_recv = _now()
             compressed.requires_grad_(True)
 
             h = ib.decode(compressed)
@@ -487,8 +522,10 @@ class Trainer:
             h = self.model.norm(h)
             logits = self.model.lm_head(h)
             loss = compute_loss(logits, labels)
+            t_after_fwd = _now()
 
             loss.backward()
+            t_after_bwd = _now()
 
             grad_compressed = compressed.grad
             if grad_compressed is None:
@@ -497,6 +534,17 @@ class Trainer:
                     device=self.device, dtype=self.amp_dtype,
                 )
             dist.send(grad_compressed.contiguous(), dst=self.pp_recv_rank)
+            t_after_send = _now()
+
+            if diag_log:
+                hone.logger.info(
+                    f"[Diag/PP sN mb={mb}] recv_wait={t_after_recv - t_start:.3f}s "
+                    f"fwd={t_after_fwd - t_after_recv:.3f}s "
+                    f"bwd={t_after_bwd - t_after_fwd:.3f}s "
+                    f"send={t_after_send - t_after_bwd:.3f}s "
+                    f"loss={loss.item():.4f} "
+                    f"total={t_after_send - t_start:.3f}s"
+                )
 
             return loss.detach()
 

@@ -7,7 +7,7 @@
     "sequence_length": 4096,
     "micro_batch_size": 4,
     "target_batch_size": 1024,
-    "batch_size": 192,
+    "batch_size": 16,
     "inner_steps": 30,
     "max_inner_steps": 300,
     "outer_learning_rate": 0.4,
