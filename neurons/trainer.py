@@ -498,17 +498,21 @@ class Trainer:
                 )
             return t
 
-        # NOTE: We do NOT pass ``group=`` to ``dist.send``/``dist.recv``.
-        # In several PyTorch versions, when both ``dst``/``src`` and
-        # ``group=`` are supplied, the rank argument is interpreted as the
-        # in-group rank rather than the global rank, which silently
-        # mis-routes the message and leaves the receiver hung. NCCL's
-        # default world group handles cross-stage P2P just fine: it lazily
-        # builds a 2-rank sub-communicator on first use (one "unbatched
-        # P2P op" warning per pair) and caches it for all subsequent
-        # sends/recvs. The pre-created ``self.pp_p2p_group_*`` groups are
-        # kept available for the future batched/async path (Phase 4) but
-        # are not used here.
+        # Cross-stage transport uses ``dist.batch_isend_irecv`` with
+        # ``dist.P2POp(peer=GLOBAL_RANK, group=PRE_CREATED_PAIR_GROUP)``.
+        # This is the canonical PyTorch PP pattern. Two reasons we use
+        # P2POp instead of plain ``dist.send``/``dist.recv``:
+        #   1. ``P2POp.peer`` is documented as global rank across PyTorch
+        #      versions, so we can safely route by global rank with a
+        #      pre-created sub-group (avoids the version-specific
+        #      ``dst``-with-``group=`` ambiguity).
+        #   2. The dedicated 2-rank comm built in ``_pp_setup`` keeps PP
+        #      P2P off the same NCCL stream as the dp-mesh all_gather/
+        #      reduce_scatter that FSDP runs inside each layer's forward,
+        #      eliminating the deadlock observed when both shared the
+        #      world-group lazy P2P comm.
+        send_grp = self.pp_p2p_group_send
+        recv_grp = self.pp_p2p_group_recv
         # ------------------------------------------------------------------------------
 
         if self.pp_is_first_stage:
@@ -528,13 +532,27 @@ class Trainer:
             compressed = self.pp_stage.output_boundary.encode(h)
             t = _phase("s0 after_encode", t)
 
-            dist.send(compressed.contiguous(), dst=self.pp_send_rank)
+            send_op = dist.P2POp(
+                dist.isend,
+                compressed.contiguous(),
+                peer=self.pp_send_rank,
+                group=send_grp,
+            )
+            for w in dist.batch_isend_irecv([send_op]):
+                w.wait()
             t = _phase("s0 after_send", t)
 
             grad_compressed = torch.empty(
                 B, S, bottleneck_dim, device=self.device, dtype=compressed.dtype
             )
-            dist.recv(grad_compressed, src=self.pp_send_rank)
+            recv_op = dist.P2POp(
+                dist.irecv,
+                grad_compressed,
+                peer=self.pp_send_rank,
+                group=send_grp,
+            )
+            for w in dist.batch_isend_irecv([recv_op]):
+                w.wait()
             t = _phase("s0 after_recv_grad", t)
 
             grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
@@ -554,7 +572,14 @@ class Trainer:
             compressed = torch.empty(
                 B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
             )
-            dist.recv(compressed, src=self.pp_recv_rank)
+            recv_op = dist.P2POp(
+                dist.irecv,
+                compressed,
+                peer=self.pp_recv_rank,
+                group=recv_grp,
+            )
+            for w in dist.batch_isend_irecv([recv_op]):
+                w.wait()
             t = _phase("sN after_recv_act", t)
 
             compressed.requires_grad_(True)
@@ -580,7 +605,14 @@ class Trainer:
                     B, S, ib.bottleneck_dim,
                     device=self.device, dtype=self.amp_dtype,
                 )
-            dist.send(grad_compressed.contiguous(), dst=self.pp_recv_rank)
+            send_op = dist.P2POp(
+                dist.isend,
+                grad_compressed.contiguous(),
+                peer=self.pp_recv_rank,
+                group=recv_grp,
+            )
+            for w in dist.batch_isend_irecv([send_op]):
+                w.wait()
             _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
             return loss.detach()
@@ -594,7 +626,14 @@ class Trainer:
             compressed_in = torch.empty(
                 B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
             )
-            dist.recv(compressed_in, src=self.pp_recv_rank)
+            recv_in_op = dist.P2POp(
+                dist.irecv,
+                compressed_in,
+                peer=self.pp_recv_rank,
+                group=recv_grp,
+            )
+            for w in dist.batch_isend_irecv([recv_in_op]):
+                w.wait()
             compressed_in.requires_grad_(True)
 
             h = ib.decode(compressed_in)
@@ -604,17 +643,38 @@ class Trainer:
                 h = result[0] if isinstance(result, tuple) else result
 
             compressed_out = ob.encode(h)
-            dist.send(compressed_out.contiguous(), dst=self.pp_send_rank)
+            send_out_op = dist.P2POp(
+                dist.isend,
+                compressed_out.contiguous(),
+                peer=self.pp_send_rank,
+                group=send_grp,
+            )
+            for w in dist.batch_isend_irecv([send_out_op]):
+                w.wait()
 
             grad_compressed_out = torch.empty_like(compressed_out)
-            dist.recv(grad_compressed_out, src=self.pp_send_rank)
+            recv_grad_op = dist.P2POp(
+                dist.irecv,
+                grad_compressed_out,
+                peer=self.pp_send_rank,
+                group=send_grp,
+            )
+            for w in dist.batch_isend_irecv([recv_grad_op]):
+                w.wait()
 
             compressed_out.backward(grad_compressed_out)
 
             grad_compressed_in = compressed_in.grad
             if grad_compressed_in is None:
                 grad_compressed_in = torch.zeros_like(compressed_in)
-            dist.send(grad_compressed_in.contiguous(), dst=self.pp_recv_rank)
+            send_grad_op = dist.P2POp(
+                dist.isend,
+                grad_compressed_in.contiguous(),
+                peer=self.pp_recv_rank,
+                group=recv_grp,
+            )
+            for w in dist.batch_isend_irecv([send_grad_op]):
+                w.wait()
 
             return torch.tensor(0.0, device=self.device)
 
