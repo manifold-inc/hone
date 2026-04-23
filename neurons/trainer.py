@@ -347,6 +347,17 @@ class Trainer:
         mesh axis so each PP stage's ranks form an independent FSDP group.
         Without PP we let ``fully_shard`` use its default world mesh, which
         is equivalent to a 1-D mesh of all ranks.
+
+        FSDP2 installs its unshard/reshard hooks on each wrapped module's
+        ``__call__``. ``_pp_forward_backward`` bypasses the outer model
+        forward and calls leaf submodules directly, so those leaves
+        (``embed_tokens``, ``lm_head``, the ResBM ``encoder``/``decoder``
+        inside each ``PipelineStageBoundary``) need their *own* FSDP units
+        or every call fails with "mixed torch.Tensor and DTensor".
+
+        Tiny modules (RMSNorm, ResBM ``IdentityProjection``) carry no
+        meaningful parameter footprint, so they stay replicated via
+        ``ignored_params`` rather than incurring an extra all-gather.
         """
         try:
             from torch.distributed.fsdp import fully_shard
@@ -358,13 +369,48 @@ class Trainer:
             fsdp_kwargs["mesh"] = self.dp_mesh
 
         if self.pp_stages > 1 and self.pp_stage is not None:
+            ignored_params: set = set()
+
+            # Shard each transformer block in the local stage.
             for layer in self.pp_stage.layers:
                 fully_shard(layer, **fsdp_kwargs)
-            fully_shard(self.model, **fsdp_kwargs)
+
+            # ResBM boundaries: shard the inner encoder/decoder MLPs (the
+            # bulk of the boundary params) so direct
+            # ``boundary.encoder(x)`` / ``boundary.decoder(c)`` calls
+            # trigger the unshard hook. The outer boundary itself stays
+            # as a plain nn.Module so ``boundary.encode(...)`` works.
+            for boundary in (
+                self.pp_stage.input_boundary,
+                self.pp_stage.output_boundary,
+            ):
+                if boundary is None:
+                    continue
+                fully_shard(boundary.encoder, **fsdp_kwargs)
+                fully_shard(boundary.decoder, **fsdp_kwargs)
+                # IdentityProjection has no parameters, nothing to ignore.
+
+            # Stage-edge submodules called directly from
+            # ``_pp_forward_backward``.
+            if self.pp_is_first_stage and hasattr(self.model, "embed_tokens"):
+                fully_shard(self.model.embed_tokens, **fsdp_kwargs)
+            if self.pp_is_last_stage and hasattr(self.model, "lm_head"):
+                fully_shard(self.model.lm_head, **fsdp_kwargs)
+
+            # RMSNorm is one (hidden_dim,) vector; replicate it.
+            if self.pp_is_last_stage and hasattr(self.model, "norm"):
+                ignored_params.update(self.model.norm.parameters())
+
+            # Outer wrapper: anything not yet wrapped (typically nothing
+            # except the ignored norm) inherits a root FSDP hook.
+            fully_shard(
+                self.model, **fsdp_kwargs, ignored_params=ignored_params
+            )
         else:
             for layer in self.model.layers:
                 fully_shard(layer, **fsdp_kwargs)
             fully_shard(self.model, **fsdp_kwargs)
+
         hone.logger.info(
             f"[Model] FSDP2 applied, world_size={self.world_size}, "
             f"pp_stages={self.pp_stages}, "
