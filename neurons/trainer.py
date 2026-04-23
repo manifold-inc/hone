@@ -465,14 +465,23 @@ class Trainer:
                 h = result[0] if isinstance(result, tuple) else result
             t = _phase("s0 after_layers", t)
 
-            compressed = self.pp_stage.output_boundary.encode(h)
+            # Cast to amp_dtype before send so the wire contract is
+            # deterministic: FSDP keeps params in their native (often
+            # float32) dtype, and autocast only kicks in at op level for
+            # whitelisted ops. ``F.embedding`` follows weight.dtype and a
+            # subsequent ``bf16 + float32`` add promotes back to float32,
+            # so ``compressed`` would otherwise leave the encoder as
+            # float32 and double the wire payload.
+            compressed = self.pp_stage.output_boundary.encode(h).to(
+                self.amp_dtype
+            )
             t = _phase("s0 after_encode", t)
 
             transport.send_next(compressed.contiguous())
             t = _phase("s0 after_send", t)
 
             grad_compressed = transport.recv_next(
-                shape=(B, S, bottleneck_dim), dtype=compressed.dtype
+                shape=(B, S, bottleneck_dim), dtype=self.amp_dtype
             )
             t = _phase("s0 after_recv_grad", t)
 
@@ -518,7 +527,10 @@ class Trainer:
                     B, S, ib.bottleneck_dim,
                     device=self.device, dtype=self.amp_dtype,
                 )
-            transport.send_prev(grad_compressed.contiguous())
+            # Same wire-contract reasoning as on the activation send:
+            # match amp_dtype so stage 0's recv_next gets exactly what
+            # it asked for.
+            transport.send_prev(grad_compressed.to(self.amp_dtype).contiguous())
             _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
             return loss.detach()
@@ -540,11 +552,11 @@ class Trainer:
                 result = layer(h, position_embeddings)
                 h = result[0] if isinstance(result, tuple) else result
 
-            compressed_out = ob.encode(h)
+            compressed_out = ob.encode(h).to(self.amp_dtype)
             transport.send_next(compressed_out.contiguous())
 
             grad_compressed_out = transport.recv_next(
-                shape=tuple(compressed_out.shape), dtype=compressed_out.dtype
+                shape=tuple(compressed_out.shape), dtype=self.amp_dtype
             )
 
             compressed_out.backward(grad_compressed_out)
@@ -552,7 +564,9 @@ class Trainer:
             grad_compressed_in = compressed_in.grad
             if grad_compressed_in is None:
                 grad_compressed_in = torch.zeros_like(compressed_in)
-            transport.send_prev(grad_compressed_in.contiguous())
+            transport.send_prev(
+                grad_compressed_in.to(self.amp_dtype).contiguous()
+            )
 
             return torch.tensor(0.0, device=self.device)
 
