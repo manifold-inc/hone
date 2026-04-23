@@ -19,14 +19,18 @@ in start() to avoid the obvious race.
 
 Wire format
 -----------
-Each tensor is sent as ``[8B big-endian length][raw payload]``. ``bfloat16``
-is reinterpreted via ``view(uint16)`` for the wire (numpy has no bf16) and
-view'd back on receive. Both sides know the shape and dtype from
-``_pp_forward_backward`` so we don't transmit metadata.
+Each tensor is sent as ``[8B big-endian length][raw payload]`` where the
+payload is produced by ``torch.save(...)``. ``torch.save`` / ``torch.load``
+handle every dtype (including ``bfloat16``) without numpy fallbacks, and
+sidestep version-specific quirks in ``Tensor.view(other_dtype)`` that
+otherwise mis-reinterpret bf16 byte buffers. The overhead of ``torch.save``
+on a contiguous CPU tensor of <1 MB is sub-millisecond and dominated by
+the network transfer itself.
 """
 
 from __future__ import annotations
 
+import io
 import socket
 import struct
 import threading
@@ -276,11 +280,13 @@ class PPTransport:
     # ------------------------------------------------------------------
     @staticmethod
     def _tensor_to_bytes(tensor: torch.Tensor) -> bytes:
+        # ``torch.save`` is dtype-agnostic (handles bf16 cleanly) and the
+        # serialization overhead on a contiguous CPU tensor of <1 MB is
+        # negligible compared to the network round-trip we're about to do.
         cpu = tensor.detach().to("cpu").contiguous()
-        # numpy doesn't support bf16; reinterpret as uint16 same-bytes.
-        if cpu.dtype == torch.bfloat16:
-            cpu = cpu.view(torch.uint16)
-        return cpu.numpy().tobytes()
+        buf = io.BytesIO()
+        torch.save(cpu, buf)
+        return buf.getvalue()
 
     def _bytes_to_tensor(
         self,
@@ -288,13 +294,20 @@ class PPTransport:
         shape: tuple[int, ...],
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        if dtype == torch.bfloat16:
-            t = torch.frombuffer(buf, dtype=torch.uint16).view(torch.bfloat16)
-        else:
-            t = torch.frombuffer(buf, dtype=dtype)
-        # ``frombuffer`` returns a tensor that aliases ``buf``; clone so the
-        # caller can let the bytearray go out of scope safely.
-        return t.reshape(shape).to(self.device).clone()
+        # We pass ``shape`` / ``dtype`` only as a sanity check; ``torch.load``
+        # rebuilds the original tensor metadata directly from the payload.
+        t = torch.load(io.BytesIO(bytes(buf)), weights_only=True)
+        if tuple(t.shape) != tuple(shape):
+            raise RuntimeError(
+                f"PPTransport: received tensor shape {tuple(t.shape)} "
+                f"but expected {tuple(shape)}"
+            )
+        if t.dtype != dtype:
+            raise RuntimeError(
+                f"PPTransport: received tensor dtype {t.dtype} "
+                f"but expected {dtype}"
+            )
+        return t.to(self.device)
 
     def _send_tensor(
         self, sock: socket.socket | None, tensor: torch.Tensor
