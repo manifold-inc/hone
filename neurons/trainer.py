@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import time
 from contextlib import nullcontext
 from typing import Iterable
@@ -415,27 +416,34 @@ class Trainer:
             torch.empty(1, 1, config.dim, device=self.device), position_ids
         )
 
-        # ---------------- DIAGNOSTIC: per-phase progress (start + end) ----------------
+        # ---------------- DIAGNOSTIC: per-phase progress (--debug only) ----------------
         # First rank of each stage logs every microbatch; one line per phase
-        # boundary so we see live progress even when the per-microbatch wall
-        # time is large. ``cuda.synchronize`` makes wall times accurate.
-        diag_log = self.rank == self.pp_stage_ranks[0]
+        # boundary so we see live progress when wall times are large.
+        # Gated on the logger being at DEBUG level, which the miner enables
+        # via ``--debug`` (calls ``hone.debug()``). When disabled we skip
+        # the ``cuda.synchronize`` calls entirely so the steady-state
+        # training loop pays zero diagnostic overhead.
+        diag_log = (
+            self.rank == self.pp_stage_ranks[0]
+            and hone.logger.isEnabledFor(logging.DEBUG)
+        )
         if not hasattr(self, "_pp_microbatch_idx"):
             self._pp_microbatch_idx = 0
         self._pp_microbatch_idx += 1
         mb = self._pp_microbatch_idx
 
         def _now() -> float:
-            if torch.cuda.is_available():
+            if diag_log and torch.cuda.is_available():
                 torch.cuda.synchronize(self.device)
             return time.time()
 
         def _phase(tag: str, t_prev: float) -> float:
+            if not diag_log:
+                return t_prev
             t = _now()
-            if diag_log:
-                hone.logger.info(
-                    f"[Diag/PP {tag} mb={mb}] +{t - t_prev:.3f}s"
-                )
+            hone.logger.debug(
+                f"[Diag/PP {tag} mb={mb}] +{t - t_prev:.3f}s"
+            )
             return t
 
         # Cross-stage transport runs over PPTransport (TCP), set up by
@@ -454,7 +462,7 @@ class Trainer:
         if self.pp_is_first_stage:
             t = _now()
             if diag_log:
-                hone.logger.info(f"[Diag/PP s0 mb={mb}] enter")
+                hone.logger.debug(f"[Diag/PP s0 mb={mb}] enter")
 
             h = self.model.embed_tokens(input_ids)
             h.requires_grad_(True)
@@ -497,7 +505,7 @@ class Trainer:
 
             t = _now()
             if diag_log:
-                hone.logger.info(f"[Diag/PP sN mb={mb}] enter")
+                hone.logger.debug(f"[Diag/PP sN mb={mb}] enter")
 
             compressed = transport.recv_prev(
                 shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype

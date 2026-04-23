@@ -20,6 +20,7 @@ import argparse
 import asyncio
 import concurrent.futures
 import hashlib
+import logging
 import os
 import random
 import sys
@@ -380,29 +381,31 @@ class Validator(BaseNode, Trainer):
         self.model_initialized = False  # Track if model has actual weights
 
         # ---------------- DIAGNOSTIC: confirm what init_model actually did ----------------
-        _rank = int(os.getenv("RANK", 0))
-        _ws = int(os.getenv("WORLD_SIZE", 1))
-        _local_rank = int(os.getenv("LOCAL_RANK", 0))
-        n_total = sum(p.numel() for p in self.model.parameters())
-        n_dt = sum(1 for p in self.model.parameters() if isinstance(p, DT))
-        first_p = next(self.model.parameters(), None)
-        first_dev = str(first_p.device) if first_p is not None else "<none>"
-        first_shape = tuple(first_p.shape) if first_p is not None else ()
-        hone.logger.info(
-            f"[Diag/Validator] post-init_model: world_size={_ws} rank={_rank} "
-            f"local_rank={_local_rank} "
-            f"pp_stages(in_trainer)={getattr(self, 'pp_stages', '<unset>')} "
-            f"pp_stage_id={getattr(self, 'pp_stage_id', '<unset>')} "
-            f"pp_stage_ranks={getattr(self, 'pp_stage_ranks', '<unset>')} "
-            f"pp_stage_module_present={getattr(self, 'pp_stage', None) is not None}"
-        )
-        hone.logger.info(
-            f"[Diag/Validator] model: total_params={n_total / 1e9:.4f}B "
-            f"dtensor_params={n_dt} "
-            f"first_param_device={first_dev} "
-            f"first_param_shape={first_shape} "
-            f"top_level_keys={list(self.model._modules.keys())}"
-        )
+        # Gated on --debug. Skips the per-param iteration entirely when off.
+        if hone.logger.isEnabledFor(logging.DEBUG):
+            _rank = int(os.getenv("RANK", 0))
+            _ws = int(os.getenv("WORLD_SIZE", 1))
+            _local_rank = int(os.getenv("LOCAL_RANK", 0))
+            n_total = sum(p.numel() for p in self.model.parameters())
+            n_dt = sum(1 for p in self.model.parameters() if isinstance(p, DT))
+            first_p = next(self.model.parameters(), None)
+            first_dev = str(first_p.device) if first_p is not None else "<none>"
+            first_shape = tuple(first_p.shape) if first_p is not None else ()
+            hone.logger.debug(
+                f"[Diag/Validator] post-init_model: world_size={_ws} rank={_rank} "
+                f"local_rank={_local_rank} "
+                f"pp_stages(in_trainer)={getattr(self, 'pp_stages', '<unset>')} "
+                f"pp_stage_id={getattr(self, 'pp_stage_id', '<unset>')} "
+                f"pp_stage_ranks={getattr(self, 'pp_stage_ranks', '<unset>')} "
+                f"pp_stage_module_present={getattr(self, 'pp_stage', None) is not None}"
+            )
+            hone.logger.debug(
+                f"[Diag/Validator] model: total_params={n_total / 1e9:.4f}B "
+                f"dtensor_params={n_dt} "
+                f"first_param_device={first_dev} "
+                f"first_param_shape={first_shape} "
+                f"top_level_keys={list(self.model._modules.keys())}"
+            )
         # ---------------------------------------------------------------------------------
         self.ckpt = hone.DCPCheckpointer(
             self.comms, uid=self.uid, version=hone.__version__

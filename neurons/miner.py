@@ -23,6 +23,7 @@ import concurrent.futures
 import gc
 import hashlib
 import json
+import logging
 import os
 import random
 import sys
@@ -289,29 +290,31 @@ class Miner(BaseNode, Trainer):
             self.pp_transport.start()
 
         # ---------------- DIAGNOSTIC: confirm what init_model actually did ----------------
-        n_total = sum(p.numel() for p in self.model.parameters())
-        n_dt = sum(1 for p in self.model.parameters() if isinstance(p, DT))
-        first_p = next(self.model.parameters(), None)
-        first_dev = str(first_p.device) if first_p is not None else "<none>"
-        first_shape = tuple(first_p.shape) if first_p is not None else ()
-        hone.logger.info(
-            f"[Diag/Miner] post-init_model: world_size={self.world_size} rank={self.rank} "
-            f"local_rank={self.local_rank} "
-            f"pp_degree(set_in_miner)={self.pp_degree} "
-            f"pp_stages(in_trainer)={getattr(self, 'pp_stages', '<unset>')} "
-            f"pp_stage_id={getattr(self, 'pp_stage_id', '<unset>')} "
-            f"pp_stage_ranks={getattr(self, 'pp_stage_ranks', '<unset>')} "
-            f"pp_send_rank={getattr(self, 'pp_send_rank', '<unset>')} "
-            f"pp_recv_rank={getattr(self, 'pp_recv_rank', '<unset>')} "
-            f"pp_stage_module_present={getattr(self, 'pp_stage', None) is not None}"
-        )
-        hone.logger.info(
-            f"[Diag/Miner] model: total_params={n_total / 1e9:.4f}B "
-            f"dtensor_params={n_dt} "
-            f"first_param_device={first_dev} "
-            f"first_param_shape={first_shape} "
-            f"top_level_keys={list(self.model._modules.keys())}"
-        )
+        # Gated on --debug. Cheap to compute but noisy in normal logs.
+        if hone.logger.isEnabledFor(logging.DEBUG):
+            n_total = sum(p.numel() for p in self.model.parameters())
+            n_dt = sum(1 for p in self.model.parameters() if isinstance(p, DT))
+            first_p = next(self.model.parameters(), None)
+            first_dev = str(first_p.device) if first_p is not None else "<none>"
+            first_shape = tuple(first_p.shape) if first_p is not None else ()
+            hone.logger.debug(
+                f"[Diag/Miner] post-init_model: world_size={self.world_size} rank={self.rank} "
+                f"local_rank={self.local_rank} "
+                f"pp_degree(set_in_miner)={self.pp_degree} "
+                f"pp_stages(in_trainer)={getattr(self, 'pp_stages', '<unset>')} "
+                f"pp_stage_id={getattr(self, 'pp_stage_id', '<unset>')} "
+                f"pp_stage_ranks={getattr(self, 'pp_stage_ranks', '<unset>')} "
+                f"pp_send_rank={getattr(self, 'pp_send_rank', '<unset>')} "
+                f"pp_recv_rank={getattr(self, 'pp_recv_rank', '<unset>')} "
+                f"pp_stage_module_present={getattr(self, 'pp_stage', None) is not None}"
+            )
+            hone.logger.debug(
+                f"[Diag/Miner] model: total_params={n_total / 1e9:.4f}B "
+                f"dtensor_params={n_dt} "
+                f"first_param_device={first_dev} "
+                f"first_param_shape={first_shape} "
+                f"top_level_keys={list(self.model._modules.keys())}"
+            )
         # ---------------------------------------------------------------------------------
 
         # Init compression

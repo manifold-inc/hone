@@ -1422,10 +1422,29 @@ class Comms(ChainManager):
             s3 = await self._get_s3_client(bucket)
             if stage_id is not None:
                 key = f"gradient-{window}-{uid}-stage{stage_id}-v{version}.pt"
-            else:
-                key = f"gradient-{window}-{uid}-v{version}.pt"
-            hdr = await s3.head_object(Bucket=bucket.name, Key=key)
-            return hdr["LastModified"].timestamp()
+                hdr = await s3.head_object(Bucket=bucket.name, Key=key)
+                return hdr["LastModified"].timestamp()
+            # ``stage_id`` not specified: try the legacy single-file
+            # naming first; if that 404s (typical for PP miners), fall
+            # back to a prefix listing that catches any per-stage upload
+            # and returns the latest LastModified.
+            legacy_key = f"gradient-{window}-{uid}-v{version}.pt"
+            try:
+                hdr = await s3.head_object(Bucket=bucket.name, Key=legacy_key)
+                return hdr["LastModified"].timestamp()
+            except Exception:
+                pass
+            prefix = f"gradient-{window}-{uid}-stage"
+            resp = await s3.list_objects_v2(
+                Bucket=bucket.name, Prefix=prefix
+            )
+            contents = resp.get("Contents", [])
+            if not contents:
+                return 0.0
+            # Use the most recent stage upload as the "miner finished"
+            # timestamp; gather time-window checks should be valid as
+            # long as the LAST stage's payload arrived in window.
+            return max(c["LastModified"].timestamp() for c in contents)
         except Exception:
             await self._purge_s3_client(bucket)
             return 0.0
@@ -2261,18 +2280,31 @@ class Comms(ChainManager):
             current_window = self.current_window
             if current_window is None:
                 return False
+            # ListObjectsV2 with the per-(window, uid) prefix matches both
+            # legacy ``gradient-{w}-{uid}-vX.pt`` and per-stage
+            # ``gradient-{w}-{uid}-stage{N}-vX.pt`` uploads in one call,
+            # so PP miners (which never write the legacy filename) are
+            # correctly counted as active.
             for window in range(current_window - recent_windows, current_window + 1):
-                filename = f"gradient-{window}-{uid}-v{hone.__version__}.pt"
-                hone.logger.debug(f"Checking for {filename} in {peer_bucket.name}")
+                prefix = f"gradient-{window}-{uid}-"
+                hone.logger.debug(
+                    f"Listing {prefix}* in {peer_bucket.name}"
+                )
                 try:
-                    await s3_client.head_object(Bucket=peer_bucket.name, Key=filename)
-                    hone.logger.debug(f"Found {filename} for UID {uid}")
-                    return True
+                    resp = await s3_client.list_objects_v2(
+                        Bucket=peer_bucket.name, Prefix=prefix, MaxKeys=1
+                    )
+                    if resp.get("KeyCount", 0) > 0:
+                        hone.logger.debug(
+                            f"Found {resp['Contents'][0]['Key']} for UID {uid}"
+                        )
+                        return True
+                    hone.logger.debug(f"No {prefix}* in {peer_bucket.name}")
                 except botocore.exceptions.ClientError as e:
                     if e.response["Error"]["Code"] not in ["404", "403", "401"]:
                         hone.logger.error(f"Error checking activity for {uid}: {e}")
                         return False
-                    hone.logger.debug(f"{filename} not found for UID {uid}")
+                    hone.logger.debug(f"{prefix}* list error for UID {uid}")
 
         except (ConnectionClosedError, ClientError):
             await self._purge_s3_client(peer_bucket)
