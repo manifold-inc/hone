@@ -192,8 +192,25 @@ class Trainer:
         self.tokenizer = self.hparams.tokenizer
 
     def _pp_setup(self, pp_stages: int):
-        """Compute pipeline parallelism rank assignments."""
+        """Compute pipeline parallelism rank assignments and device meshes.
+
+        When ``pp_stages > 1`` and we're in a distributed run, we build a
+        2D DeviceMesh laid out as ``(pp, dp)``:
+
+          - ``self.dp_mesh`` -> within-stage FSDP shard mesh (passed to
+            ``fully_shard`` as ``mesh=``).
+          - ``self.pp_mesh`` -> cross-stage mesh, used later for ResBM
+            activation transport in :meth:`_pp_forward_backward`.
+          - ``self.pp_stage_group`` -> the underlying process group for the
+            dp axis (kept for non-FSDP collectives such as DeMo per-stage
+            owner-shard reductions).
+        """
         self.pp_stages = pp_stages
+        self.pp_mesh = None
+        self.dp_mesh = None
+        self.world_mesh = None
+        self.pp_stage_group = None
+
         if pp_stages <= 1:
             self.pp_stage_id = 0
             self.pp_is_first_stage = True
@@ -202,7 +219,6 @@ class Trainer:
             self.pp_send_rank = -1
             self.pp_recv_rank = -1
             self.pp_stage: PipelineStage | None = None
-            self.pp_stage_group = None
             return
 
         ranks_per_stage = self.world_size // pp_stages
@@ -233,14 +249,30 @@ class Trainer:
         )
 
         if dist_helper.is_distributed():
-            self.pp_stage_group = dist.new_group(self.pp_stage_ranks)
-        else:
-            self.pp_stage_group = None
+            try:
+                from torch.distributed.device_mesh import init_device_mesh
+            except ImportError:
+                from torch.distributed._tensor import init_device_mesh
+
+            # 2D mesh: outer="pp" (cross-stage), inner="dp" (within-stage).
+            # The flattened layout matches our rank ordering so mesh
+            # coordinate (pp_idx, dp_idx) == pp_idx * ranks_per_stage + dp_idx
+            # == self.rank when (pp_idx, dp_idx) is this rank's position.
+            mesh_device = "cuda" if torch.cuda.is_available() else "cpu"
+            self.world_mesh = init_device_mesh(
+                mesh_device,
+                (pp_stages, ranks_per_stage),
+                mesh_dim_names=("pp", "dp"),
+            )
+            self.dp_mesh = self.world_mesh["dp"]
+            self.pp_mesh = self.world_mesh["pp"]
+            self.pp_stage_group = self.dp_mesh.get_group()
 
         hone.logger.info(
             f"[PP] stage={self.pp_stage_id}/{pp_stages}, "
             f"ranks={self.pp_stage_ranks}, "
-            f"send_to={self.pp_send_rank}, recv_from={self.pp_recv_rank}"
+            f"send_to={self.pp_send_rank}, recv_from={self.pp_recv_rank}, "
+            f"dp_mesh={'set' if self.dp_mesh is not None else 'unset'}"
         )
 
     def _init_pp_model(
@@ -309,23 +341,34 @@ class Trainer:
         )
 
     def _apply_fsdp(self):
-        """Apply FSDP2 wrapping at the TransformerBlock level."""
+        """Apply FSDP2 wrapping at the TransformerBlock level.
+
+        With PP > 1, sharding is constrained to the within-stage ``dp``
+        mesh axis so each PP stage's ranks form an independent FSDP group.
+        Without PP we let ``fully_shard`` use its default world mesh, which
+        is equivalent to a 1-D mesh of all ranks.
+        """
         try:
             from torch.distributed.fsdp import fully_shard
         except ImportError:
             from torch.distributed._composable.fsdp import fully_shard
 
+        fsdp_kwargs: dict = {}
+        if self.dp_mesh is not None:
+            fsdp_kwargs["mesh"] = self.dp_mesh
+
         if self.pp_stages > 1 and self.pp_stage is not None:
             for layer in self.pp_stage.layers:
-                fully_shard(layer, process_group=self.pp_stage_group)
-            fully_shard(self.model, process_group=self.pp_stage_group)
+                fully_shard(layer, **fsdp_kwargs)
+            fully_shard(self.model, **fsdp_kwargs)
         else:
             for layer in self.model.layers:
-                fully_shard(layer)
-            fully_shard(self.model)
+                fully_shard(layer, **fsdp_kwargs)
+            fully_shard(self.model, **fsdp_kwargs)
         hone.logger.info(
             f"[Model] FSDP2 applied, world_size={self.world_size}, "
-            f"pp_stages={self.pp_stages}"
+            f"pp_stages={self.pp_stages}, "
+            f"mesh={'dp' if self.dp_mesh is not None else 'default-world'}"
         )
 
     # ------------------------------------------------------------------
