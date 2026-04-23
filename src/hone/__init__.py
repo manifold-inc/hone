@@ -1,7 +1,7 @@
 # ruff: noqa
 # type: ignore
 
-__version__ = "0.1.20"
+__version__ = "0.1.21"
 
 from .chain import *
 from .comms import *
@@ -16,6 +16,8 @@ from .checkpoint import DCPCheckpointer
 from .model import LoopLM, LoopLMConfig
 from .loss import compute_loss
 from .reporter import DashboardReporter
+from .pp_transport import PPTransport
 from . import muon
 from . import distributed
 from . import pipeline
+from . import pp_transport

@@ -61,7 +61,14 @@ class AppState(Stateful):
         return get_model_state_dict(self.model)
 
     def load_state_dict(self, state: dict[str, ValueType]) -> None:
-        set_model_state_dict(self.model, state)
+        # ``strict=False`` lets a PP-carved miner load a full-model
+        # checkpoint without erroring on the keys for layers/embeds it
+        # doesn't own. It also lets a future schema change (extra keys in
+        # the on-disk checkpoint) avoid hard failures.
+        from torch.distributed.checkpoint.state_dict import StateDictOptions
+        set_model_state_dict(
+            self.model, state, options=StateDictOptions(strict=False)
+        )
 
 
 class SnapshotState(Stateful):

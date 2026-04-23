@@ -95,8 +95,8 @@
     },
 
     "pipeline": {
-        "enabled": false,
-        "num_stages": 4,
+        "enabled": true,
+        "num_stages": 2,
         "bottleneck_dim": 16
     }
 }

@@ -1555,6 +1555,13 @@ class Validator(BaseNode, Trainer):
                     hone.logger.info(
                         f"Rank {dist_helper.rank} starting gather_with_reserve for window {self.sync_window}"
                     )
+                    pp_cfg = getattr(self.hparams, "pipeline", None)
+                    if isinstance(pp_cfg, dict):
+                        pp_num_stages = int(pp_cfg.get("num_stages", 1))
+                    elif pp_cfg is not None:
+                        pp_num_stages = int(getattr(pp_cfg, "num_stages", 1))
+                    else:
+                        pp_num_stages = 1
                     gather_result = await self.comms.gather_with_reserve(
                         my_uid=self.uid,
                         gather_uids=self.comms.peers,
@@ -1570,6 +1577,7 @@ class Validator(BaseNode, Trainer):
                         time_min=time_min,
                         time_max=time_max,
                         expected_compressed_params=self.expected_compressed_params,
+                        pp_num_stages=pp_num_stages,
                     )
                     hone.logger.info(
                         f"Rank {dist_helper.rank} completed gather_with_reserve for window {self.sync_window}"

@@ -116,8 +116,41 @@ class Miner(BaseNode, Trainer):
         parser.add_argument("--debug", action="store_true", help="Enable debug logging")
         parser.add_argument("--trace", action="store_true", help="Enable trace logging")
         parser.add_argument(
-            "--pp-stages", type=int, default=1,
-            help="Number of pipeline-parallel stages. 1 = no PP (default).",
+            "--pp-stage", type=int, default=0,
+            help="0-indexed pipeline stage that THIS torchrun job is running.",
+        )
+        parser.add_argument(
+            "--pp-num-stages", type=int, default=1,
+            help="Total number of pipeline-parallel stages. 1 = no PP (default).",
+        )
+        parser.add_argument(
+            "--pp-peer-host-prev", type=str, default="127.0.0.1",
+            help="Hostname/IP of the previous PP stage. Unused on stage 0.",
+        )
+        parser.add_argument(
+            "--pp-peer-host-next", type=str, default="127.0.0.1",
+            help="Hostname/IP of the next PP stage. Unused on the last stage.",
+        )
+        parser.add_argument(
+            "--pp-peer-port-base-prev", type=int, default=50100,
+            help="Previous stage's listen-port base. Each rank R adds R to it. "
+                 "Currently unused (we don't initiate connections to prev) but "
+                 "kept for symmetry / future use.",
+        )
+        parser.add_argument(
+            "--pp-peer-port-base-next", type=int, default=50100,
+            help="Next stage's listen-port base. Each rank R connects to "
+                 "(peer_host_next, peer_port_base_next + R).",
+        )
+        parser.add_argument(
+            "--pp-listen-host", type=str, default="0.0.0.0",
+            help="Address to bind the PP transport listener.",
+        )
+        parser.add_argument(
+            "--pp-listen-port-base", type=int, default=50000,
+            help="My own listen-port base. Each rank R listens on "
+                 "(pp_listen_host, pp_listen_port_base + R) for the previous "
+                 "stage's connect.",
         )
         parser.add_argument(
             "--store-gathers",
@@ -217,7 +250,12 @@ class Miner(BaseNode, Trainer):
         # miner running an unsharded full model on every rank.
         fsdp_cfg = getattr(self.hparams, "fsdp", SimpleNamespace())
         self.tp_degree = 1
-        self.pp_degree = getattr(self.config, "pp_stages", 1)
+        # Each torchrun job is one PP stage; world_size = ranks within the
+        # stage. ``pp_num_stages`` is the total stage count across the
+        # logical pipeline; ``pp_stage_id`` is which stage THIS torchrun is.
+        self.pp_num_stages = int(getattr(self.config, "pp_num_stages", 1))
+        self.pp_stage_id = int(getattr(self.config, "pp_stage", 0))
+        self.pp_degree = self.pp_num_stages  # alias the trainer reads
         self.cp_degree = 1
         self.dp_replicate = int(getattr(fsdp_cfg, "dp_replicate", 1))
         self.dp_shard = int(getattr(fsdp_cfg, "dp_shard", 1))
@@ -227,6 +265,28 @@ class Miner(BaseNode, Trainer):
         # Move model from meta to actual device (allocates memory but no initialization)
         self.model = self.model.to_empty(device=str(self.device))
         self.model_initialized = False  # Track if model has actual weights
+
+        # ----- Cross-stage TCP transport (replaces NCCL P2P) -----
+        # We keep one TCP connection per (stage S rank R, stage S+1 rank R)
+        # pair. Activations and gradients both flow over this socket;
+        # FSDP-internal NCCL stays untouched. Skipped when pp_num_stages == 1.
+        self.pp_transport: hone.PPTransport | None = None
+        if self.pp_num_stages > 1:
+            self.pp_transport = hone.PPTransport(
+                my_stage=self.pp_stage_id,
+                num_stages=self.pp_num_stages,
+                my_local_rank=self.local_rank,
+                ranks_per_stage=self.world_size,
+                peer_host_prev=self.config.pp_peer_host_prev,
+                peer_port_base_prev=int(self.config.pp_peer_port_base_prev),
+                peer_host_next=self.config.pp_peer_host_next,
+                peer_port_base_next=int(self.config.pp_peer_port_base_next),
+                listen_host=self.config.pp_listen_host,
+                listen_port_base=int(self.config.pp_listen_port_base),
+                device=self.device,
+                amp_dtype=self.amp_dtype,
+            )
+            self.pp_transport.start()
 
         # ---------------- DIAGNOSTIC: confirm what init_model actually did ----------------
         n_total = sum(p.numel() for p in self.model.parameters())
@@ -521,6 +581,9 @@ class Miner(BaseNode, Trainer):
                 window=self.current_window,
                 key="gradient",
                 local=False,
+                stage_id=(
+                    self.pp_stage_id if self.pp_num_stages > 1 else None
+                ),
             )
             hone.logger.info("Dummy gradient posted successfully")
 
@@ -752,6 +815,9 @@ class Miner(BaseNode, Trainer):
                     global_step=self.global_step,
                     local=False,
                     stale_retention=100,
+                    stage_id=(
+                        self.pp_stage_id if self.pp_num_stages > 1 else None
+                    ),
                 )
 
                 upload_size = sum(
@@ -817,6 +883,7 @@ class Miner(BaseNode, Trainer):
                     time_min=time_min,
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
+                    pp_num_stages=self.pp_num_stages,
                 )
                 hone.logger.info("Gather task completed!")
                 gather_time = hone.T() - gather_start

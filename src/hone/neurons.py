@@ -1112,6 +1112,13 @@ async def catchup_with_aggregation_server(
                         )
 
                     # ---- Gather fallback ----------------------------------------
+                    pp_cfg = getattr(instance.hparams, "pipeline", None)
+                    if isinstance(pp_cfg, dict):
+                        _pp_num_stages = int(pp_cfg.get("num_stages", 1))
+                    elif pp_cfg is not None:
+                        _pp_num_stages = int(getattr(pp_cfg, "num_stages", 1))
+                    else:
+                        _pp_num_stages = 1
                     gather_ns = await instance.comms.gather(
                         my_uid=instance.uid,
                         uids=instance.comms.peers,
@@ -1125,6 +1132,7 @@ async def catchup_with_aggregation_server(
                         compressor=instance.compressor,
                         time_min=time_min,
                         time_max=time_max,
+                        pp_num_stages=_pp_num_stages,
                     )
 
                 if gather_ns is None:

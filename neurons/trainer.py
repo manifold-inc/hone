@@ -192,115 +192,55 @@ class Trainer:
         self.tokenizer = self.hparams.tokenizer
 
     def _pp_setup(self, pp_stages: int):
-        """Compute pipeline parallelism rank assignments and device meshes.
+        """Compute pipeline parallelism rank assignments.
 
-        When ``pp_stages > 1`` and we're in a distributed run, we build a
-        2D DeviceMesh laid out as ``(pp, dp)``:
-
-          - ``self.dp_mesh`` -> within-stage FSDP shard mesh (passed to
-            ``fully_shard`` as ``mesh=``).
-          - ``self.pp_mesh`` -> cross-stage mesh, used later for ResBM
-            activation transport in :meth:`_pp_forward_backward`.
-          - ``self.pp_stage_group`` -> the underlying process group for the
-            dp axis (kept for non-FSDP collectives such as DeMo per-stage
-            owner-shard reductions).
+        Per-stage torchrun model: each torchrun job runs ONE PP stage and
+        owns its own NCCL world. ``pp_stage_id`` is set externally by the
+        caller (Miner reads it from ``--pp-stage``). All ranks of this
+        torchrun belong to the same stage. Cross-stage activation transfer
+        runs over the separate :class:`hone.PPTransport` TCP channel,
+        completely outside the NCCL process group, which avoids the stream
+        contention between PP P2P and FSDP all_gather/reduce_scatter that
+        deadlocks the single-torchrun design.
         """
         self.pp_stages = pp_stages
+        # Legacy attributes kept None so any stale reference is obvious.
         self.pp_mesh = None
         self.dp_mesh = None
         self.world_mesh = None
         self.pp_stage_group = None
+        self.pp_p2p_group_send = None
+        self.pp_p2p_group_recv = None
+        self.pp_send_rank = -1  # unused under TCP transport
+        self.pp_recv_rank = -1  # unused under TCP transport
 
         if pp_stages <= 1:
             self.pp_stage_id = 0
             self.pp_is_first_stage = True
             self.pp_is_last_stage = True
             self.pp_stage_ranks = list(range(self.world_size))
-            self.pp_send_rank = -1
-            self.pp_recv_rank = -1
             self.pp_stage: PipelineStage | None = None
             return
 
-        ranks_per_stage = self.world_size // pp_stages
-        if ranks_per_stage < 1:
+        # ``pp_stage_id`` was set by ``Miner.__init__`` from the ``--pp-stage``
+        # CLI flag before ``init_model`` was called. Fall back to 0 only if
+        # the caller forgot to set it (defensive).
+        stage_id = int(getattr(self, "pp_stage_id", 0))
+        if stage_id < 0 or stage_id >= pp_stages:
             raise ValueError(
-                f"pp_stages={pp_stages} exceeds world_size={self.world_size}. "
-                f"Need at least 1 rank per stage."
+                f"pp_stage_id={stage_id} outside [0, {pp_stages})"
             )
-
-        self.pp_stage_id = self.rank // ranks_per_stage
-        self.pp_stage_ranks = list(range(
-            self.pp_stage_id * ranks_per_stage,
-            (self.pp_stage_id + 1) * ranks_per_stage,
-        ))
-        self.pp_is_first_stage = self.pp_stage_id == 0
-        self.pp_is_last_stage = self.pp_stage_id == pp_stages - 1
-
-        # Rank-to-rank topology: rank R in stage S exchanges with rank
-        # R + ranks_per_stage in stage S+1. This preserves data parallelism
-        # across the pipeline (each rank's microbatch flows through both
-        # stages independently) and gives N parallel cross-stage links over
-        # NVLink within a node.
-        self.pp_send_rank = (
-            self.rank + ranks_per_stage if not self.pp_is_last_stage else -1
-        )
-        self.pp_recv_rank = (
-            self.rank - ranks_per_stage if not self.pp_is_first_stage else -1
-        )
-
-        # Pre-created dedicated 2-rank groups for each cross-stage pair.
-        # Without these, every dist.send/recv over the size-4 world group
-        # forces NCCL to lazily create a new 2-rank sub-communicator,
-        # producing the "unbatched P2P op" warning and adding O(seconds)
-        # of setup overhead the first time a pair communicates.
-        self.pp_p2p_group_send = None  # group with my pp_send_rank peer
-        self.pp_p2p_group_recv = None  # group with my pp_recv_rank peer
-
-        if dist_helper.is_distributed():
-            try:
-                from torch.distributed.device_mesh import init_device_mesh
-            except ImportError:
-                from torch.distributed._tensor import init_device_mesh
-
-            # 2D mesh: outer="pp" (cross-stage), inner="dp" (within-stage).
-            # The flattened layout matches our rank ordering so mesh
-            # coordinate (pp_idx, dp_idx) == pp_idx * ranks_per_stage + dp_idx
-            # == self.rank when (pp_idx, dp_idx) is this rank's position.
-            mesh_device = "cuda" if torch.cuda.is_available() else "cpu"
-            self.world_mesh = init_device_mesh(
-                mesh_device,
-                (pp_stages, ranks_per_stage),
-                mesh_dim_names=("pp", "dp"),
-            )
-            self.dp_mesh = self.world_mesh["dp"]
-            self.pp_mesh = self.world_mesh["pp"]
-            self.pp_stage_group = self.dp_mesh.get_group()
-
-            # Build dedicated P2P groups for every (stage S, stage S+1)
-            # pair across all ranks. dist.new_group must be called by
-            # *every* rank in the world (even ranks not in the new group)
-            # to stay collective; non-member ranks receive None.
-            for src_stage in range(pp_stages - 1):
-                for rank_in_stage in range(ranks_per_stage):
-                    rank_a = src_stage * ranks_per_stage + rank_in_stage
-                    rank_b = (src_stage + 1) * ranks_per_stage + rank_in_stage
-                    pair_group = dist.new_group(
-                        ranks=[rank_a, rank_b], backend="nccl"
-                    )
-                    if self.rank == rank_a:
-                        # rank_a is "send-side" toward rank_b in stage S+1.
-                        self.pp_p2p_group_send = pair_group
-                    if self.rank == rank_b:
-                        # rank_b is "recv-side" from rank_a in stage S.
-                        self.pp_p2p_group_recv = pair_group
+        self.pp_stage_id = stage_id
+        self.pp_is_first_stage = stage_id == 0
+        self.pp_is_last_stage = stage_id == pp_stages - 1
+        # Within this torchrun, the stage's ranks are simply 0..world_size-1.
+        self.pp_stage_ranks = list(range(self.world_size))
 
         hone.logger.info(
             f"[PP] stage={self.pp_stage_id}/{pp_stages}, "
             f"ranks={self.pp_stage_ranks}, "
-            f"send_to={self.pp_send_rank}, recv_from={self.pp_recv_rank}, "
-            f"dp_mesh={'set' if self.dp_mesh is not None else 'unset'}, "
-            f"p2p_send_grp={'set' if self.pp_p2p_group_send is not None else 'none'}, "
-            f"p2p_recv_grp={'set' if self.pp_p2p_group_recv is not None else 'none'}"
+            f"world_size={self.world_size}, "
+            f"transport=TCP (PPTransport)"
         )
 
     def _init_pp_model(
@@ -498,21 +438,17 @@ class Trainer:
                 )
             return t
 
-        # Cross-stage transport uses ``dist.batch_isend_irecv`` with
-        # ``dist.P2POp(peer=GLOBAL_RANK, group=PRE_CREATED_PAIR_GROUP)``.
-        # This is the canonical PyTorch PP pattern. Two reasons we use
-        # P2POp instead of plain ``dist.send``/``dist.recv``:
-        #   1. ``P2POp.peer`` is documented as global rank across PyTorch
-        #      versions, so we can safely route by global rank with a
-        #      pre-created sub-group (avoids the version-specific
-        #      ``dst``-with-``group=`` ambiguity).
-        #   2. The dedicated 2-rank comm built in ``_pp_setup`` keeps PP
-        #      P2P off the same NCCL stream as the dp-mesh all_gather/
-        #      reduce_scatter that FSDP runs inside each layer's forward,
-        #      eliminating the deadlock observed when both shared the
-        #      world-group lazy P2P comm.
-        send_grp = self.pp_p2p_group_send
-        recv_grp = self.pp_p2p_group_recv
+        # Cross-stage transport runs over PPTransport (TCP), set up by
+        # Miner.__init__ before init_model returns. PPTransport is a plain
+        # blocking-socket abstraction that exchanges raw tensor bytes; it
+        # does NOT touch the NCCL stream, which means PP send/recv and
+        # FSDP all_gather can interleave freely without deadlocking.
+        transport = self.pp_transport
+        if transport is None:
+            raise RuntimeError(
+                "PP forward/backward called but pp_transport is None; "
+                "Miner.__init__ should have constructed it when pp_num_stages > 1."
+            )
         # ------------------------------------------------------------------------------
 
         if self.pp_is_first_stage:
@@ -532,27 +468,12 @@ class Trainer:
             compressed = self.pp_stage.output_boundary.encode(h)
             t = _phase("s0 after_encode", t)
 
-            send_op = dist.P2POp(
-                dist.isend,
-                compressed.contiguous(),
-                peer=self.pp_send_rank,
-                group=send_grp,
-            )
-            for w in dist.batch_isend_irecv([send_op]):
-                w.wait()
+            transport.send_next(compressed.contiguous())
             t = _phase("s0 after_send", t)
 
-            grad_compressed = torch.empty(
-                B, S, bottleneck_dim, device=self.device, dtype=compressed.dtype
+            grad_compressed = transport.recv_next(
+                shape=(B, S, bottleneck_dim), dtype=compressed.dtype
             )
-            recv_op = dist.P2POp(
-                dist.irecv,
-                grad_compressed,
-                peer=self.pp_send_rank,
-                group=send_grp,
-            )
-            for w in dist.batch_isend_irecv([recv_op]):
-                w.wait()
             t = _phase("s0 after_recv_grad", t)
 
             grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
@@ -569,17 +490,9 @@ class Trainer:
             if diag_log:
                 hone.logger.info(f"[Diag/PP sN mb={mb}] enter")
 
-            compressed = torch.empty(
-                B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
+            compressed = transport.recv_prev(
+                shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
             )
-            recv_op = dist.P2POp(
-                dist.irecv,
-                compressed,
-                peer=self.pp_recv_rank,
-                group=recv_grp,
-            )
-            for w in dist.batch_isend_irecv([recv_op]):
-                w.wait()
             t = _phase("sN after_recv_act", t)
 
             compressed.requires_grad_(True)
@@ -605,14 +518,7 @@ class Trainer:
                     B, S, ib.bottleneck_dim,
                     device=self.device, dtype=self.amp_dtype,
                 )
-            send_op = dist.P2POp(
-                dist.isend,
-                grad_compressed.contiguous(),
-                peer=self.pp_recv_rank,
-                group=recv_grp,
-            )
-            for w in dist.batch_isend_irecv([send_op]):
-                w.wait()
+            transport.send_prev(grad_compressed.contiguous())
             _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
             return loss.detach()
@@ -623,17 +529,9 @@ class Trainer:
             ib = self.pp_stage.input_boundary
             ob = self.pp_stage.output_boundary
 
-            compressed_in = torch.empty(
-                B, S, ib.bottleneck_dim, device=self.device, dtype=self.amp_dtype,
+            compressed_in = transport.recv_prev(
+                shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
             )
-            recv_in_op = dist.P2POp(
-                dist.irecv,
-                compressed_in,
-                peer=self.pp_recv_rank,
-                group=recv_grp,
-            )
-            for w in dist.batch_isend_irecv([recv_in_op]):
-                w.wait()
             compressed_in.requires_grad_(True)
 
             h = ib.decode(compressed_in)
@@ -643,38 +541,18 @@ class Trainer:
                 h = result[0] if isinstance(result, tuple) else result
 
             compressed_out = ob.encode(h)
-            send_out_op = dist.P2POp(
-                dist.isend,
-                compressed_out.contiguous(),
-                peer=self.pp_send_rank,
-                group=send_grp,
-            )
-            for w in dist.batch_isend_irecv([send_out_op]):
-                w.wait()
+            transport.send_next(compressed_out.contiguous())
 
-            grad_compressed_out = torch.empty_like(compressed_out)
-            recv_grad_op = dist.P2POp(
-                dist.irecv,
-                grad_compressed_out,
-                peer=self.pp_send_rank,
-                group=send_grp,
+            grad_compressed_out = transport.recv_next(
+                shape=tuple(compressed_out.shape), dtype=compressed_out.dtype
             )
-            for w in dist.batch_isend_irecv([recv_grad_op]):
-                w.wait()
 
             compressed_out.backward(grad_compressed_out)
 
             grad_compressed_in = compressed_in.grad
             if grad_compressed_in is None:
                 grad_compressed_in = torch.zeros_like(compressed_in)
-            send_grad_op = dist.P2POp(
-                dist.isend,
-                grad_compressed_in.contiguous(),
-                peer=self.pp_recv_rank,
-                group=recv_grp,
-            )
-            for w in dist.batch_isend_irecv([send_grad_op]):
-                w.wait()
+            transport.send_prev(grad_compressed_in.contiguous())
 
             return torch.tensor(0.0, device=self.device)
 

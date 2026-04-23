@@ -356,9 +356,11 @@ class Comms(ChainManager):
             min_allowed_window = current_window - stale_retention
 
             # Regex pattern to match filenames of the form:
-            # gradient-<window>-<uid>-v<version>.pt
+            #   gradient-<window>-<uid>-v<version>.pt          (legacy / non-PP)
+            #   gradient-<window>-<uid>-stage<N>-v<version>.pt (per-stage upload)
             pattern = re.compile(
-                rf"^gradient-(\d+)-{uid}-v{re.escape(hone.__version__)}.pt$"
+                rf"^gradient-(\d+)-{uid}(?:-stage\d+)?-v"
+                rf"{re.escape(hone.__version__)}\.pt$"
             )
 
             prefix = "gradient"
@@ -1293,6 +1295,7 @@ class Comms(ChainManager):
         global_step: int = 0,
         local: bool = True,
         stale_retention: int = 10,
+        stage_id: int | None = None,
     ) -> float:
         """
         Saves a state dictionary to either local storage or a remote S3 bucket.
@@ -1330,7 +1333,16 @@ class Comms(ChainManager):
                 secret_access_key=credentials["secret_access_key"],
             )
         else:
-            filename = f"{key}-{window}-{uid}-v{hone.__version__}.pt"
+            # Per-stage gradient uploads keyed with `-stage{n}` so multiple
+            # PP stages of the same UID don't overwrite each other in R2.
+            # All other key types (debug, etc.) keep the legacy naming.
+            if stage_id is not None and key == "gradient":
+                filename = (
+                    f"gradient-{window}-{uid}-stage{stage_id}"
+                    f"-v{hone.__version__}.pt"
+                )
+            else:
+                filename = f"{key}-{window}-{uid}-v{hone.__version__}.pt"
             bucket = None
         hone.logger.debug(f"PUT {filename} -->")
 
@@ -1378,7 +1390,11 @@ class Comms(ChainManager):
         return put_end - put_start
 
     async def gradient_timestamp(
-        self, uid: int, window: int, version: str = hone.__version__
+        self,
+        uid: int,
+        window: int,
+        version: str = hone.__version__,
+        stage_id: int | None = None,
     ) -> float:
         """
         Retrieves the last-modified timestamp of a gradient file from S3.
@@ -1391,6 +1407,8 @@ class Comms(ChainManager):
             uid (int): The UID of the miner who owns the gradient.
             window (int): The window number for the gradient.
             version (str, optional): The templar version string. Defaults to `hone.__version__`.
+            stage_id (int, optional): The PP stage. When set, the lookup uses the
+                ``-stage{n}-`` suffixed filename written by per-stage uploads.
 
         Returns:
             float: The POSIX timestamp (seconds since epoch) of the file's
@@ -1402,7 +1420,10 @@ class Comms(ChainManager):
             return 0.0
         try:
             s3 = await self._get_s3_client(bucket)
-            key = f"gradient-{window}-{uid}-v{version}.pt"
+            if stage_id is not None:
+                key = f"gradient-{window}-{uid}-stage{stage_id}-v{version}.pt"
+            else:
+                key = f"gradient-{window}-{uid}-v{version}.pt"
             hdr = await s3.head_object(Bucket=bucket.name, Key=key)
             return hdr["LastModified"].timestamp()
         except Exception:
@@ -1421,6 +1442,7 @@ class Comms(ChainManager):
         time_max: datetime | None = None,
         show_progress: bool = True,
         map_location: str | None = None,
+        stage_id: int | None = None,
     ) -> CommsGetResult:
         """
         Retrieves an object from storage, either locally or from a remote S3 bucket.
@@ -1451,6 +1473,11 @@ class Comms(ChainManager):
         """
         if key == "aggregator":
             filename = f"{key}-{window}-v{hone.__version__}.pt"
+        elif stage_id is not None and key == "gradient":
+            filename = (
+                f"gradient-{window}-{uid}-stage{stage_id}"
+                f"-v{hone.__version__}.pt"
+            )
         else:
             filename = f"{key}-{window}-{uid}-v{hone.__version__}.pt"
         hone.logger.debug(f"GET {filename} -->")
@@ -1538,6 +1565,7 @@ class Comms(ChainManager):
         time_max: datetime | None = None,
         show_progress: bool = False,
         map_location: str | None = None,
+        stage_id: int | None = None,
     ) -> CommsGetResult | None:
         """
         Attempts to retrieve an object from storage with a retry mechanism.
@@ -1611,6 +1639,7 @@ class Comms(ChainManager):
                 time_max=time_max,
                 show_progress=show_progress,
                 map_location=map_location,
+                stage_id=stage_id,
             )
 
             if result.success:
@@ -1644,6 +1673,7 @@ class Comms(ChainManager):
         time_min: datetime | None = None,
         time_max: datetime | None = None,
         xshapes: dict[str, tuple] | None = None,
+        pp_num_stages: int = 1,
     ) -> SimpleNamespace | None:
         """
         Gathers and processes gradients from a list of peer UIDs.
@@ -1709,9 +1739,17 @@ class Comms(ChainManager):
         # Ensure deterministic order across processes/ranks
         uids = sorted(uids)
 
-        async with self.gather_semaphore:
-            batch_tasks = [
-                self.get_with_retry(
+        async def _fetch_uid(uid: int) -> CommsGetResult | None:
+            """Fetch one peer's full gradient.
+
+            When ``pp_num_stages > 1`` the peer wrote one R2 file per stage
+            with the ``-stage{n}`` suffix; we download each in parallel and
+            merge into a single state dict (param namespaces between stages
+            are disjoint by construction). Otherwise we fall back to the
+            legacy single-file naming so non-PP miners keep working.
+            """
+            if pp_num_stages <= 1:
+                return await self.get_with_retry(
                     uid=str(uid),
                     window=window,
                     key=key,
@@ -1722,8 +1760,47 @@ class Comms(ChainManager):
                     time_max=time_max,
                     map_location=device,
                 )
-                for uid in uids
-            ]
+
+            stage_results = await asyncio.gather(
+                *(
+                    self.get_with_retry(
+                        uid=str(uid),
+                        window=window,
+                        key=key,
+                        timeout=timeout,
+                        local=local,
+                        stale_retention=stale_retention,
+                        time_min=time_min,
+                        time_max=time_max,
+                        map_location=device,
+                        stage_id=s,
+                    )
+                    for s in range(pp_num_stages)
+                ),
+                return_exceptions=True,
+            )
+
+            # Any stage missing / errored => the whole UID's payload is
+            # unusable; signal NOT_FOUND so the gather loop tags it skipped.
+            merged: dict[str, Any] = {}
+            global_step_first: int = 0
+            for s_idx, sr in enumerate(stage_results):
+                if isinstance(sr, Exception) or sr is None or not sr.success:
+                    hone.logger.debug(
+                        f"UID {uid} stage {s_idx}: missing/failed "
+                        f"({sr if not isinstance(sr, Exception) else sr})"
+                    )
+                    return None
+                if sr.data is None:
+                    return None
+                if s_idx == 0:
+                    global_step_first = sr.global_step
+                merged.update(sr.data)
+
+            return CommsGetResult(data=merged, global_step=global_step_first)
+
+        async with self.gather_semaphore:
+            batch_tasks = [_fetch_uid(uid) for uid in uids]
 
             try:
                 download_start = hone.T()
@@ -2021,6 +2098,7 @@ class Comms(ChainManager):
         gather_uids: list[int],
         reserve_uids: list[int],
         expected_compressed_params: set[str] | None = None,
+        pp_num_stages: int = 1,
         **kwargs,
     ) -> SimpleNamespace | None:
         """
@@ -2063,6 +2141,7 @@ class Comms(ChainManager):
             my_uid=my_uid,
             uids=gather_uids,
             expected_compressed_params=expected_compressed_params,
+            pp_num_stages=pp_num_stages,
             **kwargs,
         )
 
@@ -2098,7 +2177,12 @@ class Comms(ChainManager):
                     message=f"[gather_with_reserve] 🔄 retrying with reserve "
                     f"uids={replacements}"
                 )
-                fallback = await self.gather(my_uid=my_uid, uids=replacements, **kwargs)
+                fallback = await self.gather(
+                    my_uid=my_uid,
+                    uids=replacements,
+                    pp_num_stages=pp_num_stages,
+                    **kwargs,
+                )
                 if fallback:
                     # merge tensor‑lists inside the nested state_dict
                     for k, v in vars(fallback.state_dict).items():
