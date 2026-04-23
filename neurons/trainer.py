@@ -26,6 +26,67 @@ from hone.pipeline import PipelineStage, PipelineStageBoundary, create_pipeline_
 from neurons.base_node import CPU_COUNT
 
 
+class _PipelineStageModel(nn.Module):
+    """Wrapper module owning a single pipeline stage's submodules.
+
+    Stage 0 owns ``embed_tokens``; the last stage owns ``norm`` + ``lm_head``;
+    every stage owns its ``stage`` (a ``PipelineStage``) and a shared
+    ``rotary_emb``. ``init_weights`` mirrors ``LoopLM.init_weights`` but only
+    for the submodules that live on this stage, so the same call site works
+    after carving.
+    """
+
+    def __init__(
+        self,
+        *,
+        stage: PipelineStage,
+        embed_tokens: nn.Module | None,
+        norm: nn.Module | None,
+        lm_head: nn.Module | None,
+        rotary_emb: nn.Module,
+        config: LoopLMConfig,
+        is_first_stage: bool,
+        is_last_stage: bool,
+    ):
+        super().__init__()
+        self.stage = stage
+        if embed_tokens is not None:
+            self.embed_tokens = embed_tokens
+        if norm is not None:
+            self.norm = norm
+        if lm_head is not None:
+            self.lm_head = lm_head
+        self.rotary_emb = rotary_emb
+        self.config = config
+        self.is_first_stage = is_first_stage
+        self.is_last_stage = is_last_stage
+
+    def init_weights(self):
+        """Initialize this stage's tensors in-place.
+
+        Safe to call after ``to_empty(device)`` for the meta-init flow. This
+        only touches the submodules that live on this stage, so embed/norm/
+        lm_head are skipped on stages that don't own them.
+        """
+        if hasattr(self, "embed_tokens"):
+            nn.init.normal_(self.embed_tokens.weight)
+        self.stage.init_weights()
+        if hasattr(self, "norm"):
+            nn.init.ones_(self.norm.weight)
+        if hasattr(self, "lm_head") and not getattr(
+            self.config, "tie_embeddings", True
+        ):
+            final_std = self.config.dim ** -0.5
+            cutoff = 3 * final_std
+            nn.init.trunc_normal_(
+                self.lm_head.weight,
+                mean=0.0,
+                std=final_std,
+                a=-cutoff,
+                b=cutoff,
+            )
+
+
 class Trainer:
     """Manages model creation, optimizers, and the inner training loop."""
 
@@ -88,22 +149,32 @@ class Trainer:
     def init_model(self, validator=False, meta=False):
         config: LoopLMConfig = self.hparams.model_config
         pp_stages = getattr(self, "pp_degree", 1)
+        ranks_in_stage = self.world_size // max(pp_stages, 1)
 
         if meta:
+            # Meta-init path:
+            #   build LoopLM on meta -> set up PP groups -> carve to local stage on
+            #   meta -> wrap with FSDP2 (returns DTensor on meta).
+            # Caller (Miner/Validator) is responsible for `to_empty(device)` and
+            # then `init_weights()` on the carved model.
             with torch.device("meta"):
                 self.model = LoopLM(config)
             self._pp_setup(pp_stages)
+            if pp_stages > 1:
+                self._init_pp_model(config, pp_stages, meta=True)
+
+            if ranks_in_stage > 1 and dist_helper.is_distributed():
+                self._apply_fsdp()
         else:
+            # Eager-init path: real weights allocated immediately on `self.device`.
             self.model = LoopLM(config)
             self.model.init_weights()
             self.model.to(self.device)
 
             self._pp_setup(pp_stages)
             if pp_stages > 1:
-                self._init_pp_model(config, pp_stages)
+                self._init_pp_model(config, pp_stages, meta=False)
 
-            # FSDP2 wrapping when distributed (within each PP stage's ranks)
-            ranks_in_stage = self.world_size // max(pp_stages, 1)
             if ranks_in_stage > 1 and dist_helper.is_distributed():
                 self._apply_fsdp()
 
@@ -149,13 +220,16 @@ class Trainer:
         self.pp_is_first_stage = self.pp_stage_id == 0
         self.pp_is_last_stage = self.pp_stage_id == pp_stages - 1
 
+        # Rank-to-rank topology: rank R in stage S exchanges with rank
+        # R + ranks_per_stage in stage S+1. This preserves data parallelism
+        # across the pipeline (each rank's microbatch flows through both
+        # stages independently) and gives N parallel cross-stage links over
+        # NVLink within a node.
         self.pp_send_rank = (
-            (self.pp_stage_id + 1) * ranks_per_stage
-            if not self.pp_is_last_stage else -1
+            self.rank + ranks_per_stage if not self.pp_is_last_stage else -1
         )
         self.pp_recv_rank = (
-            self.pp_stage_id * ranks_per_stage - 1
-            if not self.pp_is_first_stage else -1
+            self.rank - ranks_per_stage if not self.pp_is_first_stage else -1
         )
 
         if dist_helper.is_distributed():
@@ -169,8 +243,20 @@ class Trainer:
             f"send_to={self.pp_send_rank}, recv_from={self.pp_recv_rank}"
         )
 
-    def _init_pp_model(self, config: LoopLMConfig, pp_stages: int):
-        """Partition the full model into pipeline stages and keep only this rank's stage."""
+    def _init_pp_model(
+        self,
+        config: LoopLMConfig,
+        pp_stages: int,
+        *,
+        meta: bool = False,
+    ):
+        """Partition the full model into pipeline stages and keep only this rank's stage.
+
+        When ``meta=True`` the model parameters are still on the meta device;
+        we skip both ``init_weights()`` and ``.to(device)`` so that the caller
+        can ``to_empty(device)`` and then call ``self.model.init_weights()``
+        once tensors have real storage.
+        """
         pipeline_cfg = getattr(self.hparams, "pipeline", None)
         if pipeline_cfg is not None:
             if hasattr(pipeline_cfg, "bottleneck_dim"):
@@ -188,29 +274,38 @@ class Trainer:
         )
 
         my_stage = stages[self.pp_stage_id]
-        my_stage.init_weights()
+        if not meta:
+            my_stage.init_weights()
 
-        new_model = nn.Module()
-        new_model.stage = my_stage
-
-        if self.pp_is_first_stage:
-            new_model.embed_tokens = self.model.embed_tokens
-        if self.pp_is_last_stage:
-            new_model.norm = self.model.norm
-            new_model.lm_head = self.model.lm_head
-
-        new_model.rotary_emb = self.model.rotary_emb
-        new_model.config = config
+        new_model = _PipelineStageModel(
+            stage=my_stage,
+            embed_tokens=self.model.embed_tokens if self.pp_is_first_stage else None,
+            norm=self.model.norm if self.pp_is_last_stage else None,
+            lm_head=self.model.lm_head if self.pp_is_last_stage else None,
+            rotary_emb=self.model.rotary_emb,
+            config=config,
+            is_first_stage=self.pp_is_first_stage,
+            is_last_stage=self.pp_is_last_stage,
+        )
 
         del self.model
-        torch.cuda.empty_cache()
-        self.model = new_model.to(self.device)
+        if not meta and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if not meta:
+            self.model = new_model.to(self.device)
+        else:
+            self.model = new_model
         self.pp_stage = my_stage
 
+        # Note: when meta=True, every parameter still reports `numel()` from
+        # its meta shape (storage is unallocated), so this count is accurate
+        # for the local stage's parameter footprint either way.
         n_params = sum(p.numel() for p in self.model.parameters())
         hone.logger.info(
             f"[PP] Stage {self.pp_stage_id}: {len(my_stage.layers)} layers, "
             f"{n_params/1e6:.1f}M params, bottleneck_dim={bottleneck_dim}"
+            f"{' (meta)' if meta else ''}"
         )
 
     def _apply_fsdp(self):

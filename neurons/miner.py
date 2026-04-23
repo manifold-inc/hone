@@ -210,19 +210,23 @@ class Miner(BaseNode, Trainer):
         hone.logger.info("[Init] Bittensor wallet loaded")
         super().__init__()
 
-        # Initialize model on meta device first
-        self.init_model(meta=True)
-        # Move model from meta to actual device (allocates memory but no initialization)
-        self.model = self.model.to_empty(device=str(self.device))
-        self.model_initialized = False  # Track if model has actual weights
-
-        # Store parallelization parameters for later use
+        # Parallelization config must be set BEFORE init_model so the
+        # trainer's meta path knows whether to carve into pipeline stages
+        # and apply FSDP. Reading these via getattr inside init_model
+        # silently defaulted to 1 when assigned afterwards, which left the
+        # miner running an unsharded full model on every rank.
         fsdp_cfg = getattr(self.hparams, "fsdp", SimpleNamespace())
         self.tp_degree = 1
         self.pp_degree = getattr(self.config, "pp_stages", 1)
         self.cp_degree = 1
         self.dp_replicate = int(getattr(fsdp_cfg, "dp_replicate", 1))
         self.dp_shard = int(getattr(fsdp_cfg, "dp_shard", 1))
+
+        # Initialize model on meta device first
+        self.init_model(meta=True)
+        # Move model from meta to actual device (allocates memory but no initialization)
+        self.model = self.model.to_empty(device=str(self.device))
+        self.model_initialized = False  # Track if model has actual weights
 
         # ---------------- DIAGNOSTIC: confirm what init_model actually did ----------------
         n_total = sum(p.numel() for p in self.model.parameters())

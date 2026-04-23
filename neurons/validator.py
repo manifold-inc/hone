@@ -368,6 +368,11 @@ class Validator(BaseNode, Trainer):
         self.device = torch.device(self.config.device)
         hone.logger.info(f"[Init] device set → {self.device}")
 
+        # Parallelization config must be set BEFORE init_model so the
+        # trainer's meta path applies FSDP across the validator's GPUs.
+        # Validator does not currently support PP; pin pp_degree=1.
+        self.pp_degree = 1
+
         # Initialize model on meta device first
         self.init_model(validator=True, meta=True)
         # Move model from meta to actual device (allocates memory but no initialization)

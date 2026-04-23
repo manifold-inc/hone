@@ -42,6 +42,14 @@ class LoopLMConfig:
     moe_layers: list[int] | None = None
     moe_aux_loss_coeff: float = 0.01
 
+    # Pipeline / ResBM. When pipeline_num_stages > 1, the full model owns
+    # `boundaries: ModuleList[PipelineStageBoundary]` with one entry per cut
+    # (i.e. pipeline_num_stages - 1 entries). This lets a single-stage holder
+    # (e.g. a non-PP validator) hold boundary weights so PP miners' uploads
+    # have a destination.
+    pipeline_num_stages: int = 1
+    pipeline_bottleneck_dim: int = 16
+
     def __post_init__(self):
         if self.n_kv_heads is None:
             self.n_kv_heads = self.n_heads
@@ -350,6 +358,17 @@ class LoopLM(nn.Module):
             max_seq_len=config.max_seq_len,
             theta=config.rope_theta,
         )
+
+        self.boundaries: nn.ModuleList | None = None
+        if config.pipeline_num_stages > 1:
+            from .pipeline import PipelineStageBoundary
+            n_cuts = config.pipeline_num_stages - 1
+            self.boundaries = nn.ModuleList(
+                [
+                    PipelineStageBoundary(config.dim, config.pipeline_bottleneck_dim)
+                    for _ in range(n_cuts)
+                ]
+            )
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Returns logits (dense) or (logits, aux_loss) when MoE is active."""
