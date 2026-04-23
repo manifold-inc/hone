@@ -932,6 +932,15 @@ class Trainer:
                 continue
 
             # 3. Forward + backward
+            # ``corrected_accum`` / ``final_micro`` need to be defined
+            # before either branch because the optimizer-step bookkeeping
+            # below reads them in both PP and non-PP modes. In PP mode the
+            # backward already happened inside ``_pp_forward_backward``
+            # via ``loss.backward()`` on the last stage, so we don't run a
+            # ``scaler.scale(loss).backward()`` here.
+            corrected_accum = max(self.sampler.grad_accum_steps, 1)
+            final_micro = (batch_count + 1) % corrected_accum == 0
+
             if self.pp_stages > 1:
                 with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                     calculated_loss = self._pp_forward_backward(input_ids, labels)
@@ -952,9 +961,6 @@ class Trainer:
 
                 loss = calculated_loss / self.sampler.grad_accum_steps
                 loss_item = calculated_loss.detach().item()
-
-                corrected_accum = max(self.sampler.grad_accum_steps, 1)
-                final_micro = (batch_count + 1) % corrected_accum == 0
 
                 if (
                     hasattr(self.model, "no_sync")
