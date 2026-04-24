@@ -6,6 +6,7 @@ import asyncio
 import concurrent.futures
 import logging
 import time
+from collections import deque
 from contextlib import nullcontext
 from typing import Iterable
 
@@ -87,6 +88,75 @@ class _PipelineStageModel(nn.Module):
                 b=cutoff,
             )
 
+    def get_canonical_param_names(self) -> dict[str, str | None]:
+        """Map this wrapper's ``named_parameters()`` keys to the equivalent
+        plain-``LoopLM`` keys so gradients can be aggregated across
+        differently-wrapped peers (and validators that run un-wrapped).
+
+        - ``stage.layers.{local}.X`` -> ``layers.{global}.X`` using each
+          ``DecoderLayer.layer_idx`` so stage 1's local index 0 maps back
+          to its true global position in the original model. ``X`` is any
+          parameter suffix and the rule is intentionally generic so it
+          handles the dense MLP keys (``mlp.gate_proj.weight`` etc.) as
+          well as the stacked MoE keys introduced for grouped-GEMM
+          (``mlp.gate_weight``, ``mlp.up_weight``, ``mlp.down_weight``,
+          ``mlp.gate.weight``, ``mlp.shared_expert.*``).
+        - ``stage.input_boundary.*`` and ``stage.output_boundary.*`` map to
+          ``None``: these ResBM modules only exist when PP is on, so
+          there's no canonical home for them in the validator's model.
+          Skipping them keeps these parameters local-only (still trained
+          by the inner optimizer, never aggregated across miners).
+        - ``embed_tokens.*``, ``norm.*``, ``lm_head.*``, ``rotary_emb.*``
+          are unprefixed and identical to the plain LoopLM names.
+        """
+        mapping: dict[str, str | None] = {}
+        for name, _ in self.named_parameters():
+            if not name.startswith("stage."):
+                mapping[name] = name
+                continue
+
+            sub = name[len("stage."):]
+            if sub.startswith("input_boundary.") or sub.startswith(
+                "output_boundary."
+            ):
+                mapping[name] = None
+                continue
+
+            if sub.startswith("layers."):
+                rest = sub[len("layers."):]
+                local_idx_str, _, suffix = rest.partition(".")
+                try:
+                    local_idx = int(local_idx_str)
+                    global_idx = self.stage.layers[local_idx].layer_idx
+                    mapping[name] = f"layers.{global_idx}.{suffix}"
+                    continue
+                except (ValueError, IndexError, AttributeError):
+                    pass
+
+            mapping[name] = sub
+
+        # Defensive sanity check: two different local params must never
+        # share the same canonical name, otherwise the validator's
+        # ``_fetch_uid`` merge step (``merged.update(stage_data)``) would
+        # silently overwrite one stage's compressed grad with another's.
+        # Cheap to run once per init and worth its weight if a future
+        # refactor accidentally collapses two params (e.g. by reusing
+        # ``mlp.gate_weight`` outside the experts).
+        seen: dict[str, str] = {}
+        for src, dst in mapping.items():
+            if dst is None:
+                continue
+            if dst in seen:
+                raise RuntimeError(
+                    "Canonical name collision between local params "
+                    f"'{seen[dst]}' and '{src}' both mapping to '{dst}'. "
+                    "This would silently corrupt gradient aggregation "
+                    "across PP stages."
+                )
+            seen[dst] = src
+
+        return mapping
+
 
 class Trainer:
     """Manages model creation, optimizers, and the inner training loop."""
@@ -140,11 +210,23 @@ class Trainer:
     # Model
     # ------------------------------------------------------------------
     def get_expected_params(self) -> set[str]:
+        """Set of compressed-payload keys we expect each peer to upload.
+
+        We use the canonical (cross-rank-stable) names so a validator
+        running plain ``LoopLM`` and a PP miner that has wrapped its model
+        in ``_PipelineStageModel`` agree on the namespace. PP-only ResBM
+        boundary params map to ``None`` and are excluded — they're never
+        aggregated across miners.
+        """
+        canon = hone.canonical_param_names(self.model)
         expected = set()
         for name, _ in self.model.named_parameters():
-            expected.add(name + "idxs")
-            expected.add(name + "vals")
-            expected.add(name + "quant_params")
+            cname = canon.get(name, name)
+            if cname is None:
+                continue
+            expected.add(cname + "idxs")
+            expected.add(cname + "vals")
+            expected.add(cname + "quant_params")
         return expected
 
     def init_model(self, validator=False, meta=False):
@@ -258,6 +340,31 @@ class Trainer:
         can ``to_empty(device)`` and then call ``self.model.init_weights()``
         once tensors have real storage.
         """
+        # Pipeline parallelism puts ``embed_tokens`` (stage 0) and
+        # ``lm_head`` (last stage) on *different* processes. Even when
+        # ``LoopLM`` would normally tie them with ``self.lm_head.weight =
+        # self.embed_tokens.weight`` the carved stages each end up with
+        # an independent ``nn.Parameter`` after the cross-process split,
+        # so the inner optimizer would update the two halves with
+        # different gradients on every micro-step and they'd silently
+        # drift apart. The validator (un-carved, weights actually tied)
+        # would see only stage 0's gradient contribution and apply it to
+        # both ends of the tied weight, baking the divergence into the
+        # checkpoint. We refuse to start in this configuration rather
+        # than let training proceed against a model that no peer can
+        # reproduce. Run with ``tie_embeddings: false`` for PP, or set
+        # ``pipeline.num_stages: 1`` to keep tied embeddings.
+        if getattr(config, "tie_embeddings", True):
+            raise RuntimeError(
+                "Pipeline parallelism is incompatible with tied embeddings: "
+                "stage 0 owns ``embed_tokens.weight`` while the last stage "
+                "owns ``lm_head.weight`` on a different process, so the two "
+                "halves of what should be a single Parameter diverge during "
+                "training. Set ``tie_embeddings: false`` in the model config "
+                "to use PP, or set ``pipeline.num_stages: 1`` to keep tied "
+                "embeddings."
+            )
+
         pipeline_cfg = getattr(self.hparams, "pipeline", None)
         if pipeline_cfg is not None:
             if hasattr(pipeline_cfg, "bottleneck_dim"):
@@ -318,8 +425,8 @@ class Trainer:
         is equivalent to a 1-D mesh of all ranks.
 
         FSDP2 installs its unshard/reshard hooks on each wrapped module's
-        ``__call__``. ``_pp_forward_backward`` bypasses the outer model
-        forward and calls leaf submodules directly, so those leaves
+        ``__call__``. ``_pp_run_1f1b`` bypasses the outer model forward
+        and calls leaf submodules directly, so those leaves
         (``embed_tokens``, ``lm_head``, the ResBM ``encoder``/``decoder``
         inside each ``PipelineStageBoundary``) need their *own* FSDP units
         or every call fails with "mixed torch.Tensor and DTensor".
@@ -359,8 +466,7 @@ class Trainer:
                 fully_shard(boundary.decoder, **fsdp_kwargs)
                 # IdentityProjection has no parameters, nothing to ignore.
 
-            # Stage-edge submodules called directly from
-            # ``_pp_forward_backward``.
+            # Stage-edge submodules called directly from ``_pp_run_1f1b``.
             if self.pp_is_first_stage and hasattr(self.model, "embed_tokens"):
                 fully_shard(self.model.embed_tokens, **fsdp_kwargs)
             if self.pp_is_last_stage and hasattr(self.model, "lm_head"):
@@ -387,219 +493,305 @@ class Trainer:
         )
 
     # ------------------------------------------------------------------
-    # Pipeline-parallel forward + backward
+    # Pipeline-parallel forward + backward (1F1B schedule)
     # ------------------------------------------------------------------
-    def _pp_forward_backward(
+    def _pp_run_1f1b(
         self,
-        input_ids: torch.Tensor,
-        labels: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run forward/backward across pipeline stages with ResBM compression.
+        microbatches: list[torch.Tensor],
+        labels: list[torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Run M microbatches through PP under a textbook 1F1B schedule.
 
-        All stages must call this synchronously. The first stage runs embedding
-        + its layers + encodes + sends. The last stage receives + decodes + its
-        layers + computes loss + backward + sends gradients back. Middle stages
-        (if any) relay in both directions.
+        Replaces the old per-microbatch ``_pp_forward_backward`` which ran
+        each forward end-to-end before starting the next. Naive PP idled
+        each stage for ~half its wall-clock waiting for the other stage;
+        1F1B fills the pipeline so stages do useful work in parallel
+        (stage 0 forwards mu_(i+1) while stage 1 backwards mu_i), shrinking
+        the bubble fraction from ~50 percent to ``P/(P+M-1)``.
 
-        Returns the scalar loss (only meaningful on the last stage; other
-        stages return 0.0 as a placeholder).
+        Per stage ``s`` the schedule is:
+
+        - **Warmup**: ``min(M, P - s - 1)`` forwards before the first
+          backward fires. Stage 0 with P=2 issues 1 warmup forward;
+          the last stage has no warmup.
+        - **Steady**: alternate one forward and one backward until
+          forwards are exhausted.
+        - **Cooldown**: drain the remaining backwards.
+
+        Wire transport stays on the existing blocking ``PPTransport`` --
+        TCP ``SO_SNDBUF`` (~4 MiB by default) easily holds our
+        ``micro_batch_size * seq * bottleneck_dim * 2`` (~hundreds of KiB)
+        activation, so ``send_next`` returns nearly immediately and the
+        next compute starts while bytes drain to the wire.
+
+        FSDP gradient reduce-scatter is gated to only the *final*
+        backward in the cycle (mirrors the per-microbatch ``no_sync``
+        pattern in the non-PP path).
+
+        Returns per-microbatch detached float32 loss tensors on
+        ``self.device`` in microbatch order. Stages other than the last
+        receive each loss over the wire so every stage's ``Inner Step``
+        log line shows the same value.
+
+        NOTE: MoE ``aux_loss`` from this stage's layers is currently
+        discarded -- a pre-existing PP bug that we don't fix here. Adding
+        cross-stage aux-loss accumulation is a separate, small change.
         """
+        M = len(microbatches)
+        if M == 0:
+            return []
+        assert len(labels) == M
+
         assert self.pp_stage is not None
+        transport = self.pp_transport
+        if transport is None:
+            raise RuntimeError(
+                "PP 1F1B called but pp_transport is None; "
+                "Miner.__init__ should have constructed it when "
+                "pp_num_stages > 1."
+            )
+
         config = self.model.config
-        bottleneck_dim = self.pp_stage.output_boundary.bottleneck_dim if self.pp_stage.output_boundary else (
-            self.pp_stage.input_boundary.bottleneck_dim if self.pp_stage.input_boundary else 16
+        P = self.pp_stages
+        s = self.pp_stage_id
+
+        # Bottleneck dim for shape negotiation. Stage 0 only has
+        # output_boundary, last stage only has input_boundary.
+        bottleneck_dim = (
+            self.pp_stage.output_boundary.bottleneck_dim
+            if self.pp_stage.output_boundary
+            else (
+                self.pp_stage.input_boundary.bottleneck_dim
+                if self.pp_stage.input_boundary
+                else 16
+            )
         )
 
-        B, S = input_ids.shape
-        position_ids = torch.arange(S, device=input_ids.device).unsqueeze(0)
+        # Each microbatch has identical (B, S) shape so position
+        # embeddings can be built once per cycle.
+        B, S = microbatches[0].shape
+        position_ids = torch.arange(S, device=self.device).unsqueeze(0)
         position_embeddings = self.model.rotary_emb(
             torch.empty(1, 1, config.dim, device=self.device), position_ids
         )
 
-        # ---------------- DIAGNOSTIC: per-phase progress (--debug only) ----------------
-        # First rank of each stage logs every microbatch; one line per phase
-        # boundary so we see live progress when wall times are large.
-        # Gated on the logger being at DEBUG level, which the miner enables
-        # via ``--debug`` (calls ``hone.debug()``). When disabled we skip
-        # the ``cuda.synchronize`` calls entirely so the steady-state
-        # training loop pays zero diagnostic overhead.
+        # ---- diagnostics (only when --debug) ----
         diag_log = (
             self.rank == self.pp_stage_ranks[0]
             and hone.logger.isEnabledFor(logging.DEBUG)
         )
         if not hasattr(self, "_pp_microbatch_idx"):
             self._pp_microbatch_idx = 0
-        self._pp_microbatch_idx += 1
-        mb = self._pp_microbatch_idx
 
-        def _now() -> float:
-            if diag_log and torch.cuda.is_available():
-                torch.cuda.synchronize(self.device)
-            return time.time()
-
-        def _phase(tag: str, t_prev: float) -> float:
+        def _phase(tag: str, mb: int) -> None:
             if not diag_log:
-                return t_prev
-            t = _now()
-            hone.logger.debug(
-                f"[Diag/PP {tag} mb={mb}] +{t - t_prev:.3f}s"
-            )
-            return t
+                return
+            if torch.cuda.is_available():
+                torch.cuda.synchronize(self.device)
+            hone.logger.debug(f"[Diag/PP {tag} mb={mb}]")
 
-        # Cross-stage transport runs over PPTransport (TCP), set up by
-        # Miner.__init__ before init_model returns. PPTransport is a plain
-        # blocking-socket abstraction that exchanges raw tensor bytes; it
-        # does NOT touch the NCCL stream, which means PP send/recv and
-        # FSDP all_gather can interleave freely without deadlocking.
-        transport = self.pp_transport
-        if transport is None:
-            raise RuntimeError(
-                "PP forward/backward called but pp_transport is None; "
-                "Miner.__init__ should have constructed it when pp_num_stages > 1."
-            )
-        # ------------------------------------------------------------------------------
+        # FSDP reduce-scatter must fire *only* on the very last backward
+        # of the cycle so accumulated grads from all M microbatches end
+        # up reduced exactly once. Track backward count and pick the
+        # right context manager.
+        bwd_count = 0
 
+        def _sync_ctx(this_bwd_count: int):
+            if (
+                hasattr(self.model, "no_sync")
+                and self.world_size > 1
+                and this_bwd_count < M - 1
+            ):
+                return self.model.no_sync()
+            return nullcontext()
+
+        losses: list[torch.Tensor] = [None] * M  # type: ignore[list-item]
+
+        # ============================================================
+        # Stage 0 (first stage): owns embed_tokens + first slice of layers.
+        # Sends compressed activations forward, receives compressed grads
+        # back along with each microbatch's float32 loss scalar.
+        # ============================================================
         if self.pp_is_first_stage:
-            t = _now()
-            if diag_log:
-                hone.logger.debug(f"[Diag/PP s0 mb={mb}] enter")
+            warmup = min(M, P - s - 1)
+            steady = M - warmup
+            # Cached activations awaiting backward, in mb order. Each
+            # entry is (mb_idx, h) where ``h`` is the stage-0 output
+            # tensor we'll call ``.backward(grad_h)`` on later.
+            pending: deque[tuple[int, torch.Tensor]] = deque()
 
-            h = self.model.embed_tokens(input_ids)
-            h.requires_grad_(True)
-            t = _phase("s0 after_embed", t)
+            def fwd_one(mb_idx: int) -> None:
+                self._pp_microbatch_idx += 1
+                input_ids = microbatches[mb_idx]
+                h = self.model.embed_tokens(input_ids)
+                h.requires_grad_(True)
+                for layer in self.pp_stage.layers:
+                    result = layer(h, position_embeddings)
+                    h = result[0] if isinstance(result, tuple) else result
+                compressed = self.pp_stage.output_boundary.encode(h).to(
+                    self.amp_dtype
+                )
+                transport.send_next(compressed.contiguous())
+                pending.append((mb_idx, h))
+                _phase(f"s0 fwd mb={mb_idx}", self._pp_microbatch_idx)
 
-            for layer in self.pp_stage.layers:
-                result = layer(h, position_embeddings)
-                h = result[0] if isinstance(result, tuple) else result
-            t = _phase("s0 after_layers", t)
+            def bwd_one() -> None:
+                nonlocal bwd_count
+                mb_idx, h = pending.popleft()
+                grad_compressed = transport.recv_next(
+                    shape=(B, S, bottleneck_dim), dtype=self.amp_dtype
+                )
+                loss_scalar = transport.recv_next(
+                    shape=(1,), dtype=torch.float32
+                )
+                grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
+                with _sync_ctx(bwd_count):
+                    h.backward(grad_h)
+                losses[mb_idx] = loss_scalar.reshape(()).to(self.device)
+                bwd_count += 1
+                _phase(
+                    f"s0 bwd mb={mb_idx} (#{bwd_count}/{M})",
+                    self._pp_microbatch_idx,
+                )
 
-            # Cast to amp_dtype before send so the wire contract is
-            # deterministic: FSDP keeps params in their native (often
-            # float32) dtype, and autocast only kicks in at op level for
-            # whitelisted ops. ``F.embedding`` follows weight.dtype and a
-            # subsequent ``bf16 + float32`` add promotes back to float32,
-            # so ``compressed`` would otherwise leave the encoder as
-            # float32 and double the wire payload.
-            compressed = self.pp_stage.output_boundary.encode(h).to(
-                self.amp_dtype
-            )
-            t = _phase("s0 after_encode", t)
+            fwd_idx = 0
+            for _ in range(warmup):
+                fwd_one(fwd_idx)
+                fwd_idx += 1
+            for _ in range(steady):
+                fwd_one(fwd_idx)
+                fwd_idx += 1
+                bwd_one()
+            while pending:
+                bwd_one()
 
-            transport.send_next(compressed.contiguous())
-            t = _phase("s0 after_send", t)
-
-            grad_compressed = transport.recv_next(
-                shape=(B, S, bottleneck_dim), dtype=self.amp_dtype
-            )
-            # Pull the scalar loss the last stage sends right after the
-            # gradient so this rank can log a meaningful value too.
-            # Sent as float32 so the printed value matches stage 1
-            # bit-for-bit (bf16's 7-bit mantissa would quantize ~12.9 to
-            # multiples of 0.0625 and visibly desync the logs).
-            loss_scalar = transport.recv_next(
-                shape=(1,), dtype=torch.float32
-            )
-            t = _phase("s0 after_recv_grad", t)
-
-            grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
-            h.backward(grad_h)
-            _phase("s0 after_bwd", t)
-
-            return loss_scalar.reshape(()).to(self.device)
-
+        # ============================================================
+        # Last stage: owns final slice of layers + norm + lm_head + loss.
+        # Receives compressed activations, runs F+B back-to-back per
+        # microbatch (no warmup/cooldown -- just the steady alternation
+        # collapses to "F then B" since we have nowhere to forward to
+        # before backward), and ships compressed grad + loss scalar back.
+        # ============================================================
         elif self.pp_is_last_stage:
             assert self.pp_stage.input_boundary is not None
             ib = self.pp_stage.input_boundary
-
-            t = _now()
-            if diag_log:
-                hone.logger.debug(f"[Diag/PP sN mb={mb}] enter")
-
-            compressed = transport.recv_prev(
-                shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
-            )
-            t = _phase("sN after_recv_act", t)
-
-            compressed.requires_grad_(True)
-
-            h = ib.decode(compressed)
-
-            for layer in self.pp_stage.layers:
-                result = layer(h, position_embeddings)
-                h = result[0] if isinstance(result, tuple) else result
-            t = _phase("sN after_layers", t)
-
-            h = self.model.norm(h)
-            logits = self.model.lm_head(h)
-            loss = compute_loss(logits, labels)
-            t = _phase("sN after_loss", t)
-
-            loss.backward()
-            t = _phase("sN after_bwd", t)
-
-            grad_compressed = compressed.grad
-            if grad_compressed is None:
-                grad_compressed = torch.zeros(
-                    B, S, ib.bottleneck_dim,
-                    device=self.device, dtype=self.amp_dtype,
+            for mb_idx in range(M):
+                self._pp_microbatch_idx += 1
+                compressed = transport.recv_prev(
+                    shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
                 )
-            # Same wire-contract reasoning as on the activation send:
-            # match amp_dtype so stage 0's recv_next gets exactly what
-            # it asked for.
-            transport.send_prev(grad_compressed.to(self.amp_dtype).contiguous())
-            # Forward the scalar loss back to the previous stage so every
-            # stage's ``Inner Step ... loss=`` log line shows the real
-            # value (otherwise stage 0 would always print 0.0000). Use
-            # float32 so the wire value matches what we hold here exactly,
-            # avoiding bf16 quantization artifacts in the printed loss.
-            loss_scalar = loss.detach().to(torch.float32).reshape(1).contiguous()
-            transport.send_prev(loss_scalar)
-            _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
+                compressed.requires_grad_(True)
+                h = ib.decode(compressed)
+                for layer in self.pp_stage.layers:
+                    result = layer(h, position_embeddings)
+                    h = result[0] if isinstance(result, tuple) else result
+                h = self.model.norm(h)
+                logits = self.model.lm_head(h)
+                loss = compute_loss(logits, labels[mb_idx])
 
-            return loss.detach()
+                with _sync_ctx(bwd_count):
+                    loss.backward()
+                bwd_count += 1
 
+                grad_compressed = compressed.grad
+                if grad_compressed is None:
+                    grad_compressed = torch.zeros(
+                        B, S, ib.bottleneck_dim,
+                        device=self.device, dtype=self.amp_dtype,
+                    )
+                transport.send_prev(
+                    grad_compressed.to(self.amp_dtype).contiguous()
+                )
+                # Float32 to keep stage-0 logs bit-identical with this
+                # stage's printed loss (bf16's 7-bit mantissa would
+                # quantize ~12.9 to multiples of 0.0625).
+                loss_scalar = (
+                    loss.detach().to(torch.float32).reshape(1).contiguous()
+                )
+                transport.send_prev(loss_scalar)
+                losses[mb_idx] = loss.detach().to(torch.float32)
+                _phase(
+                    f"sN F+B mb={mb_idx} (#{bwd_count}/{M}) "
+                    f"loss={loss.item():.4f}",
+                    self._pp_microbatch_idx,
+                )
+
+        # ============================================================
+        # Middle stage: receives compressed activation from prev stage,
+        # forwards through its layers, sends compressed activation to
+        # next stage; later receives compressed grad + loss scalar from
+        # next, backwards into ``compressed_in.grad``, sends both back to
+        # prev. Same warmup/steady/cooldown shape as stage 0 but with
+        # an extra recv on F and an extra send on B.
+        # ============================================================
         else:
             assert self.pp_stage.input_boundary is not None
             assert self.pp_stage.output_boundary is not None
             ib = self.pp_stage.input_boundary
             ob = self.pp_stage.output_boundary
 
-            compressed_in = transport.recv_prev(
-                shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
-            )
-            compressed_in.requires_grad_(True)
+            warmup = min(M, P - s - 1)
+            steady = M - warmup
+            pending: deque[
+                tuple[int, torch.Tensor, torch.Tensor]
+            ] = deque()  # type: ignore[no-redef]
 
-            h = ib.decode(compressed_in)
+            def fwd_one(mb_idx: int) -> None:
+                self._pp_microbatch_idx += 1
+                compressed_in = transport.recv_prev(
+                    shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
+                )
+                compressed_in.requires_grad_(True)
+                h = ib.decode(compressed_in)
+                for layer in self.pp_stage.layers:
+                    result = layer(h, position_embeddings)
+                    h = result[0] if isinstance(result, tuple) else result
+                compressed_out = ob.encode(h).to(self.amp_dtype)
+                transport.send_next(compressed_out.contiguous())
+                pending.append((mb_idx, compressed_in, compressed_out))
+                _phase(f"sM fwd mb={mb_idx}", self._pp_microbatch_idx)
 
-            for layer in self.pp_stage.layers:
-                result = layer(h, position_embeddings)
-                h = result[0] if isinstance(result, tuple) else result
+            def bwd_one() -> None:
+                nonlocal bwd_count
+                mb_idx, compressed_in, compressed_out = pending.popleft()
+                grad_compressed_out = transport.recv_next(
+                    shape=tuple(compressed_out.shape), dtype=self.amp_dtype
+                )
+                loss_scalar = transport.recv_next(
+                    shape=(1,), dtype=torch.float32
+                )
+                with _sync_ctx(bwd_count):
+                    compressed_out.backward(grad_compressed_out)
+                grad_compressed_in = compressed_in.grad
+                if grad_compressed_in is None:
+                    grad_compressed_in = torch.zeros_like(compressed_in)
+                transport.send_prev(
+                    grad_compressed_in.to(self.amp_dtype).contiguous()
+                )
+                transport.send_prev(loss_scalar.contiguous())
+                losses[mb_idx] = loss_scalar.reshape(()).to(self.device)
+                bwd_count += 1
+                _phase(
+                    f"sM bwd mb={mb_idx} (#{bwd_count}/{M})",
+                    self._pp_microbatch_idx,
+                )
 
-            compressed_out = ob.encode(h).to(self.amp_dtype)
-            transport.send_next(compressed_out.contiguous())
+            fwd_idx = 0
+            for _ in range(warmup):
+                fwd_one(fwd_idx)
+                fwd_idx += 1
+            for _ in range(steady):
+                fwd_one(fwd_idx)
+                fwd_idx += 1
+                bwd_one()
+            while pending:
+                bwd_one()
 
-            grad_compressed_out = transport.recv_next(
-                shape=tuple(compressed_out.shape), dtype=self.amp_dtype
-            )
-            # Receive + relay the scalar loss alongside the gradient so it
-            # propagates from the last stage all the way back to stage 0.
-            # Float32 wire format keeps every stage's printed loss
-            # bit-identical (no bf16 quantization in the chain).
-            loss_scalar = transport.recv_next(
-                shape=(1,), dtype=torch.float32
-            )
-
-            compressed_out.backward(grad_compressed_out)
-
-            grad_compressed_in = compressed_in.grad
-            if grad_compressed_in is None:
-                grad_compressed_in = torch.zeros_like(compressed_in)
-            transport.send_prev(
-                grad_compressed_in.to(self.amp_dtype).contiguous()
-            )
-            transport.send_prev(loss_scalar.contiguous())
-
-            return loss_scalar.reshape(()).to(self.device)
+        # All M backwards must have produced losses by now.
+        assert all(l is not None for l in losses), (
+            f"_pp_run_1f1b finished with missing losses; got {losses}"
+        )
+        return losses
 
     # ------------------------------------------------------------------
     # Optimizers & Schedulers
@@ -920,10 +1112,32 @@ class Trainer:
         local_loss_sum: float = 0.0
         inner_step_count: int = 0
 
+        # Reserve enough wall-clock time before the next chain-window
+        # starts to compress + cross-rank-merge + S3 PUT the gradient. We
+        # estimate "blocks left in this window" via the chain listener's
+        # ``self.current_block`` (no extra RPC needed) and convert with
+        # Bittensor's nominal block time. The check is broadcast by the
+        # MAX reduction in step 5 so all ranks bail in lockstep even if
+        # only one notices first.
+        headroom_s = float(
+            getattr(self.hparams, "window_flush_headroom_seconds", 0) or 0
+        )
+        blocks_per_window = int(self.hparams.blocks_per_window)
+        next_window_block = (step_window + 1) * blocks_per_window
+        # Bittensor's nominal block time is 12s; keep the constant local
+        # to avoid reaching into chain hparams from a hot loop and to
+        # make the back-of-envelope math obvious to anyone reading.
+        approx_block_seconds = 12.0
+
         loader_iter = iter(loader)
 
-        while not self.stop_event.is_set():
-            # 1. Fetch batch
+        # Helper: fetch + tensorise + sanity-check one microbatch from the
+        # dataloader. Returns ``(input_ids, labels, local_bs, tokens, ok)``
+        # where ``ok=False`` flags either StopIteration on every rank or a
+        # batch with no valid (non-pad) labels. Centralising this avoids
+        # duplicating the prep logic between the non-PP per-microbatch
+        # path and the PP "fetch grad_accum microbatches" path.
+        async def _fetch_microbatch():
             try:
                 batch = await self.loop.run_in_executor(None, next, loader_iter)
                 local_has_batch = True
@@ -933,22 +1147,17 @@ class Trainer:
 
             if self.world_size > 1:
                 if not dist_helper.should_continue(local_has_batch, self.device):
-                    break
+                    return None
                 if not local_has_batch:
-                    continue
+                    return "skip"
 
-            # 2. Prepare inputs
             input_ids = (
                 batch.to(self.device, dtype=torch.long, non_blocking=True)
                 if isinstance(batch, torch.Tensor)
                 else torch.tensor(batch, dtype=torch.long, device=self.device)
             )
-
             local_bs = len(batch)
-            accum_batch_size += local_bs
             tokens_this = input_ids.numel()
-            batch_tokens += tokens_this
-            local_tokens_sum += tokens_this
 
             labels = input_ids.clone()
             labels[:, :-1] = input_ids[:, 1:]
@@ -960,23 +1169,89 @@ class Trainer:
             has_valid = (labels != -100).any().item()
             if not dist_helper.all_ok(has_valid, self.device):
                 del input_ids, labels
-                continue
+                return "skip"
 
-            # 3. Forward + backward
-            # ``corrected_accum`` / ``final_micro`` need to be defined
-            # before either branch because the optimizer-step bookkeeping
-            # below reads them in both PP and non-PP modes. In PP mode the
-            # backward already happened inside ``_pp_forward_backward``
-            # via ``loss.backward()`` on the last stage, so we don't run a
-            # ``scaler.scale(loss).backward()`` here.
+            return input_ids, labels, local_bs, tokens_this
+
+        while not self.stop_event.is_set():
+            # 1. Fetch batch(es). PP runs a whole grad_accum cycle per
+            #    iteration via 1F1B; non-PP runs one microbatch per
+            #    iteration as before.
             corrected_accum = max(self.sampler.grad_accum_steps, 1)
-            final_micro = (batch_count + 1) % corrected_accum == 0
 
             if self.pp_stages > 1:
+                # Bundle up to ``corrected_accum`` microbatches and ship
+                # them through the pipeline in one 1F1B cycle. The whole
+                # cycle counts as a single optimizer step, matching the
+                # non-PP semantics where ``final_micro`` of an
+                # accumulation cycle triggers one optimizer.step().
+                micros: list[torch.Tensor] = []
+                lbls: list[torch.Tensor] = []
+                local_bs_list: list[int] = []
+                tokens_list: list[int] = []
+                stop_loop = False
+                while len(micros) < corrected_accum:
+                    fetched = await _fetch_microbatch()
+                    if fetched is None:
+                        stop_loop = True
+                        break
+                    if fetched == "skip":
+                        continue
+                    ids, lab, lbs, tk = fetched
+                    micros.append(ids)
+                    lbls.append(lab)
+                    local_bs_list.append(lbs)
+                    tokens_list.append(tk)
+
+                if stop_loop:
+                    break
+                if not micros:
+                    continue
+
                 with autocast(device_type=self.device.type, dtype=self.amp_dtype):
-                    calculated_loss = self._pp_forward_backward(input_ids, labels)
-                loss_item = calculated_loss.item()
+                    per_mb_losses = self._pp_run_1f1b(micros, lbls)
+
+                # Per-microbatch accounting -- mirrors what the non-PP
+                # branch does inside its single-microbatch loop, just
+                # batched. We leave ``loss_item`` set to the *last*
+                # microbatch's loss so the eventual log line shows the
+                # most recent value (consistent with prior behaviour).
+                loss_item = float(per_mb_losses[-1].item())
+                for i in range(len(micros)):
+                    li = float(per_mb_losses[i].item())
+                    total_loss += li
+                    local_loss_sum += li
+                    accum_batch_size += local_bs_list[i]
+                    batch_tokens += tokens_list[i]
+                    local_tokens_sum += tokens_list[i]
+                    batch_count += 1
+
+                # The dashboard reporter logs ``tokens_this`` per inner
+                # step. Since the PP path consumes a whole accumulation
+                # cycle in one shot, report the cycle total rather than
+                # the last microbatch alone.
+                tokens_this = sum(tokens_list)
+
+                # We always consumed a full accumulation cycle (or the
+                # tail end of it). The optimizer step block below still
+                # handles "step_now or window_changed" the same way.
+                final_micro = True
+                window_changed = self.current_window != step_window
             else:
+                # ---- Non-PP path: unchanged single-microbatch loop ----
+                fetched = await _fetch_microbatch()
+                if fetched is None:
+                    break
+                if fetched == "skip":
+                    continue
+                input_ids, labels, local_bs, tokens_this = fetched
+
+                accum_batch_size += local_bs
+                batch_tokens += tokens_this
+                local_tokens_sum += tokens_this
+
+                final_micro = (batch_count + 1) % corrected_accum == 0
+
                 with autocast(device_type=self.device.type, dtype=self.amp_dtype):
                     model_output = self.model(input_ids)
 
@@ -1005,10 +1280,10 @@ class Trainer:
                 with sync_ctx:
                     self.scaler.scale(loss).backward()
 
-            total_loss += loss_item
-            local_loss_sum += loss_item
-            batch_count += 1
-            window_changed = self.current_window != step_window
+                total_loss += loss_item
+                local_loss_sum += loss_item
+                batch_count += 1
+                window_changed = self.current_window != step_window
 
             # 4. Optimizer step
             step_now = final_micro or window_changed
@@ -1131,8 +1406,19 @@ class Trainer:
 
             # 5. Window control
             max_inner = getattr(self.hparams, "max_inner_steps", None) or self.hparams.inner_steps
+            # Headroom: stop training if the wall-clock distance to the
+            # next chain-window start drops below the buffer reserved for
+            # post-train compression + PP/FSDP gather + S3 PUT. Without
+            # this the inner loop would happily run one more 12s step
+            # past the window flip, then need ~30-40s of post-work, and
+            # ship the upload 1-6s after the validator's deadline.
+            blocks_left = next_window_block - int(self.current_block)
+            seconds_left = blocks_left * approx_block_seconds
+            headroom_exhausted = headroom_s > 0 and seconds_left <= headroom_s
             need_sync = (
-                window_changed or inner_step_count >= max_inner
+                window_changed
+                or inner_step_count >= max_inner
+                or headroom_exhausted
             )
             if self.world_size > 1:
                 from torch.distributed import ReduceOp
@@ -1146,7 +1432,14 @@ class Trainer:
 
             if global_done:
                 if self.is_master:
-                    hone.logger.info("<Exhausted window: exiting synchronously>")
+                    if headroom_exhausted and not window_changed:
+                        hone.logger.info(
+                            f"<Headroom exhausted: ~{seconds_left:.0f}s left "
+                            f"in window {step_window}, need {headroom_s:.0f}s "
+                            "for upload — exiting>"
+                        )
+                    else:
+                        hone.logger.info("<Exhausted window: exiting synchronously>")
                 if not null_round:
                     for _ in range(inner_step_count, self.hparams.inner_steps):
                         if not self.should_skip_scheduler_step():

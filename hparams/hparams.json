@@ -5,9 +5,9 @@
 
     "tokenizer_name": "google/gemma-2-2b",
     "sequence_length": 4096,
-    "micro_batch_size": 4,
+    "micro_batch_size": 8,
     "target_batch_size": 1024,
-    "batch_size": 16,
+    "batch_size": 32,
     "inner_steps": 30,
     "max_inner_steps": 300,
     "outer_learning_rate": 0.4,
@@ -40,6 +40,7 @@
     "gather_peers_slash_threshold": 0.4,
     "uids_per_window": 20,
     "time_window_delta_seconds": 70,
+    "window_flush_headroom_seconds": 50,
     "reset_inactivity_windows": 3,
     "sync_max_steps_behind": 2,
     "binary_score_ma_alpha": 0.05,
@@ -90,7 +91,7 @@
     "offload_optimizer_states": true,
     "fsdp": {
         "dp_shard": 2,
-        "compile": false,
+        "compile": true,
         "mixed_precision": "bfloat16"
     },
 

@@ -169,19 +169,29 @@ class ChunkingTransformer:
 
         # Get all variants of model tensor sizes
         # Generate all possible valid DCT sizes for model tensors
+        def _register_size(s: int, dtype, device) -> None:
+            sc = _get_smaller_split(s, self.target_chunk)
+            self.shape_dict[s] = sc
+            if sc not in self.f_dict:
+                I = torch.eye(sc)  # noqa: E741
+                self.f_dict[sc] = _dct(I, norm=norm).to(dtype).to(device)
+                self.b_dict[sc] = _idct(I, norm=norm).to(dtype).to(device)
+
         for _, p in model.named_parameters():
             if not p.requires_grad:
                 continue
             for s in p.shape:
-                # Get the closest smallest divisor to the targeted DCT size
-                sc = _get_smaller_split(s, self.target_chunk)
-                self.shape_dict[s] = sc
+                _register_size(s, p.dtype, p.device)
 
-                # Pregenerate DCT basis matrices
-                if sc not in self.f_dict:
-                    I = torch.eye(sc)  # noqa: E741
-                    self.f_dict[sc] = _dct(I, norm=norm).to(p.dtype).to(p.device)
-                    self.b_dict[sc] = _idct(I, norm=norm).to(p.dtype).to(p.device)
+            # For 3D params (stacked MoE expert weights ``(E, D, ffn)``)
+            # the gradient path collapses the leading two dims into rows
+            # so the codec can chunk a regular 2D matrix
+            # ``(E*D, ffn)``. Pre-register the combined dim so
+            # ``encode`` doesn't KeyError on a shape it never saw at
+            # init time.
+            if p.dim() == 3:
+                combined = int(p.shape[0]) * int(p.shape[1])
+                _register_size(combined, p.dtype, p.device)
 
     @torch.no_grad()
     def einsum_2d(self, x, b, d=None) -> torch.Tensor:

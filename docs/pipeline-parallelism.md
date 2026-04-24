@@ -145,6 +145,23 @@ Enable pipeline parallelism in `hparams/hparams.json`:
 | `num_stages` | int | `4` | Number of pipeline stages. The model's layers are divided evenly across stages. |
 | `bottleneck_dim` | int | `16` | Bottleneck dimension for ResBM compression. The compression ratio is `hidden_dim / bottleneck_dim`. For `hidden_dim=2048` and `bottleneck_dim=16`, the ratio is 128x. |
 
+### Tied embeddings are not supported with PP
+
+The model's input `embed_tokens` and output `lm_head` projections live on
+*different* stages (stage 0 and the last stage), running in *different*
+processes. They cannot share a single `nn.Parameter` across that
+process boundary, so models trained with `tie_embeddings: true` would
+silently end up with two independent copies of the embedding weight that
+diverge under per-stage inner-optimizer updates. The validator runs the
+un-carved model with the weights actually tied and would only see stage
+0's gradient contribution, so the divergence would be permanent.
+
+`Trainer._init_pp_model` raises a `RuntimeError` at startup if `pipeline.num_stages > 1`
+and the model config has `tie_embeddings: true`. To use PP, set
+`tie_embeddings: false` in the model config (this is already the case for
+`8B-A1B.json` and `35B-A3B.json`). To keep tied embeddings, set
+`pipeline.num_stages: 1` and let FSDP handle parallelism within a node.
+
 ## Scaling Examples
 
 | Model | Total Params | Active Params | Nodes | GPUs/Node | PP Stages | Activation per boundary |

@@ -337,28 +337,57 @@ class Miner(BaseNode, Trainer):
 
         self.xshapes = {}
         self.totalks = {}
+        # Map ``model.named_parameters()`` keys to validator-compatible
+        # canonical names. ``cname is None`` flags PP-only ResBM boundary
+        # params: those are trained locally by the inner optimizer but
+        # never aggregated, so we skip them from owned_params/totalks
+        # (no compressed-payload slot, no entry in ``expected_compressed_params``).
+        canon_map = hone.canonical_param_names(self.model)
         model_iterator = self.model.named_parameters()
 
-        for idx, (n, p) in enumerate(model_iterator):
-            if idx % self.world_size == self.rank:
-                # this rank "owns" the parameter
+        compressible_idx = 0
+        for n, p in model_iterator:
+            cname = canon_map.get(n, n)
+            if cname is None:
+                continue
+
+            if compressible_idx % self.world_size == self.rank:
+                # this rank "owns" the parameter — error feedback / inner
+                # buffers stay keyed by the local model name so we can
+                # index ``self.model`` directly. The wire / outer-step
+                # namespace is the canonical one, kept separately below.
                 self.owned_params.add(n)
                 # For DTensors, create error feedback based on full tensor since TP is not supported
                 self.error_feedback[n] = None
                 self.error_feedback_cpu_buffers[n] = torch.empty(
                     p.shape, device="cpu", pin_memory=True
                 )
+            compressible_idx += 1
 
+            # The codec (ChunkingTransformer + TopKCompressor) only knows
+            # 1D / 2D weights. Stacked MoE weights are 3D ``(E, D, ffn)``
+            # after the grouped-GEMM rewrite; collapse the leading expert
+            # dim into rows so encode/compress see a regular 2D matrix
+            # (the actual gradient is reshaped to and from this 2D view
+            # in ``prepare_gradient_dict`` and ``outer_step``).
+            codec_shape = (
+                (p.shape[0] * p.shape[1], p.shape[2])
+                if p.dim() == 3
+                else p.shape
+            )
             enc = self.transformer.encode(
-                torch.empty(p.shape, dtype=torch.float16, device=self.device),
+                torch.empty(codec_shape, dtype=torch.float16, device=self.device),
                 use_dct=self.hparams.use_dct,
             )
             _, _, xshape, totalk, _ = self.compressor.compress(
                 enc,
                 self.hparams.topk_compression,
             )
-            self.xshapes[n] = xshape
-            self.totalks[n] = totalk
+            # totalks/xshapes are looked up by canonical name in
+            # ``outer_step`` so they must match the keys we publish in
+            # ``prepare_gradient_dict``.
+            self.xshapes[cname] = xshape
+            self.totalks[cname] = totalk
 
         hone.logger.info(
             f"[Init] Compression initialized for {len(self.xshapes)} parameters"

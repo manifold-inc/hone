@@ -78,6 +78,7 @@ These parameters govern how miners discover, select, and manage peers for gradie
 | `gather_peers_slash_threshold` | float | -- | Threshold below which a peer's score triggers slashing (score penalty). Peers consistently below this are penalized. |
 | `uids_per_window` | int | -- | Maximum number of UIDs (miners) a validator evaluates per window. Caps validator compute per window. |
 | `time_window_delta_seconds` | int | -- | Time tolerance (in seconds) for window synchronization. Peers whose window timestamps diverge by more than this are ignored. |
+| `window_flush_headroom_seconds` | int | -- | Seconds of head-room reserved at the end of every chain window for the miner to compress, merge across PP/FSDP ranks, and PUT its gradient before the validator's `time_window_delta_seconds` deadline. The inner training loop exits early once the wall-clock distance to the next window's start drops below this. Set to 0 to disable (legacy behaviour: train until window flips). |
 | `reset_inactivity_windows` | int | -- | Number of consecutive inactive windows before a peer's state is reset. |
 | `sync_max_steps_behind` | int | -- | Maximum number of global steps a miner can fall behind before triggering a resync from checkpoint. |
 | `exclude_negative_peers` | bool | -- | Whether to exclude peers with negative scores from gradient aggregation. |

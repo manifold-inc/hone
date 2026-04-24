@@ -44,6 +44,27 @@ if TYPE_CHECKING:
 NeuronT = TypeVar("NeuronT", "Miner", "Validator")
 
 
+def canonical_param_names(model: nn.Module) -> dict[str, str | None]:
+    """Map ``model.named_parameters()`` keys to cross-rank-stable canonical
+    names so PP miners and plain-``LoopLM`` validators can agree on the
+    namespace used in compressed gradient uploads.
+
+    A value of ``None`` means the parameter has no canonical home in the
+    validator's model (e.g. PP-only ResBM boundary modules) and should be
+    skipped from gradient aggregation entirely. Callers that own the
+    parameter still train it locally via the inner optimizer; we just
+    don't ship its gradient over the wire.
+
+    Models that don't define ``get_canonical_param_names`` are assumed to
+    already use the canonical namespace (the validator's plain ``LoopLM``
+    falls into this bucket), so we return an identity mapping.
+    """
+    fn = getattr(model, "get_canonical_param_names", None)
+    if callable(fn):
+        return fn()
+    return {n: n for n, _ in model.named_parameters()}
+
+
 def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = False):
     """
     DTensor-deadlock-safe:
@@ -92,12 +113,18 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
     topk = getattr(miner.hparams, "topk_compression", 32)
 
     if isinstance(miner.model, torch.nn.parallel.DistributedDataParallel):
-        model_iterator = miner.model.module.named_parameters()
+        inner_model = miner.model.module
     else:
-        model_iterator = miner.model.named_parameters()
+        inner_model = miner.model
+    model_iterator = inner_model.named_parameters()
+
+    # Canonical name map keeps PP-wrapped miners and plain-LoopLM
+    # validators speaking the same compressed-payload namespace. A None
+    # entry means the param is local-only (PP boundary) and never shipped.
+    canon_map = canonical_param_names(inner_model)
 
     # Build params dict once to avoid repeated iteration
-    params_dict = dict(miner.model.named_parameters())
+    params_dict = dict(inner_model.named_parameters())
 
     # Batch load all error feedback tensors to GPU
     for n in miner.owned_params:
@@ -117,6 +144,11 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         g = getattr(p, "grad", None)
         g_is_dt = is_dtensor(g)
 
+        # Resolve the canonical (cross-rank-stable) name we publish under.
+        # ``cname is None`` means PP-only boundary param: skip aggregation
+        # entirely (still trained locally by the inner optimizer).
+        cname = canon_map.get(n, n)
+
         # --- 1) Grad full_tensor rendezvous (GFULL) ---
         if g_is_dt:
             grp_g = get_mesh_group(g)
@@ -129,6 +161,14 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                 continue
             assert g is not None, f"p.grad is None for {n}"
             grad_full = g.to(p.device)
+
+        # PP boundary params are local-only: every rank participated in
+        # the GFULL collective above so we don't deadlock peers, but we
+        # never compress or upload these. The inner optimizer already
+        # consumed their grad in the inner step, so just drop and move on.
+        if cname is None:
+            p.grad = None
+            continue
 
         # Non-owners: after participating in grad collective, drop grad and continue.
         if not owned:
@@ -152,7 +192,20 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             error_feedback.add_(grad_full)
 
         # --- 4) Encode & compress (owner only) ---
-        encoded = miner.transformer.encode(error_feedback, use_dct=use_dct)
+        # ``ChunkingTransformer`` only knows 1D and 2D tensors. Stacked
+        # MoE weights are 3D ``(E, D, ffn)`` after the grouped-GEMM
+        # rewrite, so we collapse the leading expert dim into rows
+        # giving a 2D ``(E*D, ffn)`` view that the codec can chunk
+        # normally. The view shares storage with ``error_feedback`` so
+        # any in-place op (``sub_`` below) propagates to the actual 3D
+        # tensor we keep around between windows.
+        ef_for_codec = (
+            error_feedback.view(-1, error_feedback.shape[-1])
+            if error_feedback.dim() == 3
+            else error_feedback
+        )
+
+        encoded = miner.transformer.encode(ef_for_codec, use_dct=use_dct)
 
         idxs, vals, xshape, totalk, quant_params = miner.compressor.compress(
             encoded, topk
@@ -160,7 +213,9 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         del encoded
 
         # --- 5) Decompress reference (owner only) ---
-        # Pass p directly - decompress only uses p.device and p.dtype
+        # ``decompress`` only reads ``p.device``/``p.dtype``, so it
+        # doesn't care about p's actual shape -- safe to pass the 3D
+        # stacked tensor directly.
         decompressed = miner.compressor.decompress(
             p, idxs, vals, xshape, totalk, quant_params
         )
@@ -169,38 +224,43 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         transmit_grad = miner.transformer.decode(decompressed, use_dct=use_dct)
         del decompressed
         alpha = getattr(miner.hparams, "momentum_subtraction_alpha", 1.0)
+        # ``transmit_grad`` matches ``ef_for_codec``'s 2D shape; subtract
+        # via the view so 3D ``error_feedback`` storage is updated
+        # in-place too.
         if alpha == 1.0:
-            error_feedback.sub_(transmit_grad)
+            ef_for_codec.sub_(transmit_grad)
         else:
-            error_feedback.sub_(transmit_grad, alpha=alpha)
+            ef_for_codec.sub_(transmit_grad, alpha=alpha)
         # Keep error feedback on GPU for now, batch offload later
         miner.error_feedback[n] = error_feedback
         del transmit_grad, error_feedback
 
         # --- 7) Pack outputs (move compressed artifacts to CPU asynchronously) ---
-        # Using non_blocking=True for async D2H transfers when CUDA is available
+        # Using non_blocking=True for async D2H transfers when CUDA is
+        # available. Keys use ``cname`` (canonical / un-prefixed) so PP
+        # miners and plain-LoopLM validators agree on the namespace.
         if isinstance(idxs, torch.Tensor):
             if torch.cuda.is_available():
                 cpu_idxs = torch.empty_like(idxs, device="cpu", pin_memory=True)
                 cpu_idxs.copy_(idxs, non_blocking=True)
-                gradient[n + "idxs"] = cpu_idxs
+                gradient[cname + "idxs"] = cpu_idxs
             else:
-                gradient[n + "idxs"] = idxs.cpu()
+                gradient[cname + "idxs"] = idxs.cpu()
         else:
-            gradient[n + "idxs"] = idxs
+            gradient[cname + "idxs"] = idxs
 
         if isinstance(vals, torch.Tensor):
             if torch.cuda.is_available():
                 cpu_vals = torch.empty_like(vals, device="cpu", pin_memory=True)
                 cpu_vals.copy_(vals, non_blocking=True)
-                gradient[n + "vals"] = cpu_vals
+                gradient[cname + "vals"] = cpu_vals
             else:
-                gradient[n + "vals"] = vals.cpu()
+                gradient[cname + "vals"] = vals.cpu()
         else:
-            gradient[n + "vals"] = vals
-        gradient[n + "quant_params"] = quant_params
-        xshapes[n] = xshape
-        totalks[n] = totalk
+            gradient[cname + "vals"] = vals
+        gradient[cname + "quant_params"] = quant_params
+        xshapes[cname] = xshape
+        totalks[cname] = totalk
 
         # Clear per-param grad
         p.grad = None
@@ -412,15 +472,23 @@ def outer_step(
             return tuple(_idx_to_device(x, dev) for x in obj)
         return obj
 
+    # Walk our local model in the canonical namespace so PP-wrapped
+    # miners (whose ``named_parameters()`` keys carry a ``stage.`` prefix
+    # and PP-only ResBM boundaries) can still match against state-dicts
+    # gathered from peers / from a plain-LoopLM validator.
+    canon_map = canonical_param_names(model)
+
     for name, p in model.named_parameters():
+        cname = canon_map.get(name, name)
+
         # ---- master decides if this param has an update; others receive a flag ----
         has_update = 0
         payload = None
 
-        if on_src and src_sd is not None:
-            idxs = src_sd.get(name + "idxs")
-            vals = src_sd.get(name + "vals")
-            qps = src_sd.get(name + "quant_params")
+        if on_src and src_sd is not None and cname is not None:
+            idxs = src_sd.get(cname + "idxs")
+            vals = src_sd.get(cname + "vals")
+            qps = src_sd.get(cname + "quant_params")
 
             if idxs is not None and vals is not None:
                 if not isinstance(idxs, (list, tuple)):
@@ -462,8 +530,8 @@ def outer_step(
                     ref,
                     idxs_dev,
                     vals_f32,
-                    xshapes[name],
-                    totalks[name],
+                    xshapes[cname],
+                    totalks[cname],
                     quantize_params=None,
                     block_norms=block_norms,
                     normalise=False,
@@ -476,13 +544,25 @@ def outer_step(
                     dtype=p.dtype, device=p.device, non_blocking=True
                 )
 
+                # Stacked MoE weights are stored as 3D ``(E, D, ffn)``
+                # but ``prepare_gradient_dict`` collapsed the leading
+                # expert dim into rows before encoding (the codec only
+                # speaks 1D / 2D). ``decode`` therefore returns a 2D
+                # tensor; reshape it back to ``p.shape`` so the
+                # subsequent ``distribute_tensor`` / ``p.grad =`` paths
+                # see a shape-compatible gradient.
+                if full_grad_src.shape != p.shape:
+                    full_grad_src = full_grad_src.view(p.shape)
+
                 # Accumulate fingerprint statistics for this parameter
+                # using the canonical name so traces compare across PP and
+                # non-PP runs without false negatives.
                 if fingerprint is not None:
                     param_norm = torch.norm(full_grad_src, p=2).item()
-                    fingerprint["param_norms"][name] = param_norm
+                    fingerprint["param_norms"][cname] = param_norm
                     fingerprint["total_norm_sq"] += param_norm**2
                     fingerprint["total_elements"] += full_grad_src.numel()
-                    fingerprint["param_means"][name] = full_grad_src.mean().item()
+                    fingerprint["param_means"][cname] = full_grad_src.mean().item()
             finally:
                 # Free intermediate pieces ASAP (existence-guarded)
                 try:

@@ -326,7 +326,7 @@ class PPTransport:
             raise RuntimeError("PPTransport: socket not connected")
         return self._bytes_to_tensor(_recv_bytes(sock), shape, dtype)
 
-    # Public API used by trainer._pp_forward_backward.
+    # Public API used by trainer._pp_run_1f1b.
     def send_next(self, tensor: torch.Tensor) -> None:
         self._send_tensor(self._sock_next, tensor)
 

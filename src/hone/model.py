@@ -198,11 +198,34 @@ class MLP(nn.Module):
 
 
 class MoEMLP(nn.Module):
-    """Mixture-of-Experts MLP with top-k gating, shared expert, and load-balancing loss.
+    """Mixture-of-Experts MLP with grouped-GEMM dispatch over a stacked
+    expert-weight tensor.
 
-    Supports the Qwen/DeepSeek-style architecture where each routed expert
-    has a smaller intermediate_size than the dense MLP, and an optional
-    shared expert processes all tokens unconditionally.
+    The previous implementation kept one ``nn.Linear`` per expert in an
+    ``nn.ModuleList`` and walked them with a Python ``for`` loop. For 96
+    experts that meant ~13K small kernel launches per microbatch (24
+    layers x 96 experts x 3 projections x 2 for fwd+bwd) plus a
+    per-layer ``offsets.tolist()`` that synced the GPU back to the host
+    every iteration. With ``(N*K)/E`` tokens per expert sitting around
+    700 for our config, each of those GEMMs ran far below B200's
+    tensor-core saturation point and the loop dominated the inner step.
+
+    This rewrite:
+
+    1. Replaces the ``nn.ModuleList(experts)`` with three stacked
+       parameters keyed by expert index along ``dim 0``. Memory layout is
+       chosen to match ``torch._grouped_mm`` directly so we avoid a
+       transpose on every forward.
+    2. Replaces the Python loop with three ``torch._grouped_mm`` calls
+       over device-resident offsets. No host sync per layer.
+    3. Drops the ``offsets.tolist()`` call so ``torch.compile`` can fuse
+       the routed-expert path end-to-end without graph breaks.
+
+    BREAKING CHANGE: parameter names move from
+    ``mlp.experts.{e}.{gate,up,down}_proj.weight`` to
+    ``mlp.{gate,up,down}_weight`` of shape ``(E, K, N)``. Old MoE
+    checkpoints cannot be loaded; the gradient-compression wire keys
+    change too. Validators and miners must be redeployed together.
     """
 
     def __init__(self, config: LoopLMConfig):
@@ -211,11 +234,25 @@ class MoEMLP(nn.Module):
         self.top_k = config.moe_top_k
         self.aux_loss_coeff = config.moe_aux_loss_coeff
 
-        expert_ffn = config.moe_intermediate_size or config.intermediate_size
-        self.gate = nn.Linear(config.dim, config.num_experts, bias=False)
-        self.experts = nn.ModuleList(
-            [MLP(config, intermediate_size=expert_ffn) for _ in range(config.num_experts)]
-        )
+        E = config.num_experts
+        D = config.dim
+        ffn = config.moe_intermediate_size or config.intermediate_size
+        assert ffn is not None
+        self.expert_dim = D
+        self.expert_ffn = ffn
+
+        self.gate = nn.Linear(D, E, bias=False)
+
+        # ``torch._grouped_mm`` expects ``mat_b`` of shape
+        # ``(num_groups, K, N)`` -- so for the up-projection ``K=D``,
+        # ``N=ffn`` and for the down-projection ``K=ffn``, ``N=D``. We
+        # store the tensors in that exact layout so the hot path needs no
+        # ``.transpose()`` (which would otherwise force a contiguous copy
+        # on every microbatch since FSDP-gathered DTensors aren't
+        # transposed-contiguous).
+        self.gate_weight = nn.Parameter(torch.empty(E, D, ffn))
+        self.up_weight = nn.Parameter(torch.empty(E, D, ffn))
+        self.down_weight = nn.Parameter(torch.empty(E, ffn, D))
 
         self.shared_expert: MLP | None = None
         if config.shared_expert_intermediate_size is not None:
@@ -223,87 +260,84 @@ class MoEMLP(nn.Module):
                 config, intermediate_size=config.shared_expert_intermediate_size
             )
 
+    def _grouped_mm(
+        self, a: torch.Tensor, b: torch.Tensor, offs: torch.Tensor
+    ) -> torch.Tensor:
+        """Type-safe wrapper around ``torch._grouped_mm``.
+
+        ``torch._grouped_mm`` is *not* autocast-aware (pytorch#174763),
+        so we coerce ``a`` to the weight dtype before each call. Under
+        FSDP with ``mixed_precision="bfloat16"`` ``b`` is already bf16
+        and the coercion is a no-op; the explicit cast is the
+        belt-and-suspenders that keeps the kernel happy when the
+        upstream layer emitted float32 (e.g. RMSNorm, embedding lookup).
+        """
+        if a.dtype != b.dtype:
+            a = a.to(b.dtype)
+        return torch._grouped_mm(a, b, offs=offs)
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """Returns (output, aux_loss).
+        """Returns ``(output, aux_loss)``.
 
-        Permutation-based dispatch: tokens are repeated ``top_k`` times,
-        sorted by chosen expert id, and each expert sees a contiguous slice
-        of its own routed tokens. This removes the K*E boolean-masking loop
-        of the naive implementation (K*E small kernel launches per layer
-        with mostly-empty masks) and replaces it with a single sort + ``E``
-        contiguous-slice expert calls.
-
-        Memory + parameter layout is unchanged so DeMo compression and
-        checkpointing keep working with the same parameter names.
+        Routing logic is unchanged from the previous permutation-based
+        dispatch: tokens are repeated ``top_k`` times, stably sorted by
+        chosen expert id, processed in expert order, and the inverse
+        permutation reassembles per-token outputs that are then summed
+        across the K choices. Only the per-expert compute step changes:
+        the Python loop over ``self.experts`` is now three grouped
+        matmuls over the stacked weights.
         """
         orig_shape = x.shape
-        x_flat = x.view(-1, orig_shape[-1])  # (N, D)
-        num_tokens = x_flat.shape[0]
+        x_flat = x.view(-1, orig_shape[-1])
+        N = x_flat.shape[0]
         K = self.top_k
         E = self.num_experts
 
-        gate_logits = self.gate(x_flat)  # (N, E)
+        gate_logits = self.gate(x_flat)
         gate_probs = F.softmax(gate_logits, dim=-1)
 
         topk_weights, topk_indices = torch.topk(gate_probs, K, dim=-1)
         topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True)
 
-        # Load balancing auxiliary loss
+        # Load-balancing auxiliary loss (unchanged).
         tokens_per_expert = torch.zeros(E, device=x.device, dtype=x.dtype)
         tokens_per_expert.scatter_add_(
             0, topk_indices.view(-1),
             torch.ones(topk_indices.numel(), device=x.device, dtype=x.dtype),
         )
-        f = tokens_per_expert / (num_tokens * K)
+        f = tokens_per_expert / (N * K)
         p = gate_probs.mean(dim=0)
         aux_loss = self.aux_loss_coeff * E * (f * p).sum()
 
         # ---- Permutation dispatch ----
-        # Repeat each token K times so each (token, choice) is its own row.
-        expanded_input = x_flat.repeat_interleave(K, dim=0)        # (N*K, D)
-        expanded_indices = topk_indices.reshape(-1)                # (N*K,)
-        expanded_weights = topk_weights.reshape(-1)                # (N*K,)
+        expanded_input = x_flat.repeat_interleave(K, dim=0)
+        expanded_indices = topk_indices.reshape(-1)
+        expanded_weights = topk_weights.reshape(-1)
 
-        # Stable sort so equal expert ids preserve original order; this
-        # gives us per-expert contiguous slices.
         sorted_indices, sort_perm = torch.sort(expanded_indices, stable=True)
         sorted_input = expanded_input.index_select(0, sort_perm)
         sorted_weights = expanded_weights.index_select(0, sort_perm)
 
-        # Per-expert token counts; offsets gives [start, start+count] slices.
-        counts = torch.bincount(sorted_indices, minlength=E)        # (E,)
-        offsets = torch.zeros(E + 1, dtype=torch.long, device=counts.device)
-        offsets[1:] = counts.cumsum(0)
-        # One device->host sync per layer to drive Python-side slicing.
-        offsets_cpu = offsets.tolist()
+        # ``torch._grouped_mm`` wants the *cumulative end indices* of each
+        # group along the first axis of ``a`` as int32, length E. We keep
+        # this entirely on-device -- no ``.tolist()`` host sync, so
+        # torch.compile can capture the routed path as a single graph.
+        counts = torch.bincount(sorted_indices, minlength=E)
+        offs = counts.cumsum(0).to(torch.int32)
 
-        # Run each expert on its contiguous slice; concat preserves order
-        # without in-place writes (cleaner for autograd than slice-assign).
-        expert_outputs = []
-        for e in range(E):
-            start = offsets_cpu[e]
-            end = offsets_cpu[e + 1]
-            if start == end:
-                continue
-            expert_outputs.append(self.experts[e](sorted_input[start:end]))
-
-        if expert_outputs:
-            sorted_output = torch.cat(expert_outputs, dim=0)
-        else:
-            # Edge case: zero tokens routed (should be impossible in
-            # practice but guards against degenerate routing).
-            sorted_output = torch.zeros_like(sorted_input)
+        gate_out = self._grouped_mm(sorted_input, self.gate_weight, offs)
+        up_out = self._grouped_mm(sorted_input, self.up_weight, offs)
+        sorted_output = self._grouped_mm(
+            F.silu(gate_out) * up_out, self.down_weight, offs
+        )
 
         sorted_output = sorted_output * sorted_weights.unsqueeze(-1)
 
-        # Inverse permutation: pure functional, autograd-safe.
+        # Inverse permutation, then sum the K choices per original token.
         inv_perm = torch.argsort(sort_perm)
         output_expanded = sorted_output.index_select(0, inv_perm)
+        output = output_expanded.view(N, K, -1).sum(dim=1)
 
-        # Sum the K choices per token.
-        output = output_expanded.view(num_tokens, K, -1).sum(dim=1)
-
-        # Shared expert processes all tokens unconditionally.
         if self.shared_expert is not None:
             output = output + self.shared_expert(x_flat)
 
@@ -358,10 +392,13 @@ class DecoderLayer(nn.Module):
         nn.init.trunc_normal_(self.self_attn.o_proj.weight, mean=0.0, std=self.weight_init_std)
         if self.use_moe:
             nn.init.trunc_normal_(self.mlp.gate.weight, mean=0.0, std=0.02)
-            for expert in self.mlp.experts:
-                nn.init.trunc_normal_(expert.gate_proj.weight, mean=0.0, std=0.02)
-                nn.init.trunc_normal_(expert.up_proj.weight, mean=0.0, std=self.weight_init_std)
-                nn.init.trunc_normal_(expert.down_proj.weight, mean=0.0, std=self.weight_init_std)
+            # Stacked-expert weights: every expert shares the same init
+            # std, so we initialise the whole (E, K, N) tensor in one
+            # shot. This works on FSDP DTensors because nn.init operates
+            # on the local shard transparently.
+            nn.init.trunc_normal_(self.mlp.gate_weight, mean=0.0, std=0.02)
+            nn.init.trunc_normal_(self.mlp.up_weight, mean=0.0, std=self.weight_init_std)
+            nn.init.trunc_normal_(self.mlp.down_weight, mean=0.0, std=self.weight_init_std)
             if self.mlp.shared_expert is not None:
                 nn.init.trunc_normal_(self.mlp.shared_expert.gate_proj.weight, mean=0.0, std=0.02)
                 nn.init.trunc_normal_(self.mlp.shared_expert.up_proj.weight, mean=0.0, std=self.weight_init_std)

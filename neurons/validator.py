@@ -429,8 +429,18 @@ class Validator(BaseNode, Trainer):
         self.xshapes = {}
         self.totalks = {}
         for n, p in self.model.named_parameters():
+            # Stacked MoE weights are 3D ``(E, D, ffn)``; the codec only
+            # speaks 1D / 2D. Collapse the leading expert dim into rows
+            # so xshapes/totalks key off the same 2D shape that miners
+            # compress against (matching the view applied in
+            # ``prepare_gradient_dict``).
+            codec_shape = (
+                (p.shape[0] * p.shape[1], p.shape[2])
+                if p.dim() == 3
+                else p.shape
+            )
             enc = self.transformer.encode(
-                torch.empty(p.shape, dtype=torch.float16, device=self.device),
+                torch.empty(codec_shape, dtype=torch.float16, device=self.device),
                 use_dct=self.hparams.use_dct,
             )
             _, _, xshape, totalk, _ = self.compressor.compress(
@@ -3908,6 +3918,15 @@ class Validator(BaseNode, Trainer):
                         full_grad_src = full_grad_src.to(
                             dtype=p.dtype, device=p.device, non_blocking=True
                         )
+
+                        # 3D MoE stacked weights ``(E, D, ffn)`` were
+                        # collapsed to 2D ``(E*D, ffn)`` by the miner
+                        # before encoding (the codec only handles 1D /
+                        # 2D); reshape the decoded gradient back to
+                        # ``p.shape`` so the downstream
+                        # ``distribute_tensor`` / ``p.data.sub_`` works.
+                        if full_grad_src.shape != p.shape:
+                            full_grad_src = full_grad_src.view(p.shape)
 
                         # Free intermediate pieces ASAP
                         del ref, decompressed
