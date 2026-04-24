@@ -916,6 +916,21 @@ class Miner(BaseNode, Trainer):
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
                     pp_num_stages=self.pp_num_stages,
+                    # PP miner: only fetch each peer's *own-stage*
+                    # gradient. Stage 0 has totalks/xshapes for
+                    # ``layers.0..N/2-1`` only; pulling stage 1 too and
+                    # merging would dump ``layers.N/2..N-1`` keys into
+                    # the state dict that the per-key totalks-check then
+                    # rejects (``Missing totalk for parameter
+                    # layers.X.self_attn.q_proj.weight from UID Y,
+                    # skipping UID``), wasting both bandwidth and
+                    # peer-aggregation opportunities. Validators leave
+                    # this ``None`` because they DO want all stages.
+                    stage_id_filter=(
+                        self.pp_stage_id
+                        if self.pp_num_stages > 1
+                        else None
+                    ),
                 )
                 hone.logger.info("Gather task completed!")
                 gather_time = hone.T() - gather_start
@@ -964,7 +979,22 @@ class Miner(BaseNode, Trainer):
                     f"{hone.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
-            if self.is_master:
+            # Debug snapshot is uploaded under the un-suffixed key
+            # ``debug-{window}-{uid}-vX.pt`` (no ``-stage{N}-`` infix
+            # like ``gradient-...`` has), so when both stage 0's and
+            # stage N-1's masters race to PUT, they share a single
+            # ``/tmp/{uid}/temp_debug-...pt`` staging path. One stage's
+            # cleanup deletes the file while the other is still calling
+            # ``os.path.getsize`` on it -> ``FileNotFoundError`` and a
+            # cascading SIGTERM that takes the run down. Restrict the
+            # upload to stage-0's master so there's exactly one writer
+            # for that path. The debug payload only contains stage-0's
+            # local param slices anyway -- stage-N's were already being
+            # silently overwritten in the racy old path.
+            if (
+                self.is_master
+                and getattr(self, "pp_is_first_stage", True)
+            ):
                 # Add debug data including successfully gathered peers
                 debug_dict = {}
 

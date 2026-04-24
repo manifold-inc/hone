@@ -1693,6 +1693,7 @@ class Comms(ChainManager):
         time_max: datetime | None = None,
         xshapes: dict[str, tuple] | None = None,
         pp_num_stages: int = 1,
+        stage_id_filter: int | None = None,
     ) -> SimpleNamespace | None:
         """
         Gathers and processes gradients from a list of peer UIDs.
@@ -1759,13 +1760,23 @@ class Comms(ChainManager):
         uids = sorted(uids)
 
         async def _fetch_uid(uid: int) -> CommsGetResult | None:
-            """Fetch one peer's full gradient.
+            """Fetch one peer's gradient.
 
-            When ``pp_num_stages > 1`` the peer wrote one R2 file per stage
-            with the ``-stage{n}`` suffix; we download each in parallel and
-            merge into a single state dict (param namespaces between stages
-            are disjoint by construction). Otherwise we fall back to the
-            legacy single-file naming so non-PP miners keep working.
+            Three modes:
+
+            1. ``pp_num_stages <= 1``: legacy single-file naming. Used by
+               non-PP runs.
+            2. ``stage_id_filter is not None``: PP miner gathering from
+               peers. Each peer's stage ``stage_id_filter`` is what this
+               local miner needs to apply (own-stage params only); the
+               other stages' files would carry foreign-namespace keys
+               and trip the totalks-check anyway. Fetch only that one
+               file, no merge.
+            3. ``pp_num_stages > 1`` and no filter: validator path.
+               Download every per-stage file in parallel and merge into
+               a single state dict so the un-carved validator model can
+               apply the full-model gradient. Param namespaces between
+               stages are disjoint by construction.
             """
             if pp_num_stages <= 1:
                 return await self.get_with_retry(
@@ -1778,6 +1789,20 @@ class Comms(ChainManager):
                     time_min=time_min,
                     time_max=time_max,
                     map_location=device,
+                )
+
+            if stage_id_filter is not None:
+                return await self.get_with_retry(
+                    uid=str(uid),
+                    window=window,
+                    key=key,
+                    timeout=timeout,
+                    local=local,
+                    stale_retention=stale_retention,
+                    time_min=time_min,
+                    time_max=time_max,
+                    map_location=device,
+                    stage_id=stage_id_filter,
                 )
 
             stage_results = await asyncio.gather(
@@ -2118,6 +2143,7 @@ class Comms(ChainManager):
         reserve_uids: list[int],
         expected_compressed_params: set[str] | None = None,
         pp_num_stages: int = 1,
+        stage_id_filter: int | None = None,
         **kwargs,
     ) -> SimpleNamespace | None:
         """
@@ -2161,6 +2187,7 @@ class Comms(ChainManager):
             uids=gather_uids,
             expected_compressed_params=expected_compressed_params,
             pp_num_stages=pp_num_stages,
+            stage_id_filter=stage_id_filter,
             **kwargs,
         )
 
@@ -2200,6 +2227,7 @@ class Comms(ChainManager):
                     my_uid=my_uid,
                     uids=replacements,
                     pp_num_stages=pp_num_stages,
+                    stage_id_filter=stage_id_filter,
                     **kwargs,
                 )
                 if fallback:
