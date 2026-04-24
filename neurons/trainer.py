@@ -493,8 +493,11 @@ class Trainer:
             )
             # Pull the scalar loss the last stage sends right after the
             # gradient so this rank can log a meaningful value too.
+            # Sent as float32 so the printed value matches stage 1
+            # bit-for-bit (bf16's 7-bit mantissa would quantize ~12.9 to
+            # multiples of 0.0625 and visibly desync the logs).
             loss_scalar = transport.recv_next(
-                shape=(1,), dtype=self.amp_dtype
+                shape=(1,), dtype=torch.float32
             )
             t = _phase("s0 after_recv_grad", t)
 
@@ -502,7 +505,7 @@ class Trainer:
             h.backward(grad_h)
             _phase("s0 after_bwd", t)
 
-            return loss_scalar.float().reshape(()).to(self.device)
+            return loss_scalar.reshape(()).to(self.device)
 
         elif self.pp_is_last_stage:
             assert self.pp_stage.input_boundary is not None
@@ -546,10 +549,10 @@ class Trainer:
             transport.send_prev(grad_compressed.to(self.amp_dtype).contiguous())
             # Forward the scalar loss back to the previous stage so every
             # stage's ``Inner Step ... loss=`` log line shows the real
-            # value (otherwise stage 0 would always print 0.0000).
-            loss_scalar = (
-                loss.detach().to(self.amp_dtype).reshape(1).contiguous()
-            )
+            # value (otherwise stage 0 would always print 0.0000). Use
+            # float32 so the wire value matches what we hold here exactly,
+            # avoiding bf16 quantization artifacts in the printed loss.
+            loss_scalar = loss.detach().to(torch.float32).reshape(1).contiguous()
             transport.send_prev(loss_scalar)
             _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
@@ -580,8 +583,10 @@ class Trainer:
             )
             # Receive + relay the scalar loss alongside the gradient so it
             # propagates from the last stage all the way back to stage 0.
+            # Float32 wire format keeps every stage's printed loss
+            # bit-identical (no bf16 quantization in the chain).
             loss_scalar = transport.recv_next(
-                shape=(1,), dtype=self.amp_dtype
+                shape=(1,), dtype=torch.float32
             )
 
             compressed_out.backward(grad_compressed_out)
@@ -594,7 +599,7 @@ class Trainer:
             )
             transport.send_prev(loss_scalar.contiguous())
 
-            return loss_scalar.float().reshape(()).to(self.device)
+            return loss_scalar.reshape(()).to(self.device)
 
     # ------------------------------------------------------------------
     # Optimizers & Schedulers
