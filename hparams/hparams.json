@@ -5,7 +5,7 @@
 
     "tokenizer_name": "google/gemma-2-2b",
     "sequence_length": 4096,
-    "micro_batch_size": 8,
+    "micro_batch_size": 4,
     "target_batch_size": 1024,
     "batch_size": 32,
     "inner_steps": 30,
