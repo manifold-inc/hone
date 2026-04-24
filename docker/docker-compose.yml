@@ -1,0 +1,216 @@
+# Hone training stack: 1 validator + N miners, each miner = 2-stage PP
+# pair sharing one wallet hotkey.
+#
+# Layout (default values shown for the GPU map; override via .env):
+#
+#   validator                GPU 0          (FSDP within the process)
+#   miner1-s0  / miner1-s1   GPUs 1 / 2    (PP stage 0 / stage 1)
+#   miner2-s0  / miner2-s1   GPUs 3 / 4    (PP stage 0 / stage 1)
+#
+# Each miner pair is its own service-name pair (miner1-s0/s1, ...) so
+# the PP transport's --pp-peer-host-{prev,next} just point at the
+# sibling service name; Docker's embedded DNS does the rest. Ports
+# stay the same across pairs (each container is in its own netns).
+#
+# To add a 3rd miner, copy the miner2-* block to miner3-*, give it a
+# new wallet hotkey + GPU IDs.
+
+x-common-env: &common-env
+  # R2 / S3 credentials (gradients + dataset). Read from .env.
+  R2_GRADIENTS_ACCOUNT_ID: ${R2_GRADIENTS_ACCOUNT_ID}
+  R2_GRADIENTS_BUCKET_NAME: ${R2_GRADIENTS_BUCKET_NAME}
+  R2_GRADIENTS_READ_ACCESS_KEY_ID: ${R2_GRADIENTS_READ_ACCESS_KEY_ID}
+  R2_GRADIENTS_READ_SECRET_ACCESS_KEY: ${R2_GRADIENTS_READ_SECRET_ACCESS_KEY}
+  R2_GRADIENTS_WRITE_ACCESS_KEY_ID: ${R2_GRADIENTS_WRITE_ACCESS_KEY_ID}
+  R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY: ${R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY}
+  R2_AGGREGATOR_ACCOUNT_ID: ${R2_AGGREGATOR_ACCOUNT_ID:-}
+  R2_AGGREGATOR_BUCKET_NAME: ${R2_AGGREGATOR_BUCKET_NAME:-}
+  R2_AGGREGATOR_READ_ACCESS_KEY_ID: ${R2_AGGREGATOR_READ_ACCESS_KEY_ID:-}
+  R2_AGGREGATOR_READ_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_READ_SECRET_ACCESS_KEY:-}
+  R2_AGGREGATOR_WRITE_ACCESS_KEY_ID: ${R2_AGGREGATOR_WRITE_ACCESS_KEY_ID:-}
+  R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY: ${R2_AGGREGATOR_WRITE_SECRET_ACCESS_KEY:-}
+  R2_DATASET_ACCOUNT_ID: ${R2_DATASET_ACCOUNT_ID}
+  R2_DATASET_BUCKET_NAME: ${R2_DATASET_BUCKET_NAME}
+  R2_DATASET_READ_ACCESS_KEY_ID: ${R2_DATASET_READ_ACCESS_KEY_ID}
+  R2_DATASET_READ_SECRET_ACCESS_KEY: ${R2_DATASET_READ_SECRET_ACCESS_KEY}
+  DATASET_BINS_PATH: ${DATASET_BINS_PATH:-tokenized/}
+  # Optional integrations.
+  WANDB_API_KEY: ${WANDB_API_KEY:-}
+  HF_TOKEN: ${HF_TOKEN:-}
+  DASHBOARD_API_URL: ${DASHBOARD_API_URL:-https://api.hone.training}
+  DASHBOARD_API_KEY: ${DASHBOARD_API_KEY:-}
+  # Subtensor / chain.
+  NETUID: ${NETUID:-268}
+  SUBTENSOR_NETWORK: ${SUBTENSOR_NETWORK:-finney}
+  SUBTENSOR_CHAIN_ENDPOINT: ${SUBTENSOR_CHAIN_ENDPOINT:-}
+  # NCCL: stick to a single device per process within each container,
+  # the Dockerfile already ranks PORT/RANK via torchrun if NPROC>1.
+  NCCL_ASYNC_ERROR_HANDLING: "1"
+  NCCL_IB_DISABLE: "1"
+  NCCL_P2P_DISABLE: "0"
+
+x-build: &build
+  context: ..
+  dockerfile: docker/Dockerfile
+
+x-common-volumes: &common-volumes
+  # Wallet directory shared across the host -- each container reads
+  # ~/.bittensor/wallets/<WALLET_NAME>/hotkeys/<WALLET_HOTKEY>.
+  - ${BITTENSOR_WALLETS_DIR:-~/.bittensor/wallets}:/root/.bittensor/wallets:ro
+  # Mount the source tree over /app so edits to hone/* land instantly
+  # (the package was installed in editable mode in the Dockerfile).
+  - ../:/app:rw
+  # Logs land here.
+  - ./logs:/app/logs:rw
+  # Reuse the host's HF cache so we don't redownload tokenizers per
+  # container (-> 4-5 hits per stack startup otherwise).
+  - ${HF_CACHE_DIR:-~/.cache/huggingface}:/root/.cache/huggingface
+
+# Bridge network. Containers reach each other by service name
+# (miner1-s0 connects to miner1-s1, etc.) over Docker's embedded DNS.
+networks:
+  hone-net:
+    driver: bridge
+
+services:
+
+  # ----------------------------- VALIDATOR ---------------------------
+  validator:
+    build: *build
+    image: hone:latest
+    hostname: validator
+    container_name: hone-validator
+    networks: [hone-net]
+    volumes: *common-volumes
+    environment:
+      <<: *common-env
+      NODE_TYPE: validator
+      WALLET_NAME: ${VALIDATOR_WALLET_NAME}
+      WALLET_HOTKEY: ${VALIDATOR_WALLET_HOTKEY}
+      HONE_EXTRA_FLAGS: ${VALIDATOR_EXTRA_FLAGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${VALIDATOR_GPU_ID:-0}"]
+              capabilities: [gpu]
+    restart: unless-stopped
+
+  # ----------------------------- MINER #1 ----------------------------
+  miner1-s0:
+    build: *build
+    image: hone:latest
+    hostname: miner1-s0
+    container_name: hone-miner1-s0
+    networks: [hone-net]
+    volumes: *common-volumes
+    environment:
+      <<: *common-env
+      NODE_TYPE: miner
+      WALLET_NAME: ${MINER1_WALLET_NAME}
+      WALLET_HOTKEY: ${MINER1_WALLET_HOTKEY}
+      PP_STAGE: "0"
+      PP_NUM_STAGES: "2"
+      # Stage 0 only ever sends *forward* to the next stage and
+      # receives *grad* back from it. ``--pp-peer-host-prev`` is
+      # ignored on the first stage but the entrypoint still passes
+      # something to keep argparse happy.
+      PP_PEER_HOST_NEXT: miner1-s1
+      PP_PEER_PORT_BASE_NEXT: "50000"
+      PP_LISTEN_PORT_BASE: "50000"
+      HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MINER1_S0_GPU_ID:-1}"]
+              capabilities: [gpu]
+    depends_on: [validator]
+    restart: unless-stopped
+
+  miner1-s1:
+    build: *build
+    image: hone:latest
+    hostname: miner1-s1
+    container_name: hone-miner1-s1
+    networks: [hone-net]
+    volumes: *common-volumes
+    environment:
+      <<: *common-env
+      NODE_TYPE: miner
+      WALLET_NAME: ${MINER1_WALLET_NAME}
+      WALLET_HOTKEY: ${MINER1_WALLET_HOTKEY}
+      PP_STAGE: "1"
+      PP_NUM_STAGES: "2"
+      PP_PEER_HOST_PREV: miner1-s0
+      PP_PEER_PORT_BASE_PREV: "50000"
+      PP_LISTEN_PORT_BASE: "50000"
+      HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MINER1_S1_GPU_ID:-2}"]
+              capabilities: [gpu]
+    depends_on: [validator]
+    restart: unless-stopped
+
+  # ----------------------------- MINER #2 ----------------------------
+  miner2-s0:
+    build: *build
+    image: hone:latest
+    hostname: miner2-s0
+    container_name: hone-miner2-s0
+    networks: [hone-net]
+    volumes: *common-volumes
+    environment:
+      <<: *common-env
+      NODE_TYPE: miner
+      WALLET_NAME: ${MINER2_WALLET_NAME}
+      WALLET_HOTKEY: ${MINER2_WALLET_HOTKEY}
+      PP_STAGE: "0"
+      PP_NUM_STAGES: "2"
+      PP_PEER_HOST_NEXT: miner2-s1
+      PP_PEER_PORT_BASE_NEXT: "50000"
+      PP_LISTEN_PORT_BASE: "50000"
+      HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MINER2_S0_GPU_ID:-3}"]
+              capabilities: [gpu]
+    depends_on: [validator]
+    restart: unless-stopped
+
+  miner2-s1:
+    build: *build
+    image: hone:latest
+    hostname: miner2-s1
+    container_name: hone-miner2-s1
+    networks: [hone-net]
+    volumes: *common-volumes
+    environment:
+      <<: *common-env
+      NODE_TYPE: miner
+      WALLET_NAME: ${MINER2_WALLET_NAME}
+      WALLET_HOTKEY: ${MINER2_WALLET_HOTKEY}
+      PP_STAGE: "1"
+      PP_NUM_STAGES: "2"
+      PP_PEER_HOST_PREV: miner2-s0
+      PP_PEER_PORT_BASE_PREV: "50000"
+      PP_LISTEN_PORT_BASE: "50000"
+      HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${MINER2_S1_GPU_ID:-4}"]
+              capabilities: [gpu]
+    depends_on: [validator]
+    restart: unless-stopped

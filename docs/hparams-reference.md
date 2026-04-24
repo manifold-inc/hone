@@ -32,6 +32,9 @@ After merging, the system constructs a `SimpleNamespace` with all fields, attach
 | `inner_steps` | int | -- | Number of local optimizer steps per training window before uploading gradients. |
 | `max_inner_steps` | int | -- | Upper bound on inner steps. Caps how many local steps a miner can take if the window is long. |
 | `outer_learning_rate` | float | -- | Learning rate for the outer (global) gradient aggregation step. Controls how aggressively aggregated gradients are applied to the global model. |
+| `outer_momentum` | float | -- | Momentum coefficient for the outer SGD optimizer. Higher values let velocity accumulate compression noise across outer steps and amplify per-window param jumps; lower values (e.g. `0.5`) keep the outer step closer to the per-window gradient direction. |
+| `outer_nesterov` | bool | `true` | Whether to use Nesterov look-ahead in the outer SGD optimizer. Nesterov adds an extra `+momentum*grad` on top of the regular momentum step (~1.5x larger updates). Disable when compression noise is high to keep outer steps from over-shooting. |
+| `reset_inner_optimizer_per_window` | bool | `false` | When true, drop all inner-optimizer per-param state (Adam moments / Muon momentum buffer / step counter) and reset the manual LR-warmup counter at the start of every chain window. Removes the "stale momentum after outer-step discontinuity" overshoot that shows up as a one-step loss spike right after each outer step, at the cost of re-warming the inner optimizer (≈30 inner steps of (k+1)/N LR ramp). Useful when outer-step compression noise is high. |
 | `weight_decay` | float | -- | Weight decay coefficient applied during outer optimization. |
 | `max_grad_norm` | float | -- | Maximum gradient norm for clipping during outer optimization. |
 

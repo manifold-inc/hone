@@ -798,11 +798,20 @@ class Trainer:
     # ------------------------------------------------------------------
     def init_optimizers_schedulers(self, validator=False):
         self.lr = float(self.hparams.outer_learning_rate)
+        # ``nesterov=True`` with ``momentum=0.9`` was the original
+        # DiLoCo/DeMo recipe but it amplifies compression-noise in the
+        # outer-grad velocity buffer (we observed outer_grad L2 growing
+        # 1.3 -> 5.9 -> 11.7 -> 19.6 -> 26.7 across consecutive outer
+        # steps with the old defaults, with corresponding loss spikes
+        # at every window boundary). The Nesterov look-ahead step adds
+        # another ``+momentum * grad`` on top of the regular
+        # momentum-corrected step, ~1.5x larger updates than plain SGD
+        # momentum. Make it a hparam so we can flip back if needed.
         self.outer_optimizer = SGD(
             self.model.parameters(),
             lr=self.lr,
-            momentum=0.9,
-            nesterov=True,
+            momentum=self.hparams.outer_momentum,
+            nesterov=bool(getattr(self.hparams, "outer_nesterov", True)),
         )
         self.inner_optimizer = self._build_inner_optimizer(validator)
         self.inner_scheduler = self._build_inner_scheduler()
@@ -1082,6 +1091,38 @@ class Trainer:
                 f"in {time.time() - t0:.3f}s"
             )
 
+    def reset_inner_optimizer_states(self, *, log: bool = True) -> None:
+        """Drop all inner optimizer per-param state and the manual LR
+        warmup counter so the next inner step starts from a clean
+        slate.
+
+        ``optimizer.state.clear()`` is the cheapest way to do this --
+        Adam / Muon / SGD all lazily re-allocate the relevant buffers
+        (``exp_avg``, ``exp_avg_sq``, ``momentum_buffer``, ``step``) on
+        the next ``.step()`` call, initialised to zero on the param's
+        own device. We also drop the offload-flag so a subsequent
+        ``prefetch_inner_optimizer_states`` no-ops instead of trying to
+        copy stale CPU buffers we just discarded.
+        """
+        if not getattr(self, "inner_optimizer", None):
+            return
+        t0 = time.time()
+        n_states = sum(1 for _ in self._iter_inner_opt_state_tensors())
+        self.inner_optimizer.state.clear()
+        # ``warmup_steps_taken`` gates the (k+1)/N LR ramp in the inner
+        # loop. Reset it so the post-reset first 30 inner steps re-ramp
+        # smoothly rather than landing with full LR + zero momentum
+        # (which would overshoot for a different reason).
+        self.warmup_steps_taken = 0
+        # We just discarded what would have been on GPU; mark not-
+        # offloaded so a follow-up prefetch is correctly skipped.
+        self._inner_opt_offloaded = False
+        if log and getattr(self, "is_master", True):
+            hone.logger.info(
+                f"[InnerOpt] reset {n_states} state tensors + warmup "
+                f"counter in {time.time() - t0:.3f}s"
+            )
+
     # ------------------------------------------------------------------
     # Inner training loop
     # ------------------------------------------------------------------
@@ -1098,7 +1139,23 @@ class Trainer:
             )
             self.loop.set_default_executor(self.executor)
 
-        self.prefetch_inner_optimizer_states()
+        # The outer step creates a parameter discontinuity that the
+        # inner-optimizer momentum buffers (calibrated against the
+        # *pre-outer-step* params) don't expect. Applying that stale
+        # momentum to the new params produces a one-step overshoot
+        # visible as a sharp loss spike right after each window flip
+        # (loss=7.69 -> 11.75 in a single inner step in our trace).
+        # When ``reset_inner_optimizer_per_window`` is set we discard
+        # the per-param state entirely and let the next ``.step()``
+        # lazily allocate fresh zero buffers. We also reset
+        # ``warmup_steps_taken`` so the post-reset first 30 inner steps
+        # re-ramp the LR via the manual-warmup branch -- without this
+        # the very first step would land with full LR + zero momentum
+        # and overshoot for a different reason.
+        if getattr(self.hparams, "reset_inner_optimizer_per_window", False):
+            self.reset_inner_optimizer_states()
+        else:
+            self.prefetch_inner_optimizer_states()
         self.inner_optimizer.zero_grad()
 
         total_loss: float = 0.0
