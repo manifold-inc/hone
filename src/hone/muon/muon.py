@@ -16,10 +16,25 @@
 # DEALINGS IN THE SOFTWARE.
 
 
+import logging
+import os
+
 import torch
 
 from .mmtt_kernel import matmul_transpose_assign
 from .newton_schulz_triton import newton_schulz_triton
+
+_log = logging.getLogger("hone")
+
+# When True we still try ``newton_schulz_triton`` (which goes through
+# ``@torch.compile`` -> Inductor -> Triton). The first time it raises (e.g.
+# Triton's CUDA driver helper fails to compile because gcc / Python headers
+# / libcuda are missing in the runtime image), we permanently fall back to
+# the pure-PyTorch ``zeropower_via_newtonschulz5`` for the rest of training.
+# Set ``HONE_DISABLE_TORCH_COMPILE=1`` to skip the attempt entirely.
+_use_triton_newton_schulz = (
+    os.environ.get("HONE_DISABLE_TORCH_COMPILE", "0") != "1"
+)
 
 
 def zeropower_via_newtonschulz5(G, steps: int):
@@ -95,12 +110,31 @@ def zeropower_via_newtonschulz5_optimized(G, steps):
 
 
 def muon_update(grad, momentum, beta=0.95, ns_steps=5, nesterov=True):
+    global _use_triton_newton_schulz
     momentum.lerp_(grad, 1 - beta)
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     if update.ndim == 4:  # for the case of conv filters
         update = update.view(len(update), -1)
-    # Use Microsoft's Newton-Schulz Triton implementation
-    update = newton_schulz_triton(update)
+    if _use_triton_newton_schulz:
+        # Use Microsoft's Newton-Schulz Triton implementation when it
+        # compiles. On environments where Inductor/Triton can't JIT
+        # (gcc, headers, libcuda issues) we silently fall back to the
+        # eager PyTorch path so training keeps progressing.
+        try:
+            update = newton_schulz_triton(update)
+        except Exception as e:  # noqa: BLE001 - intentionally broad
+            _use_triton_newton_schulz = False
+            _log.warning(
+                "[Muon] newton_schulz_triton failed (%s: %s). "
+                "Falling back to eager Newton-Schulz for the rest of "
+                "training. Set HONE_DISABLE_TORCH_COMPILE=1 to skip the "
+                "attempt next launch.",
+                type(e).__name__,
+                str(e).splitlines()[0] if str(e) else "",
+            )
+            update = zeropower_via_newtonschulz5(update, steps=ns_steps)
+    else:
+        update = zeropower_via_newtonschulz5(update, steps=ns_steps)
     update *= max(1, grad.size(-2) / grad.size(-1)) ** 0.5
     return update
 

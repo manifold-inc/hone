@@ -491,13 +491,18 @@ class Trainer:
             grad_compressed = transport.recv_next(
                 shape=(B, S, bottleneck_dim), dtype=self.amp_dtype
             )
+            # Pull the scalar loss the last stage sends right after the
+            # gradient so this rank can log a meaningful value too.
+            loss_scalar = transport.recv_next(
+                shape=(1,), dtype=self.amp_dtype
+            )
             t = _phase("s0 after_recv_grad", t)
 
             grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
             h.backward(grad_h)
             _phase("s0 after_bwd", t)
 
-            return torch.tensor(0.0, device=self.device)
+            return loss_scalar.float().reshape(()).to(self.device)
 
         elif self.pp_is_last_stage:
             assert self.pp_stage.input_boundary is not None
@@ -539,6 +544,13 @@ class Trainer:
             # match amp_dtype so stage 0's recv_next gets exactly what
             # it asked for.
             transport.send_prev(grad_compressed.to(self.amp_dtype).contiguous())
+            # Forward the scalar loss back to the previous stage so every
+            # stage's ``Inner Step ... loss=`` log line shows the real
+            # value (otherwise stage 0 would always print 0.0000).
+            loss_scalar = (
+                loss.detach().to(self.amp_dtype).reshape(1).contiguous()
+            )
+            transport.send_prev(loss_scalar)
             _phase(f"sN after_send_grad loss={loss.item():.4f}", t)
 
             return loss.detach()
@@ -566,6 +578,11 @@ class Trainer:
             grad_compressed_out = transport.recv_next(
                 shape=tuple(compressed_out.shape), dtype=self.amp_dtype
             )
+            # Receive + relay the scalar loss alongside the gradient so it
+            # propagates from the last stage all the way back to stage 0.
+            loss_scalar = transport.recv_next(
+                shape=(1,), dtype=self.amp_dtype
+            )
 
             compressed_out.backward(grad_compressed_out)
 
@@ -575,8 +592,9 @@ class Trainer:
             transport.send_prev(
                 grad_compressed_in.to(self.amp_dtype).contiguous()
             )
+            transport.send_prev(loss_scalar.contiguous())
 
-            return torch.tensor(0.0, device=self.device)
+            return loss_scalar.float().reshape(()).to(self.device)
 
     # ------------------------------------------------------------------
     # Optimizers & Schedulers

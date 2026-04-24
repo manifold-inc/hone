@@ -25,7 +25,38 @@ import torch
 from torch.distributed import gather, scatter
 from torch.distributed.tensor import DTensor
 
+from .muon import zeropower_via_newtonschulz5
 from .newton_schulz_triton import newton_schulz_triton
+
+# Same fallback knob as ``muon.py``: when the Triton/Inductor JIT can't
+# compile in this environment (e.g. gcc/headers/libcuda issue), we drop
+# back to the eager Newton-Schulz so training keeps moving.
+import logging as _logging
+import os as _os
+
+_log_fsdp2 = _logging.getLogger("hone")
+_use_triton_newton_schulz_fsdp2 = (
+    _os.environ.get("HONE_DISABLE_TORCH_COMPILE", "0") != "1"
+)
+
+
+def _newton_schulz_with_fallback(g, epsilon: float = 1e-7, ns_steps: int = 5):
+    """``newton_schulz_triton`` with a one-shot eager fallback."""
+    global _use_triton_newton_schulz_fsdp2
+    if _use_triton_newton_schulz_fsdp2:
+        try:
+            return newton_schulz_triton(g, epsilon=epsilon)
+        except Exception as e:  # noqa: BLE001
+            _use_triton_newton_schulz_fsdp2 = False
+            _log_fsdp2.warning(
+                "[Muon-FSDP2] newton_schulz_triton failed (%s: %s). "
+                "Falling back to eager Newton-Schulz for the rest of "
+                "training. Set HONE_DISABLE_TORCH_COMPILE=1 to skip the "
+                "attempt next launch.",
+                type(e).__name__,
+                str(e).splitlines()[0] if str(e) else "",
+            )
+    return zeropower_via_newtonschulz5(g, steps=ns_steps)
 
 
 def apply_momentum(grad, momentum, beta, nesterov):
@@ -60,8 +91,7 @@ def muon_update(grad, momentum, beta=0.95, nesterov=True, rms_scale=False):
     update = grad.lerp_(momentum, beta) if nesterov else momentum
     if update.ndim == 4:  # for the case of conv filters
         update = update.view(len(update), -1)
-    # Use Microsoft's Newton-Schulz Triton kernel for orthogonalization
-    update = newton_schulz_triton(update, epsilon=1e-7)
+    update = _newton_schulz_with_fallback(update)
     update = apply_scaling(update, rms_scale)
     return update
 
@@ -138,8 +168,7 @@ class Fsdp1dWork:
         gather_handle.wait()
         if rank == dest_rank:
             g_full_block = torch.cat(gather_lists, dim=0)
-            # Use Microsoft's Newton-Schulz Triton kernel
-            g_full_block.copy_(newton_schulz_triton(g_full_block, epsilon=1e-7))
+            g_full_block.copy_(_newton_schulz_with_fallback(g_full_block))
             g_full_block = g_full_block.type_as(grad)
             chunks = list(g_full_block.chunk(chunks=world_size, dim=0))
             scatter(
