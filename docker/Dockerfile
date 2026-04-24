@@ -47,33 +47,41 @@ RUN UV_INSTALL_DIR=/usr/local/bin /tmp/install-uv.sh && rm /tmp/install-uv.sh
 
 # Project source. We copy ``hone/`` (this directory's parent) into
 # ``/app`` so the dockerfile can be built with ``-f hone/docker/Dockerfile``
-# and ``--build-context=hone:./hone`` (or ``context: ..`` from the
-# compose file's docker/ subdir).
+# and ``context: ..`` from the compose file's docker/ subdir. The
+# build context is filtered by ``hone/.dockerignore`` so dataset
+# shards / virtualenvs / logs don't get streamed to the daemon.
+#
+# IMPORTANT: the venv lives at /opt/hone-venv, NOT under /app. The
+# runtime compose mounts the host hone/ at /app:rw so that source
+# edits land instantly; if the venv were at /app/.venv it would be
+# shadowed by whatever (or nothing) the host has at hone/.venv.
 WORKDIR /app
 COPY pyproject.toml /app/pyproject.toml
 COPY src/hone/__init__.py /app/src/hone/__init__.py
 
 # Resolve the dep set first so this layer caches across source edits.
-# ``--no-install-project`` skips installing hone itself; that happens
-# in the next layer once the full tree is copied. We use python 3.12.
-RUN uv venv --python 3.12 /app/.venv \
-    && . /app/.venv/bin/activate \
+# Torch is pinned to the cu124 wheel index so we get the matching
+# CUDA runtime baked into the image.
+RUN uv venv --python 3.12 /opt/hone-venv \
+    && . /opt/hone-venv/bin/activate \
     && uv pip install --no-cache --upgrade pip wheel \
     && uv pip install --no-cache \
         --extra-index-url https://download.pytorch.org/whl/cu124 \
         "torch>=2.7.1"
 
-# Now bring in the rest of the source and install the project in
-# editable mode. Editable install means rebuilds aren't needed for
-# python edits -- a bind-mount of the host source over /app at runtime
-# is also supported (see compose ``volumes:`` entry).
+# Bring in the rest of the source and install the project in
+# editable mode. Editable means future ``COPY``-bound or bind-mounted
+# python edits are picked up live -- no rebuild needed.
 COPY . /app
-RUN . /app/.venv/bin/activate \
+RUN . /opt/hone-venv/bin/activate \
     && uv pip install --no-cache -e .
 
-# Make the venv the default Python everywhere downstream.
-ENV PATH="/app/.venv/bin:${PATH}" \
-    VIRTUAL_ENV="/app/.venv"
+# Make the venv the default Python everywhere downstream. Putting
+# /opt/hone-venv first on PATH means ``python``, ``torchrun``, etc.
+# resolve to the container's interpreter even when /app is bind-
+# mounted from the host.
+ENV PATH="/opt/hone-venv/bin:${PATH}" \
+    VIRTUAL_ENV="/opt/hone-venv"
 
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
