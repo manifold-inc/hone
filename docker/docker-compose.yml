@@ -110,9 +110,14 @@ services:
   # is set.
 
   miner-s0:
-    build: *build
+    # NOTE: no ``build:`` -- the validator service is the sole build
+    # target for ``hone:latest``. Without this miners would each
+    # invoke their own (identical) build job and re-export the
+    # finished image to the local store, multiplying the slow
+    # "exporting layers" step by 3. ``pull_policy: never`` tells
+    # compose to use whatever's already tagged locally.
     image: hone:latest
-    pull_policy: build
+    pull_policy: never
     hostname: miner-s0
     container_name: hone-miner-s0
     networks: [hone-net]
@@ -142,9 +147,11 @@ services:
     restart: unless-stopped
 
   miner-s1:
-    build: *build
+    # See comment on miner-s0: image is built once by the validator
+    # service. ``depends_on: [validator]`` below ensures the build
+    # has happened before this service starts.
     image: hone:latest
-    pull_policy: build
+    pull_policy: never
     hostname: miner-s1
     container_name: hone-miner-s1
     networks: [hone-net]

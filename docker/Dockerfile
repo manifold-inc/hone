@@ -8,8 +8,14 @@
 # pytorch.org's cu124 wheel index caps at torch 2.6.0 while
 # pyproject.toml requires torch>=2.7.1 -- the cu126 index has 2.7.x
 # wheels and remains B200-compatible (12.6 supersedes 12.4 ABI).
+#
+# Use the *runtime* (not -devel) CUDA variant: the PyTorch wheel
+# bundles every CUDA shared lib it needs and Triton bundles its own
+# ``ptxas`` for JIT, so we don't need ``nvcc`` / headers / static
+# libs. That cuts image size by ~3 GiB and shaves ~30-60s off the
+# layer-export step that finalises the build.
 ARG CUDA_VERSION=12.6.3
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
+FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
