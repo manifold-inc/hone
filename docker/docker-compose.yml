@@ -83,6 +83,7 @@ services:
   validator:
     build: *build
     image: hone:latest
+    pull_policy: build  # don't try to pull hone:latest from a registry
     hostname: validator
     container_name: hone-validator
     networks: [hone-net]
@@ -111,6 +112,7 @@ services:
   miner-s0:
     build: *build
     image: hone:latest
+    pull_policy: build
     hostname: miner-s0
     container_name: hone-miner-s0
     networks: [hone-net]
@@ -142,6 +144,7 @@ services:
   miner-s1:
     build: *build
     image: hone:latest
+    pull_policy: build
     hostname: miner-s1
     container_name: hone-miner-s1
     networks: [hone-net]

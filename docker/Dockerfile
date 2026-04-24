@@ -1,12 +1,14 @@
 # syntax=docker/dockerfile:1.6
 #
-# Hone training image. Bakes in CUDA 12.4 + cuDNN, Python 3.12, uv, and
+# Hone training image. Bakes in CUDA 12.6 + cuDNN, Python 3.12, uv, and
 # the hone package installed editable so source-tree edits are picked
 # up on the next container restart without a rebuild.
 #
-# B200 / H200 require CUDA 12.4+; we pin 12.4.1 explicitly. torch>=2.7.1
-# wheels for cu124 are pulled in by uv when the project is installed.
-ARG CUDA_VERSION=12.4.1
+# B200 / H200 require CUDA 12.4+; we pin 12.6.3 explicitly because
+# pytorch.org's cu124 wheel index caps at torch 2.6.0 while
+# pyproject.toml requires torch>=2.7.1 -- the cu126 index has 2.7.x
+# wheels and remains B200-compatible (12.6 supersedes 12.4 ABI).
+ARG CUDA_VERSION=12.6.3
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -60,13 +62,18 @@ COPY pyproject.toml /app/pyproject.toml
 COPY src/hone/__init__.py /app/src/hone/__init__.py
 
 # Resolve the dep set first so this layer caches across source edits.
-# Torch is pinned to the cu124 wheel index so we get the matching
-# CUDA runtime baked into the image.
+# Torch is pinned to the cu126 wheel index so we get the matching
+# CUDA runtime baked into the image (cu124 caps at torch 2.6.0).
+# ``--index-strategy unsafe-best-match`` lets uv consider PyPI for
+# everything that's NOT torch (transitive deps that aren't on the
+# pytorch index), otherwise the cu126 index would shadow PyPI for
+# unrelated packages.
 RUN uv venv --python 3.12 /opt/hone-venv \
     && . /opt/hone-venv/bin/activate \
     && uv pip install --no-cache --upgrade pip wheel \
     && uv pip install --no-cache \
-        --extra-index-url https://download.pytorch.org/whl/cu124 \
+        --index-strategy unsafe-best-match \
+        --extra-index-url https://download.pytorch.org/whl/cu126 \
         "torch>=2.7.1"
 
 # Bring in the rest of the source and install the project in
