@@ -1,0 +1,77 @@
+const UV = "/home/cvm/.local/bin/uv";
+const CWD = "/home/cvm/hone";
+
+module.exports = {
+  apps: [
+    {
+      name: "vali",
+      cwd: CWD,
+      script: UV,
+      args: [
+        "run", "torchrun",
+        "--nproc_per_node=2",
+        "neurons/validator.py",
+        "--wallet.name", "vali",
+        "--netuid", "5",
+      ],
+      interpreter: "none",
+    },
+    {
+      name: "s0",
+      cwd: CWD,
+      script: UV,
+      args: [
+        "run", "torchrun",
+        "--nproc_per_node=2",
+        "--master_port=29501",
+        "neurons/miner.py",
+        "--wallet.name", "miner",
+        "--netuid", "5",
+        "--pp-stage", "0",
+        "--pp-num-stages", "3",
+        "--pp-peer-host-next", "127.0.0.1",
+        "--pp-peer-port-base-next", "50000",
+        "--pp-listen-port-base", "50000",
+      ],
+      interpreter: "none",
+    },
+    {
+      name: "s1",
+      cwd: CWD,
+      script: UV,
+      args: [
+        "run", "torchrun",
+        "--nproc_per_node=2",
+        "--master_port=29502",
+        "neurons/miner.py",
+        "--wallet.name", "miner",
+        "--netuid", "5",
+        "--pp-stage", "1",
+        "--pp-num-stages", "3",
+        "--pp-peer-host-next", "127.0.0.1",
+        "--pp-peer-port-base-next", "50000",
+        "--pp-listen-port-base", "50000",
+      ],
+      interpreter: "none",
+    },
+    {
+      name: "s2",
+      cwd: CWD,
+      script: UV,
+      args: [
+        "run", "torchrun",
+        "--nproc_per_node=2",
+        "--master_port=29503",
+        "neurons/miner.py",
+        "--wallet.name", "miner",
+        "--netuid", "5",
+        "--pp-stage", "2",
+        "--pp-num-stages", "3",
+        "--pp-peer-host-next", "127.0.0.1",
+        "--pp-peer-port-base-next", "50000",
+        "--pp-listen-port-base", "50000",
+      ],
+      interpreter: "none",
+    },
+  ],
+};
