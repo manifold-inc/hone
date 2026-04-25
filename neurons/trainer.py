@@ -437,18 +437,20 @@ class Trainer:
         FSDP2 installs its unshard/reshard hooks on each wrapped module's
         ``__call__``. ``_pp_run_1f1b`` bypasses the outer model forward
         and calls leaf submodules directly, so those leaves
-        (``embed_tokens``, ``lm_head``, the ResBM ``encoder``/``decoder``
-        inside each ``PipelineStageBoundary``) need their *own* FSDP units
-        or every call fails with "mixed torch.Tensor and DTensor".
+        (``embed_tokens``, ``lm_head``, ``model.norm``, the ResBM
+        ``encoder``/``decoder`` inside each ``PipelineStageBoundary``)
+        need their *own* FSDP units or every call fails with
+        "mixed torch.Tensor and DTensor".
 
-        Every parameter in the carved stage MUST end up as a DTensor --
-        ``clip_grad_norm_`` calls ``_foreach_norm`` over all
-        ``model.parameters()`` grads, and that op blows up with
-        "got mixed torch.Tensor and DTensor" if any grad is a plain
-        tensor. The previous code excluded ``model.norm`` via
-        ``ignored_params`` to "save an all-gather", but for a
-        ``(hidden_dim,)`` 1-D vector that all-gather is ~8 KiB --
-        cheaper than the bug.
+        Every parameter in the carved stage MUST also end up as a
+        DTensor for grad-norm: ``clip_grad_norm_`` calls
+        ``_foreach_norm`` over all ``model.parameters()`` grads and
+        that op blows up the same way if any grad is a plain tensor.
+        The earlier code excluded ``model.norm`` via ``ignored_params``
+        to "save an all-gather", but for a ``(hidden_dim,)`` 1-D
+        vector that all-gather is ~8 KiB -- cheaper than the bug, and
+        wrapping it explicitly here also fixes the leaf-call problem
+        above.
         """
         try:
             from torch.distributed.fsdp import fully_shard
@@ -480,17 +482,23 @@ class Trainer:
                 fully_shard(boundary.decoder, **fsdp_kwargs)
 
             # Stage-edge submodules called directly from ``_pp_run_1f1b``.
+            # Each needs its OWN ``fully_shard`` so the unshard hook
+            # fires on the leaf call (e.g. ``self.model.norm(h)``)
+            # instead of only on ``self.model(...)``. Without that the
+            # leaf's weight stays a sharded DTensor while the activation
+            # is a plain Tensor and the very first op in the leaf
+            # forward (e.g. ``self.weight * x`` in RMSNorm) crashes
+            # with "mixed torch.Tensor and DTensor".
             if self.pp_is_first_stage and hasattr(self.model, "embed_tokens"):
                 fully_shard(self.model.embed_tokens, **fsdp_kwargs)
             if self.pp_is_last_stage and hasattr(self.model, "lm_head"):
                 fully_shard(self.model.lm_head, **fsdp_kwargs)
+            if self.pp_is_last_stage and hasattr(self.model, "norm"):
+                fully_shard(self.model.norm, **fsdp_kwargs)
 
-            # Outer wrapper: catches any params not yet wrapped by a
-            # leaf FSDP unit above (notably the final ``model.norm``
-            # RMSNorm on the last stage). Skipping this wrap on the
-            # norm via ``ignored_params`` leaves a plain Tensor mixed
-            # in among DTensor params, which crashes
-            # ``clip_grad_norm_`` -> ``_foreach_norm``.
+            # Outer wrapper: catches any remaining params not yet
+            # wrapped by a leaf FSDP unit above. Also installs the
+            # root-level FSDP state needed for grad-norm reductions.
             fully_shard(self.model, **fsdp_kwargs)
         else:
             for layer in self.model.layers:
