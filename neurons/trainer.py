@@ -232,17 +232,7 @@ class Trainer:
     def init_model(self, validator=False, meta=False):
         config: LoopLMConfig = self.hparams.model_config
         pp_stages = getattr(self, "pp_degree", 1)
-        # With the iota-aligned per-stage torchrun layout, each PP stage
-        # is its own torchrun job and therefore its own NCCL world --
-        # ``self.world_size`` is *already* the count of ranks in THIS
-        # stage, not a global rank count. The old
-        # ``ranks_in_stage = world_size // pp_stages`` divide came from
-        # a hypothetical single-global-torchrun architecture that we
-        # don't run; under per-stage torchrun it gates FSDP off
-        # entirely whenever ``world_size <= pp_stages`` (e.g. NPROC=2
-        # per stage with PP=2 leaves the model unsharded on each
-        # stage's two GPUs and you silently lose ~2x throughput).
-        ranks_in_stage = self.world_size
+        ranks_in_stage = self.world_size // max(pp_stages, 1)
 
         if meta:
             # Meta-init path:
@@ -437,20 +427,13 @@ class Trainer:
         FSDP2 installs its unshard/reshard hooks on each wrapped module's
         ``__call__``. ``_pp_run_1f1b`` bypasses the outer model forward
         and calls leaf submodules directly, so those leaves
-        (``embed_tokens``, ``lm_head``, ``model.norm``, the ResBM
-        ``encoder``/``decoder`` inside each ``PipelineStageBoundary``)
-        need their *own* FSDP units or every call fails with
-        "mixed torch.Tensor and DTensor".
+        (``embed_tokens``, ``lm_head``, the ResBM ``encoder``/``decoder``
+        inside each ``PipelineStageBoundary``) need their *own* FSDP units
+        or every call fails with "mixed torch.Tensor and DTensor".
 
-        Every parameter in the carved stage MUST also end up as a
-        DTensor for grad-norm: ``clip_grad_norm_`` calls
-        ``_foreach_norm`` over all ``model.parameters()`` grads and
-        that op blows up the same way if any grad is a plain tensor.
-        The earlier code excluded ``model.norm`` via ``ignored_params``
-        to "save an all-gather", but for a ``(hidden_dim,)`` 1-D
-        vector that all-gather is ~8 KiB -- cheaper than the bug, and
-        wrapping it explicitly here also fixes the leaf-call problem
-        above.
+        Tiny modules (RMSNorm, ResBM ``IdentityProjection``) carry no
+        meaningful parameter footprint, so they stay replicated via
+        ``ignored_params`` rather than incurring an extra all-gather.
         """
         try:
             from torch.distributed.fsdp import fully_shard
@@ -462,6 +445,8 @@ class Trainer:
             fsdp_kwargs["mesh"] = self.dp_mesh
 
         if self.pp_stages > 1 and self.pp_stage is not None:
+            ignored_params: set = set()
+
             # Shard each transformer block in the local stage.
             for layer in self.pp_stage.layers:
                 fully_shard(layer, **fsdp_kwargs)
@@ -471,7 +456,6 @@ class Trainer:
             # ``boundary.encoder(x)`` / ``boundary.decoder(c)`` calls
             # trigger the unshard hook. The outer boundary itself stays
             # as a plain nn.Module so ``boundary.encode(...)`` works.
-            # ``IdentityProjection`` has no parameters; nothing to wrap.
             for boundary in (
                 self.pp_stage.input_boundary,
                 self.pp_stage.output_boundary,
@@ -480,26 +464,23 @@ class Trainer:
                     continue
                 fully_shard(boundary.encoder, **fsdp_kwargs)
                 fully_shard(boundary.decoder, **fsdp_kwargs)
+                # IdentityProjection has no parameters, nothing to ignore.
 
             # Stage-edge submodules called directly from ``_pp_run_1f1b``.
-            # Each needs its OWN ``fully_shard`` so the unshard hook
-            # fires on the leaf call (e.g. ``self.model.norm(h)``)
-            # instead of only on ``self.model(...)``. Without that the
-            # leaf's weight stays a sharded DTensor while the activation
-            # is a plain Tensor and the very first op in the leaf
-            # forward (e.g. ``self.weight * x`` in RMSNorm) crashes
-            # with "mixed torch.Tensor and DTensor".
             if self.pp_is_first_stage and hasattr(self.model, "embed_tokens"):
                 fully_shard(self.model.embed_tokens, **fsdp_kwargs)
             if self.pp_is_last_stage and hasattr(self.model, "lm_head"):
                 fully_shard(self.model.lm_head, **fsdp_kwargs)
-            if self.pp_is_last_stage and hasattr(self.model, "norm"):
-                fully_shard(self.model.norm, **fsdp_kwargs)
 
-            # Outer wrapper: catches any remaining params not yet
-            # wrapped by a leaf FSDP unit above. Also installs the
-            # root-level FSDP state needed for grad-norm reductions.
-            fully_shard(self.model, **fsdp_kwargs)
+            # RMSNorm is one (hidden_dim,) vector; replicate it.
+            if self.pp_is_last_stage and hasattr(self.model, "norm"):
+                ignored_params.update(self.model.norm.parameters())
+
+            # Outer wrapper: anything not yet wrapped (typically nothing
+            # except the ignored norm) inherits a root FSDP hook.
+            fully_shard(
+                self.model, **fsdp_kwargs, ignored_params=ignored_params
+            )
         else:
             for layer in self.model.layers:
                 fully_shard(layer, **fsdp_kwargs)

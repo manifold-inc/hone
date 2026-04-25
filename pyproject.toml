@@ -13,34 +13,7 @@ readme = "README.md"
 dynamic = ["version"]
 requires-python = ">=3.11"
 dependencies = [
-    # Pin to the 10.x line: ``decode_account_id`` is re-exported from
-    # ``bittensor.core.chain_data`` (via ``.utils``) here, which
-    # ``hone.chain`` depends on. The 11.x line shuffled chain_data and
-    # dropped that re-export -- without an upper bound, uv resolves
-    # to 11.x and ``import hone`` fails at startup with
-    # ``ImportError: cannot import name 'decode_account_id'``.
-    # The host's working venv was on 10.2.0 so 10.x is the known-good
-    # range.
-    "bittensor==10.2.0",
-    # ``async-substrate-interface`` 1.7.0 migrated from the pure-Python
-    # ``scalecodec`` (~=1.2.11) to the Cython ``cyscale`` library, which
-    # claims the same import namespace. When anything else in the dep
-    # tree still drags ``scalecodec`` in (newer bittensor patches /
-    # ``bt-decode`` transitive resolutions do this), the two collide
-    # and ``async_substrate_interface/__init__.py::_check_conflicts``
-    # raises at import time, killing every container at startup. Cap
-    # at <1.7 so we stay on the scalecodec-only 1.6.x line that
-    # matches the host's known-good 10.2.0 / 1.6.4 / scalecodec-1.2.12
-    # combo.
-    "async-substrate-interface<1.7",
-    # And pin scalecodec exactly: a recent post-1.2.12 release added
-    # ``from .constants import ScaleValue`` to the package
-    # ``__init__.py`` but did not add ``ScaleValue`` to constants.py
-    # (likely a half-merged cyscale-compatibility commit), so any
-    # ``import scalecodec`` blows up with ``ImportError: cannot import
-    # name 'ScaleValue'``. The 1.2.12 wheel on PyPI is the last clean
-    # one and is what the host's working venv has.
-    "scalecodec==1.2.12",
+    "bittensor>=10.2.1",
     "bt-decode",
     "torch>=2.7.1",
     "boto3",
