@@ -61,6 +61,36 @@ class NullMetricsLogger:
         return
 
 
+class _NullDashboardReporter:
+    """No-op stand-in used on every miner rank that is NOT
+    "stage-0 master".
+
+    We can't reuse the real :class:`hone.DashboardReporter` with
+    ``api_url=""`` as a stub: its ``__init__`` falls back to
+    ``os.environ.get("DASHBOARD_API_URL", "")`` whenever ``api_url``
+    is falsy, so a passed-empty-string actually re-enables the
+    reporter from env. With PP > 1 + dp > 1 every rank would then
+    compete for the same hotkey's WebSocket and POST endpoint, which
+    is the source of the cascading "POST /ingest/inner-step failed"
+    + WS-timeout spam in s0/s1 logs.
+
+    Method names on the real reporter change over time
+    (``register_run``, ``report_inner_step``, ``report_miner``,
+    ``report_window``, ``report_slash_event`` ...). Rather than keep
+    a stub method list in sync, we expose a generic ``__getattr__``
+    that returns an async no-op for *any* attribute access. New
+    reporter methods Just Work without touching this class.
+    """
+
+    enabled = False
+
+    async def _async_noop(self, *_args, **_kwargs) -> None:
+        return
+
+    def __getattr__(self, _name: str):
+        return self._async_noop
+
+
 class Miner(BaseNode, Trainer):
     def log_gpu_memory(self, stage: str):
         """Log current GPU memory allocation and reservation"""
@@ -467,9 +497,21 @@ class Miner(BaseNode, Trainer):
         self.wandb = NullMetricsLogger()
         self.metrics_logger = NullMetricsLogger()
 
-        # Dashboard reporter (master rank only — other ranks get a no-op stub
-        # to avoid nonce collisions from multiple ranks signing with the same hotkey)
-        if self.is_master:
+        # Dashboard reporter: ONE per miner total -- stage-0 master.
+        #
+        # ``self.is_master`` is per-torchrun (i.e. the local rank-0 of
+        # this stage's process group), so under PP > 1 every stage has
+        # its own master. Without the extra ``pp_stage_id == 0`` gate,
+        # every PP stage would register a separate run, open its own
+        # WebSocket as the same hotkey, and race on POST /ingest/*.
+        # The dashboard's ws server then disconnects duplicates and
+        # we see the "POST /ingest/inner-step failed" + WS timeout
+        # cascade in the logs. With PP=2 + dp=4 we'd otherwise have
+        # 2 real reporters; keep it at 1.
+        self.is_dashboard_master = (
+            self.is_master and int(getattr(self, "pp_stage_id", 0)) == 0
+        )
+        if self.is_dashboard_master:
             self.dashboard_reporter = hone.DashboardReporter(
                 hotkey=str(self.wallet.hotkey.ss58_address),
                 role="miner",
@@ -482,12 +524,11 @@ class Miner(BaseNode, Trainer):
                 wallet=self.wallet,
             )
         else:
-            self.dashboard_reporter = hone.DashboardReporter(
-                hotkey=str(self.wallet.hotkey.ss58_address),
-                role="miner",
-                netuid=self.config.netuid,
-                api_url="",
-            )
+            # True no-op stub. NB: do NOT use ``DashboardReporter(..., api_url="")``
+            # here -- its ctor falls back to ``DASHBOARD_API_URL`` env when
+            # api_url is falsy, which would silently re-enable the reporter
+            # on every non-stage-0-master rank.
+            self.dashboard_reporter = _NullDashboardReporter()
 
         # Initialize peer related attributes
         self.next_peers: list[int] | None = None
@@ -525,7 +566,7 @@ class Miner(BaseNode, Trainer):
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=CPU_COUNT)
         self.loop.set_default_executor(self.executor)
 
-        if self.is_master:
+        if self.is_dashboard_master:
             await self.dashboard_reporter.register_run()
 
         # Use config peers if provided

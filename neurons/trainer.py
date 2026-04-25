@@ -677,11 +677,27 @@ class Trainer:
                 fully_shard(self.model.lm_head, **fsdp_kwargs)
 
             # RMSNorm is one (hidden_dim,) vector; replicate it.
+            # Final RMSNorm on the last stage. The original code tried
+            # to keep this as a replicated regular ``nn.Parameter`` via
+            # ``ignored_params`` to avoid the all-gather on a tiny
+            # ``(hidden_dim,)`` weight. The cost of that "optimisation"
+            # is much worse: every other param on the last stage is a
+            # DTensor, so when ``clip_grad_norm_`` walks
+            # ``model.parameters()`` it hits a mix of regular Tensor +
+            # DTensor and ``aten._foreach_norm`` raises:
+            #     RuntimeError: aten._foreach_norm.Scalar: got mixed
+            #     torch.Tensor and DTensor, need to convert all
+            #     torch.Tensor to DTensor before calling distributed
+            #     operators!
+            # Fully-shard the norm so its grad is a DTensor too. With
+            # ``dp_shard=4`` and ``hidden_dim=2048`` each rank gets a
+            # 512-element shard -- the all-gather + reduce-scatter on
+            # 2048 floats per step is effectively free.
             if self.pp_is_last_stage and hasattr(self.model, "norm"):
-                ignored_params.update(self.model.norm.parameters())
+                fully_shard(self.model.norm, **fsdp_kwargs)
 
-            # Outer wrapper: anything not yet wrapped (typically nothing
-            # except the ignored norm) inherits a root FSDP hook.
+            # Outer wrapper: anything not yet wrapped inherits a root
+            # FSDP hook.
             fully_shard(
                 self.model, **fsdp_kwargs, ignored_params=ignored_params
             )
