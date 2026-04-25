@@ -441,9 +441,14 @@ class Trainer:
         inside each ``PipelineStageBoundary``) need their *own* FSDP units
         or every call fails with "mixed torch.Tensor and DTensor".
 
-        Tiny modules (RMSNorm, ResBM ``IdentityProjection``) carry no
-        meaningful parameter footprint, so they stay replicated via
-        ``ignored_params`` rather than incurring an extra all-gather.
+        Every parameter in the carved stage MUST end up as a DTensor --
+        ``clip_grad_norm_`` calls ``_foreach_norm`` over all
+        ``model.parameters()`` grads, and that op blows up with
+        "got mixed torch.Tensor and DTensor" if any grad is a plain
+        tensor. The previous code excluded ``model.norm`` via
+        ``ignored_params`` to "save an all-gather", but for a
+        ``(hidden_dim,)`` 1-D vector that all-gather is ~8 KiB --
+        cheaper than the bug.
         """
         try:
             from torch.distributed.fsdp import fully_shard
@@ -455,8 +460,6 @@ class Trainer:
             fsdp_kwargs["mesh"] = self.dp_mesh
 
         if self.pp_stages > 1 and self.pp_stage is not None:
-            ignored_params: set = set()
-
             # Shard each transformer block in the local stage.
             for layer in self.pp_stage.layers:
                 fully_shard(layer, **fsdp_kwargs)
@@ -466,6 +469,7 @@ class Trainer:
             # ``boundary.encoder(x)`` / ``boundary.decoder(c)`` calls
             # trigger the unshard hook. The outer boundary itself stays
             # as a plain nn.Module so ``boundary.encode(...)`` works.
+            # ``IdentityProjection`` has no parameters; nothing to wrap.
             for boundary in (
                 self.pp_stage.input_boundary,
                 self.pp_stage.output_boundary,
@@ -474,7 +478,6 @@ class Trainer:
                     continue
                 fully_shard(boundary.encoder, **fsdp_kwargs)
                 fully_shard(boundary.decoder, **fsdp_kwargs)
-                # IdentityProjection has no parameters, nothing to ignore.
 
             # Stage-edge submodules called directly from ``_pp_run_1f1b``.
             if self.pp_is_first_stage and hasattr(self.model, "embed_tokens"):
@@ -482,15 +485,13 @@ class Trainer:
             if self.pp_is_last_stage and hasattr(self.model, "lm_head"):
                 fully_shard(self.model.lm_head, **fsdp_kwargs)
 
-            # RMSNorm is one (hidden_dim,) vector; replicate it.
-            if self.pp_is_last_stage and hasattr(self.model, "norm"):
-                ignored_params.update(self.model.norm.parameters())
-
-            # Outer wrapper: anything not yet wrapped (typically nothing
-            # except the ignored norm) inherits a root FSDP hook.
-            fully_shard(
-                self.model, **fsdp_kwargs, ignored_params=ignored_params
-            )
+            # Outer wrapper: catches any params not yet wrapped by a
+            # leaf FSDP unit above (notably the final ``model.norm``
+            # RMSNorm on the last stage). Skipping this wrap on the
+            # norm via ``ignored_params`` leaves a plain Tensor mixed
+            # in among DTensor params, which crashes
+            # ``clip_grad_norm_`` -> ``_foreach_norm``.
+            fully_shard(self.model, **fsdp_kwargs)
         else:
             for layer in self.model.layers:
                 fully_shard(layer, **fsdp_kwargs)
