@@ -99,7 +99,7 @@
 
     "pipeline": {
         "enabled": true,
-        "num_stages": 2,
+        "num_stages": 3,
         "bottleneck_dim": 16
     }
 }

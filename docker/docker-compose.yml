@@ -3,22 +3,33 @@
 # UID per (cold, hot) pair regardless of how many stage containers
 # back it).
 #
-# Layout (default values shown for the GPU map; override via .env):
+# Default 8-GPU layout (override via .env):
 #
-#   validator           GPU 0          (FSDP within the process)
-#   miner-s0            GPU 1          (PP stage 0)
-#   miner-s1            GPU 2          (PP stage 1)
+#   validator           GPUs 0,1       (FSDP, NPROC=2)
+#   miner-s0            GPUs 2,3       (PP stage 0, FSDP NPROC=2)
+#   miner-s1            GPUs 4,5       (PP stage 1, FSDP NPROC=2)
+#   miner-s2            GPUs 6,7       (PP stage 2, FSDP NPROC=2)
 #
-# Each stage is its own service so we can pin a specific GPU to it
+# Each stage is its own service so we can pin specific GPUs to it
 # and inspect its logs in isolation. The PP transport's
 # --pp-peer-host-{prev,next} just point at the sibling service name;
 # Docker's embedded DNS does the rest. Listen ports stay the same
 # across stages (each container is in its own netns, no collision).
 #
-# To add stage 2 / 3 / N for a deeper pipeline: copy the miner-s1
-# block, rename to miner-s{N}, set PP_STAGE=N and PP_NUM_STAGES=N+1
-# on every stage, and chain PP_PEER_HOST_NEXT/PREV through. Make sure
-# ``pipeline.num_stages`` in hparams.json matches.
+# IMPORTANT GPU/NPROC constraints (see hone/docker/.env for details):
+#   1. ``MINER_S*_NPROC`` MUST all be equal -- the PP transport pairs
+#      ranks 1-to-1 across stages and the sampler strides by
+#      ``rank :: world_size``, so asymmetric NPROC hangs and desyncs.
+#   2. Each NPROC must be a divisor of the model ``hidden_dim`` (2048
+#      for 8B-A1B). FSDP pads weight shards along dim 0 when the dim
+#      isn't divisible, and the padded full shape then mismatches the
+#      original param shape during ``restore_offloaded_params``.
+#      Valid values for hidden_dim=2048: {1, 2, 4, 8}.
+#
+# To bump the pipeline to N stages: copy the miner-s1 block (which is
+# already a middle stage with both PREV and NEXT chained), rename to
+# miner-s{N-1}/.../miner-s{K}, set PP_STAGE on each, and update
+# ``PP_NUM_STAGES`` + ``pipeline.num_stages`` in hparams.json.
 
 x-common-env: &common-env
   # R2 / S3 credentials (gradients + dataset). Read from .env.
@@ -100,8 +111,8 @@ services:
       # YAML lists. NPROC_PER_NODE drives torchrun in the entrypoint;
       # match it to the count of GPUs and to fsdp.dp_shard in
       # hparams.json or FSDP won't shard the model.
-      NVIDIA_VISIBLE_DEVICES: ${VALIDATOR_GPU_IDS:-0}
-      NPROC_PER_NODE: ${VALIDATOR_NPROC:-1}
+      NVIDIA_VISIBLE_DEVICES: ${VALIDATOR_GPU_IDS:-0,1}
+      NPROC_PER_NODE: ${VALIDATOR_NPROC:-2}
     restart: unless-stopped
 
   # ----------------------------- MINER STAGES ------------------------
@@ -130,7 +141,7 @@ services:
       WALLET_NAME: ${MINER_WALLET_NAME}
       WALLET_HOTKEY: ${MINER_WALLET_HOTKEY}
       PP_STAGE: "0"
-      PP_NUM_STAGES: "${PP_NUM_STAGES:-2}"
+      PP_NUM_STAGES: "${PP_NUM_STAGES:-3}"
       # Stage 0 only sends *forward* to stage 1 and receives *grad*
       # back. ``--pp-peer-host-prev`` is unused on stage 0; we pass the
       # default 127.0.0.1 from the entrypoint.
@@ -138,12 +149,12 @@ services:
       PP_PEER_PORT_BASE_NEXT: "50000"
       PP_LISTEN_PORT_BASE: "50000"
       HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
-      # NVIDIA_VISIBLE_DEVICES takes a CSV ("4,5") so we can
+      # NVIDIA_VISIBLE_DEVICES takes a CSV ("2,3") so we can
       # parameterise multi-GPU intra-stage FSDP from .env. The
       # entrypoint flips to torchrun when NPROC_PER_NODE > 1; match
       # it to the GPU count and to fsdp.dp_shard in hparams.json.
-      NVIDIA_VISIBLE_DEVICES: ${MINER_S0_GPU_IDS:-1}
-      NPROC_PER_NODE: ${MINER_S0_NPROC:-1}
+      NVIDIA_VISIBLE_DEVICES: ${MINER_S0_GPU_IDS:-2,3}
+      NPROC_PER_NODE: ${MINER_S0_NPROC:-2}
       # Each torchrun world needs its own master_port: stage 0 and
       # stage 1 run separate NCCL worlds, both bind to localhost in
       # their own netns, but using distinct ports keeps logs clean
@@ -156,6 +167,12 @@ services:
     # See comment on miner-s0: image is built once by the validator
     # service. ``depends_on: [validator]`` below ensures the build
     # has happened before this service starts.
+    #
+    # MIDDLE stage in a >=3-stage pipeline: needs BOTH PP_PEER_HOST_PREV
+    # (to receive activations from miner-s0) and PP_PEER_HOST_NEXT
+    # (to forward activations to miner-s2). When PP_NUM_STAGES=2 the
+    # _NEXT chain just dangles harmlessly -- stage 1 is then the tail
+    # and never opens a forward connection.
     image: hone:latest
     pull_policy: never
     hostname: miner-s1
@@ -169,13 +186,45 @@ services:
       WALLET_NAME: ${MINER_WALLET_NAME}
       WALLET_HOTKEY: ${MINER_WALLET_HOTKEY}
       PP_STAGE: "1"
-      PP_NUM_STAGES: "${PP_NUM_STAGES:-2}"
+      PP_NUM_STAGES: "${PP_NUM_STAGES:-3}"
       PP_PEER_HOST_PREV: miner-s0
+      PP_PEER_PORT_BASE_PREV: "50000"
+      PP_PEER_HOST_NEXT: miner-s2
+      PP_PEER_PORT_BASE_NEXT: "50000"
+      PP_LISTEN_PORT_BASE: "50000"
+      HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
+      NVIDIA_VISIBLE_DEVICES: ${MINER_S1_GPU_IDS:-4,5}
+      NPROC_PER_NODE: ${MINER_S1_NPROC:-2}
+      MASTER_PORT: "29500"
+    depends_on: [validator]
+    restart: unless-stopped
+
+  miner-s2:
+    # Tail stage in the default 3-stage layout. Receives activations
+    # from miner-s1 and computes the LM head + loss. No PP_PEER_HOST_NEXT
+    # (the entrypoint defaults that to 127.0.0.1, and ``--pp-stage``
+    # being the last stage means PPTransport never opens a forward
+    # connection).
+    image: hone:latest
+    pull_policy: never
+    hostname: miner-s2
+    container_name: hone-miner-s2
+    runtime: nvidia
+    networks: [hone-net]
+    volumes: *common-volumes
+    environment:
+      <<: *common-env
+      NODE_TYPE: miner
+      WALLET_NAME: ${MINER_WALLET_NAME}
+      WALLET_HOTKEY: ${MINER_WALLET_HOTKEY}
+      PP_STAGE: "2"
+      PP_NUM_STAGES: "${PP_NUM_STAGES:-3}"
+      PP_PEER_HOST_PREV: miner-s1
       PP_PEER_PORT_BASE_PREV: "50000"
       PP_LISTEN_PORT_BASE: "50000"
       HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
-      NVIDIA_VISIBLE_DEVICES: ${MINER_S1_GPU_IDS:-2}
-      NPROC_PER_NODE: ${MINER_S1_NPROC:-1}
+      NVIDIA_VISIBLE_DEVICES: ${MINER_S2_GPU_IDS:-6,7}
+      NPROC_PER_NODE: ${MINER_S2_NPROC:-2}
       MASTER_PORT: "29500"
     depends_on: [validator]
     restart: unless-stopped

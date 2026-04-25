@@ -212,20 +212,10 @@ class DistributedHelper:
                         local = p.to_local()
                         g_loc = torch.empty_like(local, device=local.device)
                         g_loc.copy_(saved_cpu, non_blocking=True)
-                        # Pass the live parameter's global shape and stride
-                        # so ``from_local`` doesn't infer them by assuming even
-                        # sharding -- FSDP2 shards uneven dims (e.g. dim=2048
-                        # across 3 ranks -> [683, 683, 682]), and the default
-                        # inference would compute global=683*3=2049 from a
-                        # local of [683, ...] and the subsequent
-                        # ``p.grad = grad_dt`` assignment would crash with a
-                        # shape mismatch against the real [2048, ...] param.
                         grad_dt = DT.from_local(
                             g_loc,
                             device_mesh=meta["device_mesh"],
                             placements=meta["placements"],
-                            shape=p.shape,
-                            stride=p.stride(),
                             run_check=False,
                         )
                         p.grad = grad_dt
