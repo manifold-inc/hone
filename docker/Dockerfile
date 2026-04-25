@@ -1,20 +1,26 @@
 # syntax=docker/dockerfile:1.6
 #
-# Hone training image. Bakes in CUDA 12.6 + cuDNN, Python 3.12, uv, and
+# Hone training image. Bakes in CUDA 12.8 + cuDNN, Python 3.12, uv, and
 # the hone package installed editable so source-tree edits are picked
 # up on the next container restart without a rebuild.
 #
-# B200 / H200 require CUDA 12.4+; we pin 12.6.3 explicitly because
-# pytorch.org's cu124 wheel index caps at torch 2.6.0 while
-# pyproject.toml requires torch>=2.7.1 -- the cu126 index has 2.7.x
-# wheels and remains B200-compatible (12.6 supersedes 12.4 ABI).
+# B200 (Blackwell, sm_100) requires CUDA 12.8 wheels of PyTorch:
+#   * cu124 wheels cap at torch 2.6.0 (no Blackwell support).
+#   * cu126 wheels carry torch 2.7.x but the precompiled fatbinaries
+#     only cover sm_50/60/70/75/80/86/90 -- the very first GPU op on
+#     a B200 fails with ``cudaErrorNoKernelImageForDevice`` /
+#     ``no kernel image is available for execution on the device``.
+#   * cu128 wheels add sm_100 (Blackwell) + sm_120; this is the line
+#     PyTorch publishes Blackwell support against.
+# Match the CUDA runtime in the base image to the wheel ABI by using
+# the 12.8 base.
 #
 # Use the *runtime* (not -devel) CUDA variant: the PyTorch wheel
 # bundles every CUDA shared lib it needs and Triton bundles its own
 # ``ptxas`` for JIT, so we don't need ``nvcc`` / headers / static
 # libs. That cuts image size by ~3 GiB and shaves ~30-60s off the
 # layer-export step that finalises the build.
-ARG CUDA_VERSION=12.6.3
+ARG CUDA_VERSION=12.8.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -68,18 +74,19 @@ COPY pyproject.toml /app/pyproject.toml
 COPY src/hone/__init__.py /app/src/hone/__init__.py
 
 # Resolve the dep set first so this layer caches across source edits.
-# Torch is pinned to the cu126 wheel index so we get the matching
-# CUDA runtime baked into the image (cu124 caps at torch 2.6.0).
+# Torch is pinned to the cu128 wheel index so the precompiled kernels
+# cover B200 / Blackwell (sm_100); cu124 caps at torch 2.6.0 and
+# cu126 wheels lack sm_100 fatbinaries.
 # ``--index-strategy unsafe-best-match`` lets uv consider PyPI for
 # everything that's NOT torch (transitive deps that aren't on the
-# pytorch index), otherwise the cu126 index would shadow PyPI for
+# pytorch index), otherwise the cu128 index would shadow PyPI for
 # unrelated packages.
 RUN uv venv --python 3.12 /opt/hone-venv \
     && . /opt/hone-venv/bin/activate \
     && uv pip install --no-cache --upgrade pip wheel \
     && uv pip install --no-cache \
         --index-strategy unsafe-best-match \
-        --extra-index-url https://download.pytorch.org/whl/cu126 \
+        --extra-index-url https://download.pytorch.org/whl/cu128 \
         "torch>=2.7.1"
 
 # Bring in the rest of the source and install the project in
