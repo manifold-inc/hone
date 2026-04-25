@@ -7,9 +7,9 @@
     "sequence_length": 4096,
     "micro_batch_size": 4,
     "target_batch_size": 1024,
-    "batch_size": 128,
-    "inner_steps": 8,
-    "max_inner_steps": 80,
+    "batch_size": 256,
+    "inner_steps": 4,
+    "max_inner_steps": 40,
     "outer_learning_rate": 0.1,
     "outer_momentum": 0.5,
     "outer_nesterov": false,
@@ -97,7 +97,7 @@
 
     "offload_optimizer_states": true,
     "fsdp": {
-        "dp_shard": 2,
+        "dp_shard": 4,
         "compile": true,
         "mixed_precision": "bfloat16",
         "activation_checkpoint": "selective"
@@ -105,7 +105,7 @@
 
     "pipeline": {
         "enabled": true,
-        "num_stages": 3,
+        "num_stages": 2,
         "bottleneck_dim": 16
     },
 
