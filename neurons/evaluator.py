@@ -59,11 +59,15 @@ import uvloop
 
 import hone
 from hone.distributed import dist_helper
+from neurons.trainer import Trainer
 
-# We deliberately do NOT inherit BaseNode/Trainer here -- the evaluator
-# does not need the full miner/validator scaffolding (no peer comms /
-# scoring loop / chain weights). What we need from those modules is the
-# init pattern, which we replicate inline.
+# We inherit from Trainer (but NOT BaseNode -- the evaluator drives its
+# own polling loop instead of the miner/validator chain-block listener)
+# so that ``Trainer.init_model``'s internal calls to ``self._pp_setup``,
+# ``self._apply_fsdp``, ``self._apply_activation_checkpointing``, and
+# ``self._apply_torch_compile`` resolve to bound methods on the
+# Evaluator instance. Without inheritance those calls fail with
+# ``AttributeError: 'Evaluator' object has no attribute '_pp_setup'``.
 
 # GPU determinism / TF32 (matches validator/miner setup).
 torch.manual_seed(42)
@@ -436,7 +440,7 @@ def _evaluate_task(
 # ----------------------------------------------------------------------
 # Evaluator class
 # ----------------------------------------------------------------------
-class Evaluator:
+class Evaluator(Trainer):
     """Polling evaluator. One per torchrun job; expects 1-4 GPUs.
 
     Lifecycle (mirrors templar's at the contract level):
@@ -540,6 +544,10 @@ class Evaluator:
 
     def __init__(self) -> None:
         hone.logger.info("[Evaluator] starting initialization")
+        # Trainer.__init__ is trivial (sets inner_scheduler_step_count=0)
+        # but we call it for forward-compat in case it grows state we'd
+        # otherwise miss.
+        super().__init__()
         self.config = self.evaluator_config()
 
         # Distributed init -- same pattern as the validator. The eval
@@ -587,20 +595,23 @@ class Evaluator:
             self.comms, uid=self.uid, version=self.version
         )
 
-        # Build the model on meta device and let FSDP-or-not place it.
-        # The validator-style ``init_model(meta=True)`` runs FSDP
-        # wrapping for us; we reuse the same ``Trainer`` machinery to
-        # avoid drift.
-        from neurons.trainer import Trainer
-
-        self._trainer = Trainer  # for type only
-        # Build a barebones Trainer instance manually. We can't
-        # ``Trainer.__init__()`` cleanly without going through the
-        # node base, so we set the minimal attrs ``init_model`` reads.
-        self._init_trainer_shim()
-        # ``pp_degree=1`` -- evaluator never runs PP.
+        # Set the minimal Trainer attributes that ``init_model``
+        # reads off self before invoking the inherited init pipeline
+        # (``_pp_setup`` -> ``_apply_activation_checkpointing`` ->
+        # ``_apply_fsdp`` -> ``_apply_torch_compile``). We're inherited
+        # from Trainer so all those methods are bound on us.
+        #
+        # ``pp_degree=1`` -- evaluator never runs PP. Even when running
+        # 4 ranks, those ranks form a single FSDP DP group and walk a
+        # single (full) model copy; PP is meaningless for read-only
+        # forward-pass scoring.
+        self.dp_shard = int(
+            getattr(self.hparams.fsdp, "dp_shard", self.world_size)
+        )
+        self.amp_dtype = torch.bfloat16
+        self.pp_stage_id = 0
         self.pp_degree = 1
-        Trainer.init_model(self, validator=True, meta=True)
+        self.init_model(validator=True, meta=True)
         # Materialize on device; weights are filled by DCP load.
         self.model = self.model.to_empty(device=str(self.device))
 
@@ -633,20 +644,6 @@ class Evaluator:
 
         self.stop_event = asyncio.Event()
         hone.logger.info("[Evaluator] initialization complete")
-
-    # ------------------------------------------------------------------
-    # Trainer shim
-    # ------------------------------------------------------------------
-    def _init_trainer_shim(self) -> None:
-        """Set the minimum set of attributes that :meth:`Trainer.init_model`
-        reads off ``self`` so we can call it without inheriting from
-        :class:`neurons.trainer.Trainer` and dragging in its full ctor.
-        """
-        # The trainer pulls these off self in init_model.
-        self.dp_shard = int(getattr(self.hparams.fsdp, "dp_shard", self.world_size))
-        self.amp_dtype = torch.bfloat16
-        # PP attrs the trainer touches; keep PP off for the evaluator.
-        self.pp_stage_id = 0
 
     # ------------------------------------------------------------------
     # Checkpoint discovery
