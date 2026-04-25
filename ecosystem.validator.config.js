@@ -8,8 +8,26 @@
 // all 8 GPUs for the 3-stage PP miner. This file is intended to live
 // on the *second* 8xB200 box dedicated to subnet duties.
 
-const UV = "/home/cvm/.local/bin/uv";
-const CWD = "/home/cvm/hone";
+const { execSync } = require('child_process');
+
+function findUv() {
+  try {
+    // 'whereis -b uv' returns lines like: "uv: /root/.local/bin/uv"
+    const output = execSync('whereis -b uv').toString().trim();
+    const match = output.match(/uv:\s*(\S+)/);
+    if (match) {
+      return match[1];
+    } else {
+      throw new Error('uv binary not found in whereis output');
+    }
+  } catch (e) {
+    // Fallback to common install location if not found
+    return '/usr/local/bin/uv';
+  }
+}
+
+const UV = findUv();
+const CWD = "~/hone";
 
 // Hone API endpoint the dashboard reads from. Override via env when
 // pointing at a non-prod stack.
