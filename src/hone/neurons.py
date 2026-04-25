@@ -44,6 +44,45 @@ if TYPE_CHECKING:
 NeuronT = TypeVar("NeuronT", "Miner", "Validator")
 
 
+# PyTorch wrappers (torch.compile, checkpoint_wrapper, FSDP1) splice
+# magic tokens into ``named_parameters()`` keys. They're orthogonal to
+# the model's logical structure, but their position depends on the
+# *order* of wrapping. Validator wraps root + AC + compile, so its
+# keys look like ``_orig_mod.layers.5._checkpoint_wrapped_module.mlp.weight``.
+# PP miner wraps per-layer + AC + per-leaf compile, so its keys look
+# like ``stage.layers.5._orig_mod._checkpoint_wrapped_module.mlp.weight``.
+# Different positions for the same logical param -> validator's
+# expected set never matches the miner's upload, every UID gets
+# rejected with a giant "extra keys" log spam ("skipping UID 174 due
+# to validation failures"). Stripping these tokens uniformly on both
+# sides gives both wrapping orders a single agreed namespace
+# (``layers.5.mlp.weight``).
+import re as _re
+
+_WRAPPER_TOKENS = (
+    "_orig_mod",  # torch.compile (Dynamo)
+    "_checkpoint_wrapped_module",  # checkpoint_wrapper (selective AC)
+    "_fsdp_wrapped_module",  # FSDP1 wrap (kept for safety; FSDP2 doesn't add it)
+    "module",  # nn.parallel.DistributedDataParallel root
+)
+_WRAPPER_TOKEN_RE = _re.compile(
+    r"(?:^|(?<=\.))(?:" + "|".join(_re.escape(t) for t in _WRAPPER_TOKENS) + r")\."
+)
+
+
+def _strip_wrapper_prefixes(name: str) -> str:
+    """Remove every wrapper token (``_orig_mod.``, ``_checkpoint_wrapped_module.``,
+    etc.) from ``name``, anywhere in the dotted path.
+
+    The regex matches a wrapper token only when it sits at the start
+    of the string OR immediately after a dot, so we don't accidentally
+    chew up a real submodule that happens to *contain* one of these
+    substrings as a suffix (e.g. ``my_module.``). Run repeatedly is
+    safe (idempotent).
+    """
+    return _WRAPPER_TOKEN_RE.sub("", name)
+
+
 def canonical_param_names(model: nn.Module) -> dict[str, str | None]:
     """Map ``model.named_parameters()`` keys to cross-rank-stable canonical
     names so PP miners and plain-``LoopLM`` validators can agree on the
@@ -58,11 +97,24 @@ def canonical_param_names(model: nn.Module) -> dict[str, str | None]:
     Models that don't define ``get_canonical_param_names`` are assumed to
     already use the canonical namespace (the validator's plain ``LoopLM``
     falls into this bucket), so we return an identity mapping.
+
+    All returned canonical names are post-processed to strip PyTorch
+    wrapper tokens (``_orig_mod.``, ``_checkpoint_wrapped_module.``,
+    ``_fsdp_wrapped_module.``) so callers don't have to reason about
+    whether the model was compiled / activation-checkpointed / FSDP-
+    wrapped, in what order. Wrapping order varies between PP and
+    non-PP code paths and used to silently break gradient
+    aggregation across miner/validator topologies.
     """
     fn = getattr(model, "get_canonical_param_names", None)
     if callable(fn):
-        return fn()
-    return {n: n for n, _ in model.named_parameters()}
+        raw = fn()
+    else:
+        raw = {n: n for n, _ in model.named_parameters()}
+    return {
+        src: (None if dst is None else _strip_wrapper_prefixes(dst))
+        for src, dst in raw.items()
+    }
 
 
 def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = False):
