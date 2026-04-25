@@ -1422,9 +1422,24 @@ class Trainer:
         t0 = time.time()
         n_states = sum(1 for _ in self._iter_inner_opt_state_tensors())
         if factor >= 1.0:
+            # Hard clear: Muon / Adam will lazily re-allocate fresh
+            # zero buffers on the next ``.step()`` call, on the
+            # param's own device. Discard whatever's offloaded.
             self.inner_optimizer.state.clear()
             mode = "clear"
         else:
+            # Soft decay: we must touch every state tensor in place.
+            # If they're currently offloaded to pinned CPU (the steady
+            # state at the end of every window) we have to bring them
+            # back to GPU first, otherwise the next ``optimizer.step()``
+            # will run ``buf.lerp_(grad, ...)`` with ``buf`` on CPU
+            # and ``grad`` on cuda -- raising
+            #   RuntimeError: Expected all tensors to be on the same
+            #   device, but found at least two devices, cuda:N and cpu!
+            # ``prefetch_inner_optimizer_states`` is a no-op when
+            # ``_inner_opt_offloaded`` is False, so calling it
+            # unconditionally is safe and cheap.
+            self.prefetch_inner_optimizer_states(log=False)
             for s, k, v in self._iter_inner_opt_state_tensors():
                 if torch.is_tensor(v) and v.is_floating_point():
                     v.mul_(factor)
@@ -1435,8 +1450,10 @@ class Trainer:
             self.warmup_steps_taken = 0
             warmup_was_reset = True
 
-        # We just modified what would have been on GPU; mark not-
-        # offloaded so a follow-up prefetch is correctly skipped.
+        # State now lives on GPU (either freshly prefetched + decayed,
+        # or freshly cleared and about to be lazily re-allocated on
+        # GPU by the next .step()). Mark not-offloaded so the next
+        # prefetch is correctly a no-op.
         self._inner_opt_offloaded = False
 
         if log and getattr(self, "is_master", True):

@@ -68,7 +68,16 @@ class DashboardReporter:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._ws_authenticated = False
         self._ws_connect_failures = 0
-        self._ws_max_failures = 5
+        # Backoff window after a burst of failed reconnects. The miner
+        # asyncio loop shares time with CUDA-bound training steps; a
+        # 12s inner step can starve the heartbeat task long enough for
+        # the server to disconnect us. Instead of permanently disabling
+        # the WS after N failures (the old behaviour, which silently
+        # locked the reporter into HTTP-only fallback for the rest of
+        # the run), back off for ``_ws_backoff_until`` and try again.
+        self._ws_backoff_threshold = 5
+        self._ws_backoff_seconds = 30.0
+        self._ws_backoff_until: float = 0.0
         self._ws_heartbeat_task: asyncio.Task | None = None
         self._ws_connecting = False
 
@@ -151,7 +160,18 @@ class DashboardReporter:
             return False
         if self._ws_connecting:
             return False
-        if self._ws_connect_failures >= self._ws_max_failures:
+        # Soft backoff: after a burst of N failures we wait
+        # ``_ws_backoff_seconds`` before retrying. Crucially this is a
+        # *temporary* freeze, not a permanent one -- the WS will come
+        # back automatically once the asyncio loop has time to breathe
+        # again. The old code permanently disabled WS after 5 fails,
+        # which silently locked the reporter into HTTP-only fallback
+        # for the remainder of the training run.
+        now = time.monotonic()
+        if (
+            self._ws_connect_failures >= self._ws_backoff_threshold
+            and now < self._ws_backoff_until
+        ):
             return False
 
         self._ws_connecting = True
@@ -177,6 +197,7 @@ class DashboardReporter:
             if resp.get("type") == "auth-ok":
                 self._ws_authenticated = True
                 self._ws_connect_failures = 0
+                self._ws_backoff_until = 0.0
                 self._start_heartbeat()
                 logger.info("[DashboardReporter] WebSocket connected and authenticated")
                 return True
@@ -184,17 +205,29 @@ class DashboardReporter:
                 logger.warning(f"[DashboardReporter] WS auth rejected: {resp}")
                 await self._ws.close()
                 self._ws = None
-                self._ws_connect_failures += 1
+                self._record_ws_failure()
                 return False
 
         except Exception as e:
-            logger.warning(f"[DashboardReporter] WS connect failed: {e}")
+            # Use repr() so e.g. ``asyncio.TimeoutError`` (whose str()
+            # is empty) shows up as "TimeoutError()" in the log instead
+            # of an unhelpful blank "WS connect failed:" line.
+            logger.warning(f"[DashboardReporter] WS connect failed: {e!r}")
             self._ws = None
             self._ws_authenticated = False
-            self._ws_connect_failures += 1
+            self._record_ws_failure()
             return False
         finally:
             self._ws_connecting = False
+
+    def _record_ws_failure(self) -> None:
+        """Bump the failure counter and arm the backoff window if we
+        crossed the threshold. Resets on the next successful auth."""
+        self._ws_connect_failures += 1
+        if self._ws_connect_failures >= self._ws_backoff_threshold:
+            self._ws_backoff_until = (
+                time.monotonic() + self._ws_backoff_seconds
+            )
 
     def _start_heartbeat(self):
         if self._ws_heartbeat_task and not self._ws_heartbeat_task.done():
@@ -264,7 +297,9 @@ class DashboardReporter:
                         f"[DashboardReporter] POST {path} returned {resp.status}: {body[:200]}"
                     )
         except Exception as e:
-            logger.warning(f"[DashboardReporter] POST {path} failed: {e}")
+            # ``repr`` so empty-string exceptions like
+            # ``asyncio.TimeoutError`` are still identifiable in logs.
+            logger.warning(f"[DashboardReporter] POST {path} failed: {e!r}")
 
     # ── Unified send: try Redis → WS → HTTP ────────────────────────────
 
