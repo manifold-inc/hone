@@ -138,7 +138,50 @@ class DistributedHelper:
         dist.all_gather_object(object_list, obj)
         return object_list
 
+    def _force_reshard(self, model: torch.nn.Module) -> None:
+        """Force every FSDP2 unit in ``model`` back to the sharded state.
+
+        ``_pp_run_1f1b`` calls leaf submodules (``embed_tokens``,
+        ``lm_head``, ``model.norm``, ``output_boundary.encoder``,
+        ``output_boundary.decoder``, ...) directly, NOT through the
+        root model's forward. FSDP2's post-backward reshard callback
+        is hooked off the root forward; when that root forward never
+        runs, some leaf units are left in the *unsharded* state where
+        ``param.data`` is the full-shape plain Tensor instead of the
+        local-shard DTensor. Iterating ``model.parameters()`` then
+        observes a mix of sharded (DTensor, local shape (32, 2048))
+        and unsharded (plain Tensor, full shape (64, 2048)) params,
+        which breaks any code (offload/restore/checkpoint/etc.) that
+        assumes a consistent state across all params.
+
+        ``FSDPModule.reshard()`` (added by ``fully_shard``) puts the
+        unit back to the sharded state synchronously. Walking the
+        module tree and calling it on every FSDP unit is cheap and
+        idempotent; for already-sharded units it's a no-op.
+        """
+        try:
+            from torch.distributed.fsdp import FSDPModule
+        except ImportError:
+            try:
+                from torch.distributed._composable.fsdp import FSDPModule
+            except ImportError:
+                return
+        for sub in model.modules():
+            if isinstance(sub, FSDPModule):
+                try:
+                    sub.reshard()
+                except Exception:
+                    # Best-effort: if reshard fails for any reason,
+                    # the meta-driven branch in restore_offloaded_params
+                    # below will still cope. Don't kill the run.
+                    pass
+
     def get_offloaded_params(self, model: torch.nn.Module) -> tuple:
+        # Make sure every FSDP unit is in its sharded (DTensor) state
+        # before snapshotting; otherwise we'd save full-shape buffers
+        # for some params and local-shape buffers for others, and the
+        # corresponding restore would then mismatch sizes.
+        self._force_reshard(model)
         params_offloaded = []
         param_info = []
         stream = self._get_offload_stream(model)
@@ -199,6 +242,11 @@ class DistributedHelper:
         params_offloaded: list,
         param_specs: list,
     ) -> None:
+        # Same rationale as in ``get_offloaded_params``: FSDP2 may have
+        # left some leaf units in the unsharded state after
+        # ``_pp_run_1f1b``'s direct submodule calls. Reshard before
+        # iterating so ``isinstance(p, DT)`` agrees with what we saved.
+        self._force_reshard(model)
         stream = self._get_offload_stream(model)
         if stream is not None:
             stream.wait_stream(torch.cuda.current_stream())
@@ -208,8 +256,37 @@ class DistributedHelper:
             with ctx:
                 it = zip(zip(params_offloaded, param_specs), model.parameters())
                 for (saved_cpu, meta), p in it:
-                    if isinstance(p, DT) and meta.get("is_dtensor", False):
+                    # Drive the branch off the saved meta, NOT off
+                    # ``isinstance(p, DT)``. The meta is the source of
+                    # truth: it tells us whether ``saved_cpu`` is a
+                    # DTensor's local shard (``is_dtensor=True``) or a
+                    # plain-tensor full snapshot (``is_dtensor=False``).
+                    # If FSDP unfortunately leaves ``p`` in the wrong
+                    # state we still know how to interpret the buffer.
+                    if meta.get("is_dtensor", False):
+                        # After ``_force_reshard`` ``p`` MUST be a
+                        # DTensor whose local shape matches what we
+                        # saved. If not, fail loudly with the actual
+                        # mismatch -- silently coercing would corrupt
+                        # the outer-step delta math (``saved - p``)
+                        # and poison every subsequent step.
+                        if not isinstance(p, DT):
+                            raise RuntimeError(
+                                "[restore_offloaded_params] meta says "
+                                "param was a DTensor at offload but at "
+                                f"restore p is plain (shape={tuple(p.shape)}); "
+                                "FSDP _force_reshard didn't put this unit "
+                                "back to sharded state. Saved local_shape="
+                                f"{meta.get('local_shape')}."
+                            )
                         local = p.to_local()
+                        if local.shape != saved_cpu.shape:
+                            raise RuntimeError(
+                                "[restore_offloaded_params] local shard "
+                                f"shape {tuple(local.shape)} != saved CPU "
+                                f"shape {tuple(saved_cpu.shape)}; saved meta "
+                                f"local_shape={meta.get('local_shape')}"
+                            )
                         g_loc = torch.empty_like(local, device=local.device)
                         g_loc.copy_(saved_cpu, non_blocking=True)
                         grad_dt = DT.from_local(
