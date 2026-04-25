@@ -1699,6 +1699,18 @@ class Trainer:
                         self.model.parameters(),
                         getattr(self.hparams, "max_grad_norm", 1.0),
                     )
+                    # Under FSDP2 with ``dp_shard > 1``, ``clip_grad_norm_``
+                    # returns a ``DTensor`` scalar whose ``__format__``
+                    # rejects spec strings like ``{x:.4f}`` with
+                    # ``TypeError: unsupported format string passed to
+                    # DTensor.__format__``. Replicate the scalar onto
+                    # the local rank so the value is a regular
+                    # ``torch.Tensor`` for ``isfinite`` + every f-string
+                    # below + the dashboard reporter. Cheap (single-
+                    # element all-gather, already amortized by the
+                    # surrounding all-reduce that produced the norm).
+                    if hasattr(grad_norm, "full_tensor"):
+                        grad_norm = grad_norm.full_tensor()
                     if torch.isfinite(grad_norm):
                         self.scaler.step(self.inner_optimizer)
                     else:

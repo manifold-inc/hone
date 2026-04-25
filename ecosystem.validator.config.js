@@ -20,6 +20,43 @@ const path = require("path");
 // ENOENT and pidusage logs "One of the pids provided is invalid".
 const CWD = __dirname;
 
+// PM2 does NOT auto-load .env files. The Python ``hone`` package does
+// (via python-dotenv on ``import hone``), but anything we explicitly
+// set in the ``env:`` block below *overrides* dotenv -- so if we pass
+// HONE_EVAL_API_KEY="" because process.env didn't have it, the Python
+// side can never recover the real value from .env. Solve that by
+// reading hone/.env ourselves at config load time and merging into
+// process.env (without overwriting anything already exported by the
+// shell/PM2). The parser is intentionally tiny -- the .env we ship is
+// plain ``KEY=VALUE`` lines, no quoting / expansion.
+function loadDotenv(envPath) {
+  if (!fs.existsSync(envPath)) return {};
+  const out = {};
+  for (const raw of fs.readFileSync(envPath, "utf8").split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    // Strip surrounding quotes if any were used.
+    if (
+      (val.startsWith('"') && val.endsWith('"')) ||
+      (val.startsWith("'") && val.endsWith("'"))
+    ) {
+      val = val.slice(1, -1);
+    }
+    out[key] = val;
+    // Don't clobber an explicit shell export, but DO populate when
+    // unset so the rest of this config file can read process.env.X.
+    if (process.env[key] === undefined || process.env[key] === "") {
+      process.env[key] = val;
+    }
+  }
+  return out;
+}
+const _dotenvLoaded = loadDotenv(path.join(CWD, ".env"));
+
 // UV: try the most reliable lookups in order, fall back to common
 // install paths. We need an *existing* file (PM2 spawns it directly,
 // so a missing path = failed spawn = the same pidusage error).
@@ -74,10 +111,13 @@ const UV = findUv();
 const HONE_API_BASE_URL =
   process.env.HONE_API_BASE_URL || "https://api.hone.training";
 
-// The eval ingest API key MUST be set in the validator-box environment
-// (e.g. /etc/profile.d/hone.sh) -- pm2 will inherit it. This is the
-// SAME value as hone-api's API_KEY env var so the evaluator can write.
-const HONE_EVAL_API_KEY = process.env.HONE_EVAL_API_KEY || "";
+// The eval ingest API key. Source order: shell env > hone/.env (loaded
+// above) > unset. We deliberately do NOT default to "" here because an
+// empty string in PM2's ``env:`` block would *override* whatever
+// python-dotenv loads from .env on ``import hone`` -- locking the
+// Python side out of the value entirely. Leave undefined when missing
+// and pass it through conditionally below.
+const HONE_EVAL_API_KEY = process.env.HONE_EVAL_API_KEY;
 
 // HF cache: keep on the running user's home so we don't redownload
 // datasets each container restart. Operator can override with
@@ -88,11 +128,32 @@ const HF_DATASETS_CACHE =
   process.env.HF_DATASETS_CACHE || path.join(HF_HOME, "datasets");
 
 // Surface the resolved paths so a quick ``pm2 logs`` shows what we picked
-// instead of forcing the operator to re-derive it from the trace.
+// instead of forcing the operator to re-derive it from the trace. Don't
+// log the actual key -- just whether we resolved one and where from.
+const _evalKeyState = HONE_EVAL_API_KEY
+  ? `set (${HONE_EVAL_API_KEY.length} chars)`
+  : "MISSING";
 console.error(
   `[ecosystem.validator] resolved UV=${UV} CWD=${CWD} ` +
-    `HF_HOME=${HF_HOME} HONE_API_BASE_URL=${HONE_API_BASE_URL}`
+    `HF_HOME=${HF_HOME} HONE_API_BASE_URL=${HONE_API_BASE_URL} ` +
+    `HONE_EVAL_API_KEY=${_evalKeyState} ` +
+    `(dotenv loaded ${Object.keys(_dotenvLoaded).length} keys)`
 );
+
+// Build the env block for the ``eval`` PM2 app. We only include
+// HONE_EVAL_API_KEY when it actually has a value, so a missing-here
+// case still lets python-dotenv inside the spawned process resolve
+// it from .env at runtime. Same dance for HF_TOKEN / WANDB_API_KEY:
+// pass them through if set so the eval inherits them, otherwise let
+// dotenv handle it.
+const evalEnv = {
+  CUDA_VISIBLE_DEVICES: "4,5,6,7",
+  HF_HOME: HF_HOME,
+  HF_DATASETS_CACHE: HF_DATASETS_CACHE,
+};
+for (const k of ["HONE_EVAL_API_KEY", "HF_TOKEN", "WANDB_API_KEY"]) {
+  if (process.env[k]) evalEnv[k] = process.env[k];
+}
 
 module.exports = {
   apps: [
@@ -130,16 +191,7 @@ module.exports = {
         "--api-base-url", HONE_API_BASE_URL,
       ],
       interpreter: "none",
-      env: {
-        CUDA_VISIBLE_DEVICES: "4,5,6,7",
-        HONE_EVAL_API_KEY: HONE_EVAL_API_KEY,
-        // Force HF datasets cache off /tmp so we don't redownload
-        // each restart; on-box NVMe is plenty. Resolved at config
-        // load time from os.homedir() (or HF_HOME / HF_DATASETS_CACHE
-        // overrides if set in the shell env).
-        HF_HOME: HF_HOME,
-        HF_DATASETS_CACHE: HF_DATASETS_CACHE,
-      },
+      env: evalEnv,
     },
   ],
 };
