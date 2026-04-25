@@ -273,6 +273,16 @@ class Miner(BaseNode, Trainer):
         # FSDP-internal NCCL stays untouched. Skipped when pp_num_stages == 1.
         self.pp_transport: hone.PPTransport | None = None
         if self.pp_num_stages > 1:
+            # Per-transport hparams. ``async_send`` enables the
+            # background sender thread (decouples next-microbatch
+            # compute from socket I/O), ``send_queue_depth`` bounds
+            # how many in-flight tensors we let pile up on the wire,
+            # and ``intra_node_nccl`` opts into the NCCL P2P fast
+            # path when both adjacent stages are on loopback (still
+            # falls back to TCP if NCCL bringup fails).
+            pp_t_cfg = getattr(self.hparams, "pp_transport", None) or {}
+            if not isinstance(pp_t_cfg, dict):
+                pp_t_cfg = {}
             self.pp_transport = hone.PPTransport(
                 my_stage=self.pp_stage_id,
                 num_stages=self.pp_num_stages,
@@ -286,6 +296,9 @@ class Miner(BaseNode, Trainer):
                 listen_port_base=int(self.config.pp_listen_port_base),
                 device=self.device,
                 amp_dtype=self.amp_dtype,
+                async_send=bool(pp_t_cfg.get("async_send", True)),
+                send_queue_depth=int(pp_t_cfg.get("send_queue_depth", 2)),
+                intra_node_nccl=bool(pp_t_cfg.get("intra_node_nccl", False)),
             )
             self.pp_transport.start()
 
@@ -961,6 +974,15 @@ class Miner(BaseNode, Trainer):
                 self.global_step += (
                     1  # Increment only when we actually do an outer step
                 )
+                # Tick the outer LR scheduler once per applied outer step.
+                # ``outer_scheduler`` is None when ``outer_lr_schedule`` is
+                # ``"constant"`` (the back-compat default); any other
+                # value (e.g. ``"cosine"``) builds a real scheduler in
+                # ``Trainer._build_outer_scheduler`` that anneals the
+                # outer LR over ``outer_lr_t_max`` outer steps.
+                outer_sched = getattr(self, "outer_scheduler", None)
+                if outer_sched is not None:
+                    outer_sched.step()
                 model_update_time = hone.T() - update_start
                 if gradient_fingerprint is not None:
                     hone.logger.info(
@@ -1119,6 +1141,31 @@ class Miner(BaseNode, Trainer):
                         wandb_metrics["miner/gradient_fingerprint/total_elements"] = (
                             gradient_fingerprint["total_elements"]
                         )
+
+                    # PP transport timing -- pop_timing_metrics returns
+                    # the *cumulative* counters since the last pop, so
+                    # the values we log are per-window aggregates of
+                    # send/recv wait time, byte counts, and op counts.
+                    # Lets us watch the bubble shrink as async_send
+                    # engages and confirm the new transport actually
+                    # overlaps with compute.
+                    if self.pp_transport is not None:
+                        pp_metrics = self.pp_transport.pop_timing_metrics()
+                        # Computed bubble-style indicator: total time
+                        # blocked on PP I/O / total training_time. >0.5
+                        # means we're still pipeline-bound; <0.1 means
+                        # PP overhead has been amortized.
+                        if training_time > 0:
+                            total_pp_wait_s = (
+                                pp_metrics["pp/send_wait_us_next"]
+                                + pp_metrics["pp/send_wait_us_prev"]
+                                + pp_metrics["pp/recv_wait_us_next"]
+                                + pp_metrics["pp/recv_wait_us_prev"]
+                            ) / 1e6
+                            wandb_metrics["pp/wait_fraction"] = (
+                                total_pp_wait_s / training_time
+                            )
+                        wandb_metrics.update(pp_metrics)
 
                     self.wandb.log(wandb_metrics, step=self.global_step)
 

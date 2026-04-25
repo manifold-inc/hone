@@ -199,12 +199,47 @@ class Trainer:
             )
 
         self.sampler = SamplerClass(**kwargs)
-        self.loader = DataLoader(
+
+        # Read DataLoader knobs from hparams.dataloader (dict or
+        # SimpleNamespace), falling back to the legacy single-thread
+        # defaults when the section is absent. With ``num_workers > 0``
+        # plus ``pin_memory=True`` plus ``prefetch_factor`` the loader
+        # tokenizes microbatches in worker processes and keeps a queue
+        # of pinned-CPU tensors ready for H2D, removing the synchronous
+        # ``next(loader_iter)`` bounce on the inner loop's main thread
+        # (see ``_fetch_microbatch`` ~ trainer.py:1292).
+        dl_cfg_raw = getattr(self.hparams, "dataloader", None) or {}
+        if hasattr(dl_cfg_raw, "__dict__"):
+            dl_cfg = vars(dl_cfg_raw)
+        elif isinstance(dl_cfg_raw, dict):
+            dl_cfg = dl_cfg_raw
+        else:
+            dl_cfg = {}
+        num_workers = int(dl_cfg.get("num_workers", 0))
+        pin_memory = bool(dl_cfg.get("pin_memory", False))
+        persistent_workers = bool(
+            dl_cfg.get("persistent_workers", False)
+        ) and num_workers > 0
+        prefetch_factor_cfg = dl_cfg.get("prefetch_factor", None)
+        # ``prefetch_factor`` is only valid when num_workers > 0.
+        loader_kwargs: dict = dict(
             dataset=self.dataset,
             sampler=self.sampler,
             batch_size=self.hparams.micro_batch_size,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            persistent_workers=persistent_workers,
         )
-        hone.logger.info("[Run] dataset + sampler ready")
+        if num_workers > 0 and prefetch_factor_cfg is not None:
+            loader_kwargs["prefetch_factor"] = int(prefetch_factor_cfg)
+
+        self.loader = DataLoader(**loader_kwargs)
+        hone.logger.info(
+            f"[Run] dataset + sampler ready "
+            f"(num_workers={num_workers}, pin_memory={pin_memory}, "
+            f"persistent_workers={persistent_workers}, "
+            f"prefetch_factor={prefetch_factor_cfg if num_workers > 0 else 'n/a'})"
+        )
 
     # ------------------------------------------------------------------
     # Model
@@ -246,8 +281,10 @@ class Trainer:
             if pp_stages > 1:
                 self._init_pp_model(config, pp_stages, meta=True)
 
+            self._apply_activation_checkpointing()
             if ranks_in_stage > 1 and dist_helper.is_distributed():
                 self._apply_fsdp()
+            self._apply_torch_compile()
         else:
             # Eager-init path: real weights allocated immediately on `self.device`.
             self.model = LoopLM(config)
@@ -258,18 +295,10 @@ class Trainer:
             if pp_stages > 1:
                 self._init_pp_model(config, pp_stages, meta=False)
 
+            self._apply_activation_checkpointing()
             if ranks_in_stage > 1 and dist_helper.is_distributed():
                 self._apply_fsdp()
-
-            fsdp_cfg = getattr(self.hparams, "fsdp", None) or {}
-            if isinstance(fsdp_cfg, dict):
-                do_compile = fsdp_cfg.get("compile", False)
-            else:
-                do_compile = getattr(fsdp_cfg, "compile", False)
-
-            if do_compile:
-                self.model = torch.compile(self.model)
-                hone.logger.info("[Model] torch.compile applied")
+            self._apply_torch_compile()
 
         self.expected_compressed_params = self.get_expected_params()
         self.tokenizer = self.hparams.tokenizer
@@ -416,6 +445,137 @@ class Trainer:
             f"{' (meta)' if meta else ''}"
         )
 
+    def _apply_torch_compile(self) -> None:
+        """Compile the model with ``torch.compile``.
+
+        Two cases:
+
+        - **Non-PP**: compile ``self.model`` end-to-end so the single
+          forward path benefits. This is the legacy behaviour.
+        - **PP**: ``_pp_run_1f1b`` calls leaf submodules
+          (``embed_tokens``, each ``self.pp_stage.layers[i]``,
+          ``self.pp_stage.input_boundary``, ``self.pp_stage.output_boundary``,
+          ``norm``, ``lm_head``) directly -- compiling the *root*
+          ``self.model`` is a no-op for these calls. Instead we compile
+          each leaf submodule individually; Dynamo then emits one
+          stable graph per leaf that gets reused across all M
+          microbatches in the cycle. This is also what
+          activation-checkpoint wrappers expect.
+
+        Reads ``hparams.fsdp.compile`` for the master switch (kept on
+        the existing fsdp sub-namespace for back-compat).
+        """
+        fsdp_cfg = getattr(self.hparams, "fsdp", None) or {}
+        if isinstance(fsdp_cfg, dict):
+            do_compile = fsdp_cfg.get("compile", False)
+        else:
+            do_compile = getattr(fsdp_cfg, "compile", False)
+        if not do_compile:
+            return
+
+        if self.pp_stages > 1 and self.pp_stage is not None:
+            # PP path: compile each leaf the manual schedule actually
+            # invokes. We deliberately avoid compiling the root model
+            # (it isn't called) and avoid compiling FSDP composable
+            # wrappers above the leaves (they install their own hooks).
+            n_compiled = 0
+            for i, layer in enumerate(self.pp_stage.layers):
+                self.pp_stage.layers[i] = torch.compile(layer)
+                n_compiled += 1
+            for boundary_attr in ("input_boundary", "output_boundary"):
+                boundary = getattr(self.pp_stage, boundary_attr, None)
+                if boundary is None:
+                    continue
+                # Compile the encoder + decoder MLPs -- the bulk of the
+                # boundary's GEMM work. The thin ResBM wrapper modules
+                # stay uncompiled (they're already tiny dispatch glue).
+                if hasattr(boundary, "encoder") and boundary.encoder is not None:
+                    boundary.encoder = torch.compile(boundary.encoder)
+                    n_compiled += 1
+                if hasattr(boundary, "decoder") and boundary.decoder is not None:
+                    boundary.decoder = torch.compile(boundary.decoder)
+                    n_compiled += 1
+            for stage_edge_attr in ("embed_tokens", "lm_head", "norm"):
+                mod = getattr(self.model, stage_edge_attr, None)
+                if mod is None:
+                    continue
+                setattr(self.model, stage_edge_attr, torch.compile(mod))
+                n_compiled += 1
+            hone.logger.info(
+                f"[Model] torch.compile applied to {n_compiled} PP leaf "
+                "submodules (Dynamo will retrace if microbatch shapes "
+                "vary -- they're held constant in _pp_run_1f1b)."
+            )
+        else:
+            self.model = torch.compile(self.model)
+            hone.logger.info("[Model] torch.compile applied (full model)")
+
+    def _apply_activation_checkpointing(self) -> None:
+        """Wrap each transformer ``Block`` in a checkpoint wrapper.
+
+        Activation checkpointing (AC) trades compute for memory: each
+        wrapped module's forward pass is re-run during backward instead
+        of stashing all intermediates. For the 8B-A1B MoE config the
+        ``torch._grouped_mm`` activations dominate per-layer memory and
+        AC frees enough room to grow ``micro_batch_size`` /
+        ``batch_size`` (which in turn shrinks the PP bubble).
+
+        Modes (``hparams.fsdp.activation_checkpoint``):
+        - ``"none"`` / falsy / missing: no AC (legacy behaviour).
+        - ``"selective"``: wrap each transformer block. Recommended.
+          Checkpoints the per-block forward (attn + MoE/MLP).
+        - ``"full"``: same wrap path here; reserved for a future
+          finer-grained policy that also checkpoints inside the block.
+
+        Must run *before* ``_apply_fsdp`` so AC sees plain ``nn.Module``
+        children, not the FSDP-composable variant which intercepts
+        forward via its own hooks.
+        """
+        mode = (
+            getattr(self.hparams.fsdp, "activation_checkpoint", None)
+            if hasattr(self.hparams, "fsdp")
+            else None
+        )
+        if not mode or str(mode).lower() in ("none", "false", "off"):
+            return
+
+        try:
+            from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
+                CheckpointImpl,
+                checkpoint_wrapper,
+            )
+        except ImportError as e:
+            hone.logger.warning(
+                f"[Model] activation_checkpoint={mode} requested but the "
+                f"checkpoint_wrapper API is unavailable ({e!r}); skipping."
+            )
+            return
+
+        def _wrap(layer):
+            return checkpoint_wrapper(
+                layer, checkpoint_impl=CheckpointImpl.NO_REENTRANT
+            )
+
+        wrapped = 0
+        if self.pp_stages > 1 and self.pp_stage is not None:
+            # In PP mode the per-stage layers live on ``self.pp_stage``;
+            # the root ``self.model`` keeps a different (full) layer list
+            # for state-dict / param-naming compatibility, so we only wrap
+            # the carved stage's layers (those are the ones that actually
+            # run forward / backward).
+            for i, layer in enumerate(self.pp_stage.layers):
+                self.pp_stage.layers[i] = _wrap(layer)
+                wrapped += 1
+        else:
+            for i, layer in enumerate(self.model.layers):
+                self.model.layers[i] = _wrap(layer)
+                wrapped += 1
+
+        hone.logger.info(
+            f"[Model] activation checkpointing applied to {wrapped} "
+            f"transformer blocks (mode={mode})"
+        )
+
     def _apply_fsdp(self):
         """Apply FSDP2 wrapping at the TransformerBlock level.
 
@@ -443,6 +603,50 @@ class Trainer:
         fsdp_kwargs: dict = {}
         if self.dp_mesh is not None:
             fsdp_kwargs["mesh"] = self.dp_mesh
+
+        # Mixed-precision policy: keep params + computation in
+        # ``param_dtype`` (default bf16) but reduce gradients in fp32
+        # for stability. Halves the per-layer all-gather wire bandwidth
+        # versus the previous accidental fp32 default and removes a
+        # redundant fp32->bf16 cast inside autocast. Reads
+        # ``hparams.fsdp.mixed_precision`` (set in hparams.json); falls
+        # back to no policy when the hparam is missing or null so older
+        # configs keep their existing behaviour.
+        mp_name = (
+            getattr(self.hparams.fsdp, "mixed_precision", None)
+            if hasattr(self.hparams, "fsdp")
+            else None
+        )
+        if mp_name:
+            try:
+                from torch.distributed.fsdp import MixedPrecisionPolicy
+            except ImportError:
+                from torch.distributed._composable.fsdp import (
+                    MixedPrecisionPolicy,
+                )
+            param_dtype_map = {
+                "bfloat16": torch.bfloat16,
+                "bf16": torch.bfloat16,
+                "float16": torch.float16,
+                "fp16": torch.float16,
+                "float32": torch.float32,
+                "fp32": torch.float32,
+            }
+            param_dtype = param_dtype_map.get(str(mp_name).lower())
+            if param_dtype is None:
+                hone.logger.warning(
+                    f"[Model] fsdp.mixed_precision={mp_name!r} not "
+                    "recognised; skipping MixedPrecisionPolicy."
+                )
+            else:
+                fsdp_kwargs["mp_policy"] = MixedPrecisionPolicy(
+                    param_dtype=param_dtype,
+                    reduce_dtype=torch.float32,
+                )
+                hone.logger.info(
+                    f"[Model] FSDP MixedPrecisionPolicy: "
+                    f"param_dtype={param_dtype}, reduce_dtype=float32"
+                )
 
         if self.pp_stages > 1 and self.pp_stage is not None:
             ignored_params: set = set()
@@ -791,6 +995,14 @@ class Trainer:
         assert all(l is not None for l in losses), (
             f"_pp_run_1f1b finished with missing losses; got {losses}"
         )
+
+        # Drain any pending async sends before we hand control back to
+        # the inner loop, which will issue a stage-wide FSDP collective
+        # next. Letting an in-flight cross-stage send bleed past the
+        # collective is harmless on the wire but makes the
+        # ``pp/wait_*`` metrics undercount the per-step transport
+        # overhead. Cheap when the queue is already empty.
+        transport.flush()
         return losses
 
     # ------------------------------------------------------------------
@@ -813,6 +1025,7 @@ class Trainer:
             momentum=self.hparams.outer_momentum,
             nesterov=bool(getattr(self.hparams, "outer_nesterov", True)),
         )
+        self.outer_scheduler = self._build_outer_scheduler()
         self.inner_optimizer = self._build_inner_optimizer(validator)
         self.inner_scheduler = self._build_inner_scheduler()
         self.inner_scheduler_step_count = 0
@@ -825,6 +1038,42 @@ class Trainer:
         self.warmup_steps_taken = 0
 
         hone.logger.info("[Init] optimizers & schedulers constructed")
+
+    def _build_outer_scheduler(self) -> lr_scheduler.LRScheduler | None:
+        """Optional cosine schedule on the outer SGD learning rate.
+
+        Default is ``"constant"`` (no scheduler) for back-compat, so any
+        existing config that doesn't set ``outer_lr_schedule`` keeps its
+        previous behaviour. With ``"cosine"`` the outer LR anneals from
+        the configured starting ``outer_learning_rate`` down to
+        ``outer_lr * outer_lr_min_factor`` over ``outer_lr_t_max`` outer
+        steps -- one outer step per successful gather/window. This pairs
+        with outer-grad clipping to slow the late-run "spike-and-recover"
+        pattern as the model gets closer to convergence.
+        """
+        kind = str(getattr(self.hparams, "outer_lr_schedule", "constant"))
+        if kind == "constant":
+            return None
+        if kind != "cosine":
+            hone.logger.warning(
+                f"[Init] unknown outer_lr_schedule={kind!r}; "
+                "falling back to constant LR"
+            )
+            return None
+
+        t_max = int(getattr(self.hparams, "outer_lr_t_max", 1000))
+        min_factor = float(
+            getattr(self.hparams, "outer_lr_min_factor", 0.1)
+        )
+        eta_min = float(self.lr) * max(0.0, min_factor)
+        sched = lr_scheduler.CosineAnnealingLR(
+            self.outer_optimizer, T_max=t_max, eta_min=eta_min
+        )
+        hone.logger.info(
+            f"[Init] outer LR schedule: cosine "
+            f"lr={self.lr} -> eta_min={eta_min:.5g} over {t_max} outer steps"
+        )
+        return sched
 
     def _build_inner_scheduler(self):
         optimizer_config = getattr(self.hparams, "optimizer", {})
@@ -1091,36 +1340,94 @@ class Trainer:
                 f"in {time.time() - t0:.3f}s"
             )
 
-    def reset_inner_optimizer_states(self, *, log: bool = True) -> None:
-        """Drop all inner optimizer per-param state and the manual LR
-        warmup counter so the next inner step starts from a clean
-        slate.
+    @staticmethod
+    def _coerce_reset_factor(value) -> float:
+        """Normalise ``reset_inner_optimizer_per_window`` to a float in
+        ``[0.0, 1.0]``.
 
-        ``optimizer.state.clear()`` is the cheapest way to do this --
-        Adam / Muon / SGD all lazily re-allocate the relevant buffers
-        (``exp_avg``, ``exp_avg_sq``, ``momentum_buffer``, ``step``) on
-        the next ``.step()`` call, initialised to zero on the param's
-        own device. We also drop the offload-flag so a subsequent
-        ``prefetch_inner_optimizer_states`` no-ops instead of trying to
-        copy stale CPU buffers we just discarded.
+        - ``False`` / ``None`` / ``0``      -> ``0.0`` (no-op)
+        - ``True`` / ``1`` / ``1.0``        -> ``1.0`` (full clear)
+        - any ``0.0 < x < 1.0``             -> ``x``   (soft decay)
+        - out-of-range floats are clamped, non-numerics fall back to
+          ``0.0`` with a warning so a typo in the hparam can't silently
+          enable a hard reset that the operator didn't ask for.
+        """
+        if value is None or value is False:
+            return 0.0
+        if value is True:
+            return 1.0
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            hone.logger.warning(
+                f"[InnerOpt] reset_inner_optimizer_per_window={value!r} "
+                "not a bool/float; treating as 0.0 (no reset)"
+            )
+            return 0.0
+        if f < 0.0:
+            return 0.0
+        if f > 1.0:
+            return 1.0
+        return f
+
+    def reset_inner_optimizer_states(self, *, log: bool = True) -> None:
+        """Reset (or soft-decay) inner-optimizer per-param state at the
+        start of a window.
+
+        ``reset_inner_optimizer_per_window`` semantics:
+
+        - ``0.0`` / ``False``: no-op. Caller should ``prefetch`` instead.
+        - ``1.0`` / ``True`` : full clear via ``optimizer.state.clear()``.
+          Adam / Muon / SGD lazily re-allocate zero buffers on the next
+          ``.step()`` call, on the param's own device.
+        - ``0.0 < x < 1.0``  : soft decay. Iterate every state tensor
+          and ``mul_(x)`` in place. Direction of momentum is preserved,
+          its magnitude is attenuated. This is the recommended setting
+          for live training -- it removes the "stale momentum applied
+          to a discontinuous outer-stepped model" overshoot without
+          throwing away the inner-loop's accumulated learning signal.
+
+        The manual-warmup counter (``warmup_steps_taken``) is reset only
+        when ``reset_warmup_per_window`` is true. Decoupling the two
+        means we don't have to pay the 30-inner-step (k+1)/N LR ramp
+        every window once the optimizer is calibrated. This is safe in
+        combination with outer-grad clipping (which bounds the
+        post-outer-step jump that the warmup was protecting against).
         """
         if not getattr(self, "inner_optimizer", None):
             return
+
+        factor = self._coerce_reset_factor(
+            getattr(self.hparams, "reset_inner_optimizer_per_window", False)
+        )
+        if factor <= 0.0:
+            return
+
         t0 = time.time()
         n_states = sum(1 for _ in self._iter_inner_opt_state_tensors())
-        self.inner_optimizer.state.clear()
-        # ``warmup_steps_taken`` gates the (k+1)/N LR ramp in the inner
-        # loop. Reset it so the post-reset first 30 inner steps re-ramp
-        # smoothly rather than landing with full LR + zero momentum
-        # (which would overshoot for a different reason).
-        self.warmup_steps_taken = 0
-        # We just discarded what would have been on GPU; mark not-
+        if factor >= 1.0:
+            self.inner_optimizer.state.clear()
+            mode = "clear"
+        else:
+            for s, k, v in self._iter_inner_opt_state_tensors():
+                if torch.is_tensor(v) and v.is_floating_point():
+                    v.mul_(factor)
+            mode = f"decay x{factor:.3g}"
+
+        warmup_was_reset = False
+        if getattr(self.hparams, "reset_warmup_per_window", True):
+            self.warmup_steps_taken = 0
+            warmup_was_reset = True
+
+        # We just modified what would have been on GPU; mark not-
         # offloaded so a follow-up prefetch is correctly skipped.
         self._inner_opt_offloaded = False
+
         if log and getattr(self, "is_master", True):
+            warmup_msg = " + warmup counter" if warmup_was_reset else ""
             hone.logger.info(
-                f"[InnerOpt] reset {n_states} state tensors + warmup "
-                f"counter in {time.time() - t0:.3f}s"
+                f"[InnerOpt] {mode} {n_states} state tensors{warmup_msg} "
+                f"in {time.time() - t0:.3f}s"
             )
 
     # ------------------------------------------------------------------
@@ -1139,20 +1446,20 @@ class Trainer:
             )
             self.loop.set_default_executor(self.executor)
 
-        # The outer step creates a parameter discontinuity that the
-        # inner-optimizer momentum buffers (calibrated against the
-        # *pre-outer-step* params) don't expect. Applying that stale
-        # momentum to the new params produces a one-step overshoot
-        # visible as a sharp loss spike right after each window flip
-        # (loss=7.69 -> 11.75 in a single inner step in our trace).
-        # When ``reset_inner_optimizer_per_window`` is set we discard
-        # the per-param state entirely and let the next ``.step()``
-        # lazily allocate fresh zero buffers. We also reset
-        # ``warmup_steps_taken`` so the post-reset first 30 inner steps
-        # re-ramp the LR via the manual-warmup branch -- without this
-        # the very first step would land with full LR + zero momentum
-        # and overshoot for a different reason.
-        if getattr(self.hparams, "reset_inner_optimizer_per_window", False):
+        # The outer step creates a parameter discontinuity that stale
+        # inner-optimizer momentum (calibrated against the *pre-outer-
+        # step* params) doesn't expect. Applying it produces a one-step
+        # overshoot that shows up as a sharp loss spike right after
+        # each window flip (loss=7.69 -> 11.75 in a single inner step
+        # in the original trace). Three options are gated by the
+        # ``reset_inner_optimizer_per_window`` hparam (see
+        # ``_coerce_reset_factor``): 0 = preserve state and prefetch
+        # from CPU; 1 = full clear; 0<x<1 = soft decay (recommended,
+        # keeps direction info, attenuates stale magnitude).
+        reset_factor = self._coerce_reset_factor(
+            getattr(self.hparams, "reset_inner_optimizer_per_window", False)
+        )
+        if reset_factor > 0.0:
             self.reset_inner_optimizer_states()
         else:
             self.prefetch_inner_optimizer_states()
@@ -1548,4 +1855,7 @@ class Trainer:
             use_dct=self.hparams.use_dct,
             wandb_run=self.wandb if self.is_master and log_wandb else None,
             global_step=self.global_step,
+            max_grad_norm=getattr(
+                self.hparams, "outer_max_grad_norm", None
+            ),
         )

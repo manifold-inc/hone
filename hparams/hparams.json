@@ -7,13 +7,18 @@
     "sequence_length": 4096,
     "micro_batch_size": 4,
     "target_batch_size": 1024,
-    "batch_size": 32,
-    "inner_steps": 30,
-    "max_inner_steps": 300,
+    "batch_size": 128,
+    "inner_steps": 8,
+    "max_inner_steps": 80,
     "outer_learning_rate": 0.1,
     "outer_momentum": 0.5,
     "outer_nesterov": false,
-    "reset_inner_optimizer_per_window": true,
+    "outer_max_grad_norm": 5.0,
+    "outer_lr_schedule": "cosine",
+    "outer_lr_t_max": 1000,
+    "outer_lr_min_factor": 0.1,
+    "reset_inner_optimizer_per_window": 0.5,
+    "reset_warmup_per_window": false,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
     "blocks_per_window": 26,
@@ -94,12 +99,26 @@
     "fsdp": {
         "dp_shard": 2,
         "compile": true,
-        "mixed_precision": "bfloat16"
+        "mixed_precision": "bfloat16",
+        "activation_checkpoint": "selective"
     },
 
     "pipeline": {
         "enabled": true,
-        "num_stages": 2,
+        "num_stages": 3,
         "bottleneck_dim": 16
+    },
+
+    "pp_transport": {
+        "async_send": true,
+        "send_queue_depth": 2,
+        "intra_node_nccl": false
+    },
+
+    "dataloader": {
+        "num_workers": 4,
+        "pin_memory": true,
+        "persistent_workers": true,
+        "prefetch_factor": 4
     }
 }

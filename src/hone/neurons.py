@@ -403,6 +403,7 @@ def outer_step(
     use_dct: bool = False,
     wandb_run: Run | None = None,
     global_step: int | None = None,
+    max_grad_norm: float | None = None,
 ) -> dict | None:
     """
     Memory-minimizing variant:
@@ -452,6 +453,16 @@ def outer_step(
             "param_means": {},
             "total_norm_sq": 0.0,
             "total_elements": 0,
+            # Outer-grad clipping bookkeeping. ``pre_clip_norm`` is the
+            # pre-scale global L2 of the incoming aggregated gradient
+            # (computed in the pre-pass below); ``clip_scale`` is the
+            # multiplier applied to every per-param ``full_grad_src``
+            # tensor before it lands in ``p.grad``. ``1.0`` means
+            # clipping didn't fire either because ``max_grad_norm`` is
+            # None or because the global L2 was already under the
+            # threshold.
+            "pre_clip_norm": 0.0,
+            "clip_scale": 1.0,
         }
 
     def _idx_to_device(obj, dev: str):
@@ -478,6 +489,68 @@ def outer_step(
     # gathered from peers / from a plain-LoopLM validator.
     canon_map = canonical_param_names(model)
 
+    # ------------------------------------------------------------------
+    # Outer-gradient clipping pre-pass (master rank only)
+    # ------------------------------------------------------------------
+    # The outer-grad L2 was observed to grow unboundedly across windows
+    # (7 -> 32 -> 75 -> ... -> 727) producing ever-larger per-window
+    # parameter jumps and the loss spikes the user sees on the dashboard.
+    # We bound it the same way the inner loop does: compute the global
+    # L2 across all params we're about to update, scale every per-param
+    # ``full_grad_src`` by ``min(1, threshold / global_norm)``.
+    #
+    # Implementation choices:
+    # 1. Dequantise each peer's ``vals`` *once* up front and cache the
+    #    fp32 list in ``vals_f32_cache[cname]`` so the main loop can
+    #    skip the second ``maybe_dequantize_values`` call. Cache size is
+    #    tiny (sparse top-k vals; ~1.5 MiB for the full 8B-A1B model).
+    # 2. Use ``||vals_f32||`` (not the post-decompress / post-decode
+    #    full-tensor norm) for the threshold check: orthogonal DCT and
+    #    sparse-into-zero scatter both preserve L2, so this is exact.
+    # 3. Skip entirely when ``max_grad_norm`` is None (current behaviour
+    #    for all unaware callers) or when there's no master payload.
+    # 4. Per-stage clipping: each PP stage's ``outer_step`` only sees
+    #    its own param subset, so clipping is per-stage. That's exactly
+    #    what's needed -- spikes are per-stage param jumps too.
+    vals_f32_cache: dict[str, list[torch.Tensor]] = {}
+    clip_scale: float = 1.0
+    pre_clip_norm: float = 0.0
+
+    if (
+        on_src
+        and src_sd is not None
+        and max_grad_norm is not None
+        and max_grad_norm > 0.0
+    ):
+        # Accumulate sum-of-squares on-device into a single scalar so
+        # we only sync to host once at the end, regardless of how many
+        # params / chunks we walked.
+        total_sq_dev = torch.zeros((), device=device, dtype=torch.float32)
+        for name, p in model.named_parameters():
+            cname = canon_map.get(name, name)
+            if cname is None:
+                continue
+            idxs = src_sd.get(cname + "idxs")
+            vals = src_sd.get(cname + "vals")
+            qps = src_sd.get(cname + "quant_params")
+            if idxs is None or vals is None:
+                continue
+            if not isinstance(vals, (list, tuple)):
+                vals = [vals]
+            vals_f32 = compressor.maybe_dequantize_values(vals, qps, device)
+            if not vals_f32:
+                continue
+            vals_f32_cache[cname] = vals_f32
+            for v in vals_f32:
+                vf = v.to(torch.float32)
+                total_sq_dev.add_(torch.dot(vf.flatten(), vf.flatten()))
+        pre_clip_norm = float(total_sq_dev.sqrt().item())
+        if pre_clip_norm > max_grad_norm:
+            clip_scale = max_grad_norm / max(pre_clip_norm, 1e-8)
+        if fingerprint is not None:
+            fingerprint["pre_clip_norm"] = pre_clip_norm
+            fingerprint["clip_scale"] = clip_scale
+
     for name, p in model.named_parameters():
         cname = canon_map.get(name, name)
 
@@ -495,8 +568,16 @@ def outer_step(
                     idxs = [idxs]
                 if not isinstance(vals, (list, tuple)):
                     vals = [vals]
-                # Dequantize values directly on target device (H2D per-block if needed)
-                vals_f32 = compressor.maybe_dequantize_values(vals, qps, device)
+                # Reuse the dequantised list from the clipping pre-pass
+                # if it ran; otherwise dequantise here. This keeps the
+                # work identical when ``max_grad_norm`` is None (the
+                # cache is empty) and saves one dequant per param when
+                # clipping is on.
+                vals_f32 = vals_f32_cache.pop(cname, None)
+                if vals_f32 is None:
+                    vals_f32 = compressor.maybe_dequantize_values(
+                        vals, qps, device
+                    )
                 if vals_f32:
                     # Ensure indices (or packed tuples) live on the same device as 'ref'
                     idxs_dev = _idx_to_device(idxs, device)
@@ -553,6 +634,12 @@ def outer_step(
                 # see a shape-compatible gradient.
                 if full_grad_src.shape != p.shape:
                     full_grad_src = full_grad_src.view(p.shape)
+
+                # Apply outer-grad clipping scale (computed in the
+                # pre-pass above). When ``clip_scale == 1.0`` this is a
+                # no-op the autograd graph won't even materialise.
+                if clip_scale != 1.0:
+                    full_grad_src.mul_(clip_scale)
 
                 # Accumulate fingerprint statistics for this parameter
                 # using the canonical name so traces compare across PP and
@@ -1266,6 +1353,9 @@ async def catchup_with_aggregation_server(
             if instance.is_master and isinstance(instance.wandb, Run)
             else None,
             global_step=instance.global_step,
+            max_grad_norm=getattr(
+                instance.hparams, "outer_max_grad_norm", None
+            ),
         )
 
         # advance LR scheduler if one exists.

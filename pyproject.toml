@@ -8,7 +8,7 @@ include = ["hone*", "neurons*"]
 
 [project]
 name = "hone"
-description = "LoopLM — Incentivised Internet-Wide Training with Looped Language Models"
+description = "Hone — Incentivised Internet-Wide Training with Looped Language Models"
 readme = "README.md"
 dynamic = ["version"]
 requires-python = ">=3.11"

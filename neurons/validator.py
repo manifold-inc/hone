@@ -2581,6 +2581,9 @@ class Validator(BaseNode, Trainer):
                 use_dct=self.hparams.use_dct,
                 wandb_run=self.wandb if self.is_master else None,
                 global_step=self.global_step,
+                max_grad_norm=getattr(
+                    self.hparams, "outer_max_grad_norm", None
+                ),
             )
             self.global_step += 1  # Increment only when we actually do an outer step
 
