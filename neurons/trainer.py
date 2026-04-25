@@ -232,7 +232,17 @@ class Trainer:
     def init_model(self, validator=False, meta=False):
         config: LoopLMConfig = self.hparams.model_config
         pp_stages = getattr(self, "pp_degree", 1)
-        ranks_in_stage = self.world_size // max(pp_stages, 1)
+        # With the iota-aligned per-stage torchrun layout, each PP stage
+        # is its own torchrun job and therefore its own NCCL world --
+        # ``self.world_size`` is *already* the count of ranks in THIS
+        # stage, not a global rank count. The old
+        # ``ranks_in_stage = world_size // pp_stages`` divide came from
+        # a hypothetical single-global-torchrun architecture that we
+        # don't run; under per-stage torchrun it gates FSDP off
+        # entirely whenever ``world_size <= pp_stages`` (e.g. NPROC=2
+        # per stage with PP=2 leaves the model unsharded on each
+        # stage's two GPUs and you silently lose ~2x throughput).
+        ranks_in_stage = self.world_size
 
         if meta:
             # Meta-init path:

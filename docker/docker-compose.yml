@@ -86,6 +86,7 @@ services:
     pull_policy: build  # don't try to pull hone:latest from a registry
     hostname: validator
     container_name: hone-validator
+    runtime: nvidia
     networks: [hone-net]
     volumes: *common-volumes
     environment:
@@ -94,13 +95,13 @@ services:
       WALLET_NAME: ${VALIDATOR_WALLET_NAME}
       WALLET_HOTKEY: ${VALIDATOR_WALLET_HOTKEY}
       HONE_EXTRA_FLAGS: ${VALIDATOR_EXTRA_FLAGS:-}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${VALIDATOR_GPU_ID:-0}"]
-              capabilities: [gpu]
+      # NVIDIA_VISIBLE_DEVICES takes a CSV ("0,1,2,3") so we can
+      # parameterise the multi-GPU layout from .env without juggling
+      # YAML lists. NPROC_PER_NODE drives torchrun in the entrypoint;
+      # match it to the count of GPUs and to fsdp.dp_shard in
+      # hparams.json or FSDP won't shard the model.
+      NVIDIA_VISIBLE_DEVICES: ${VALIDATOR_GPU_IDS:-0}
+      NPROC_PER_NODE: ${VALIDATOR_NPROC:-1}
     restart: unless-stopped
 
   # ----------------------------- MINER STAGES ------------------------
@@ -120,6 +121,7 @@ services:
     pull_policy: never
     hostname: miner-s0
     container_name: hone-miner-s0
+    runtime: nvidia
     networks: [hone-net]
     volumes: *common-volumes
     environment:
@@ -136,13 +138,17 @@ services:
       PP_PEER_PORT_BASE_NEXT: "50000"
       PP_LISTEN_PORT_BASE: "50000"
       HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${MINER_S0_GPU_ID:-1}"]
-              capabilities: [gpu]
+      # NVIDIA_VISIBLE_DEVICES takes a CSV ("4,5") so we can
+      # parameterise multi-GPU intra-stage FSDP from .env. The
+      # entrypoint flips to torchrun when NPROC_PER_NODE > 1; match
+      # it to the GPU count and to fsdp.dp_shard in hparams.json.
+      NVIDIA_VISIBLE_DEVICES: ${MINER_S0_GPU_IDS:-1}
+      NPROC_PER_NODE: ${MINER_S0_NPROC:-1}
+      # Each torchrun world needs its own master_port: stage 0 and
+      # stage 1 run separate NCCL worlds, both bind to localhost in
+      # their own netns, but using distinct ports keeps logs clean
+      # and avoids any future single-host orchestration confusion.
+      MASTER_PORT: "29500"
     depends_on: [validator]
     restart: unless-stopped
 
@@ -154,6 +160,7 @@ services:
     pull_policy: never
     hostname: miner-s1
     container_name: hone-miner-s1
+    runtime: nvidia
     networks: [hone-net]
     volumes: *common-volumes
     environment:
@@ -167,12 +174,8 @@ services:
       PP_PEER_PORT_BASE_PREV: "50000"
       PP_LISTEN_PORT_BASE: "50000"
       HONE_EXTRA_FLAGS: ${MINER_EXTRA_FLAGS:-}
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              device_ids: ["${MINER_S1_GPU_ID:-2}"]
-              capabilities: [gpu]
+      NVIDIA_VISIBLE_DEVICES: ${MINER_S1_GPU_IDS:-2}
+      NPROC_PER_NODE: ${MINER_S1_NPROC:-1}
+      MASTER_PORT: "29500"
     depends_on: [validator]
     restart: unless-stopped

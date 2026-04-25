@@ -47,16 +47,28 @@ fi
 
 case "${NODE_TYPE}" in
     validator)
-        # Validator currently always runs as a single process (FSDP
-        # within the process via dp_shard from hparams.json). We don't
-        # use torchrun: the validator pins ``pp_degree=1`` and the
-        # in-process FSDP setup handles multi-GPU sharding via
-        # CUDA_VISIBLE_DEVICES picking the right devices for this
-        # container.
-        echo "[entrypoint] starting validator: netuid=${NETUID} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
-        exec python /app/neurons/validator.py \
-            "${COMMON_FLAGS[@]}" \
-            ${EXTRA_FLAGS}
+        # Validator pins ``pp_degree=1`` so all GPUs in the container
+        # form a single FSDP world. With NPROC_PER_NODE > 1 we need
+        # torchrun to spawn one process per GPU and rendez-vous them
+        # via NCCL -- otherwise we'd be running on a single GPU
+        # regardless of how many are mapped in. ``fsdp.dp_shard`` in
+        # ``hparams.json`` should match this NPROC value.
+        NPROC_PER_NODE="${NPROC_PER_NODE:-1}"
+        if [[ "${NPROC_PER_NODE}" -gt 1 ]]; then
+            echo "[entrypoint] starting validator via torchrun: nproc=${NPROC_PER_NODE} netuid=${NETUID} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
+            exec torchrun \
+                --nproc_per_node="${NPROC_PER_NODE}" \
+                --master_addr=127.0.0.1 \
+                --master_port="${MASTER_PORT:-29500}" \
+                /app/neurons/validator.py \
+                "${COMMON_FLAGS[@]}" \
+                ${EXTRA_FLAGS}
+        else
+            echo "[entrypoint] starting validator: netuid=${NETUID} wallet=${WALLET_NAME}/${WALLET_HOTKEY}"
+            exec python /app/neurons/validator.py \
+                "${COMMON_FLAGS[@]}" \
+                ${EXTRA_FLAGS}
+        fi
         ;;
 
     miner)
