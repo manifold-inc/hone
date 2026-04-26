@@ -172,7 +172,11 @@ class Trainer:
         self.dataset = self.dataset_manager.active_dataset
 
         max_steps = getattr(self.hparams, "max_inner_steps", None) or self.hparams.inner_steps
-        pool_steps = max_steps if not validator else self.hparams.inner_steps
+        # Miners draw from a deterministic max_inner_steps-sized pool and
+        # may stop early for window headroom. Validators must sample/evaluate
+        # from the same pool; using inner_steps here makes the sample digest
+        # and "own data" eval silently cover a different distribution.
+        pool_steps = max_steps
 
         shared_args = dict(
             dataset=self.dataset,
@@ -852,9 +856,10 @@ class Trainer:
         if self.pp_is_first_stage:
             warmup = min(M, P - s - 1)
             steady = M - warmup
-            # Cached activations awaiting backward, in mb order. Each
-            # entry is (mb_idx, h) where ``h`` is the stage-0 output
-            # tensor we'll call ``.backward(grad_h)`` on later.
+            # Cached boundary outputs awaiting backward, in mb order. Keep
+            # the actual compressed tensor so autograd flows through
+            # output_boundary.encode(), including both encoder weights and
+            # the identity residual path.
             pending: deque[tuple[int, torch.Tensor]] = deque()
 
             def fwd_one(mb_idx: int) -> None:
@@ -869,21 +874,20 @@ class Trainer:
                     self.amp_dtype
                 )
                 transport.send_next(compressed.contiguous())
-                pending.append((mb_idx, h))
+                pending.append((mb_idx, compressed))
                 _phase(f"s0 fwd mb={mb_idx}", self._pp_microbatch_idx)
 
             def bwd_one() -> None:
                 nonlocal bwd_count
-                mb_idx, h = pending.popleft()
+                mb_idx, compressed = pending.popleft()
                 grad_compressed = transport.recv_next(
                     shape=(B, S, bottleneck_dim), dtype=self.amp_dtype
                 )
                 loss_scalar = transport.recv_next(
                     shape=(1,), dtype=torch.float32
                 )
-                grad_h = self.pp_stage.output_boundary.decoder(grad_compressed)
                 with _sync_ctx(bwd_count):
-                    h.backward(grad_h)
+                    compressed.backward(grad_compressed)
                 losses[mb_idx] = loss_scalar.reshape(()).to(self.device)
                 bwd_count += 1
                 _phase(
@@ -925,9 +929,10 @@ class Trainer:
                 h = self.model.norm(h)
                 logits = self.model.lm_head(h)
                 loss = compute_loss(logits, labels[mb_idx])
+                loss_for_backward = loss / self.sampler.grad_accum_steps
 
                 with _sync_ctx(bwd_count):
-                    loss.backward()
+                    self.scaler.scale(loss_for_backward).backward()
                 bwd_count += 1
 
                 grad_compressed = compressed.grad
