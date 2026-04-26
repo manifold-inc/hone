@@ -2040,14 +2040,11 @@ class Validator(BaseNode, Trainer):
 
                 if self.is_master:
                     try:
-                        eval_result = await self.comms.get(
-                            uid=str(eval_uid),
+                        eval_result = await self._fetch_peer_gradient_pp_aware(
+                            eval_uid=eval_uid,
                             window=self.sync_window,
-                            key="gradient",
-                            local=False,
-                            stale_retention=10,
-                            time_max=time_max,
                             time_min=time_min,
+                            time_max=time_max,
                         )
                     except Exception as e:
                         # Transient infrastructure error (network/IO/deser) - don't slash
@@ -3614,6 +3611,108 @@ class Validator(BaseNode, Trainer):
         # Initialize OpenSkill rating if needed
         if uid not in self.openskill_ratings:
             self.openskill_ratings[uid] = self.openskill_model.rating(name=str(uid))
+
+    async def _fetch_peer_gradient_pp_aware(
+        self,
+        *,
+        eval_uid: int,
+        window: int,
+        time_min,
+        time_max,
+    ):
+        """Fetch a single peer's gradient for per-UID evaluation, with
+        the same PP-stage merge logic the gather flow uses.
+
+        The legacy ``self.comms.get(uid, window, key='gradient')`` call
+        looks for ``gradient-{w}-{uid}-v{version}.pt`` -- a single-file
+        upload that PP miners NEVER produce. PP miners upload one file
+        per stage (``gradient-{w}-{uid}-stage{N}-v{version}.pt``). Under
+        ``pipeline.num_stages > 1`` the legacy call always 404s and the
+        per-UID eval slashes the peer with "No gradient received from
+        UID N" even though the peer's gradient was published correctly
+        and the global gather happily downloaded it via ``_fetch_uid``
+        in src/hone/comms.py (which knows about stages).
+
+        This helper mirrors that gather-side per-stage fetch + merge so
+        the per-UID eval finds the same data.
+        """
+        # Resolve PP stage count from chain hparams (same lookup the
+        # gather path uses around validator.py:1586). Validator itself
+        # always runs pp_degree=1; the topology number here is what
+        # peers (miners) configured.
+        pp_cfg = getattr(self.hparams, "pipeline", None)
+        if isinstance(pp_cfg, dict):
+            pp_num_stages = int(pp_cfg.get("num_stages", 1))
+        elif pp_cfg is not None:
+            pp_num_stages = int(getattr(pp_cfg, "num_stages", 1))
+        else:
+            pp_num_stages = 1
+
+        if pp_num_stages <= 1:
+            return await self.comms.get(
+                uid=str(eval_uid),
+                window=window,
+                key="gradient",
+                local=False,
+                stale_retention=10,
+                time_min=time_min,
+                time_max=time_max,
+            )
+
+        # PP > 1: fetch every per-stage file in parallel, then merge.
+        # Param namespaces between stages are disjoint by construction
+        # (each stage owns its own layers), so a flat ``dict.update``
+        # is the right merge primitive (matches comms._fetch_uid).
+        stage_results = await asyncio.gather(
+            *(
+                self.comms.get(
+                    uid=str(eval_uid),
+                    window=window,
+                    key="gradient",
+                    local=False,
+                    stale_retention=10,
+                    time_min=time_min,
+                    time_max=time_max,
+                    stage_id=s,
+                )
+                for s in range(pp_num_stages)
+            ),
+            return_exceptions=True,
+        )
+
+        merged: dict = {}
+        global_step_first: int = 0
+        for s_idx, sr in enumerate(stage_results):
+            # Any stage missing / exception -> the whole peer payload
+            # is unusable. Return a NOT_FOUND-equivalent so the caller
+            # follows its existing slashing path.
+            if isinstance(sr, Exception):
+                hone.logger.warning(
+                    f"[validator] per-UID PP stage {s_idx} fetch raised "
+                    f"for UID {eval_uid}: {sr!r} -- marking missing"
+                )
+                from hone.comms import CommsGetResult
+                return CommsGetResult(status="NOT_FOUND")
+            if sr is None or not sr.success or sr.data is None:
+                hone.logger.info(
+                    f"[validator] per-UID PP stage {s_idx} missing for "
+                    f"UID {eval_uid} -- marking missing"
+                )
+                from hone.comms import CommsGetResult
+                return CommsGetResult(status="NOT_FOUND")
+            if isinstance(sr.data, dict) and sr.data.get("__status") in (
+                "TOO_LATE",
+                "TOO_EARLY",
+            ):
+                # Treat any-stage-too-late as the whole UID being late;
+                # consistent with the gather-side behaviour.
+                return sr
+            if s_idx == 0:
+                global_step_first = sr.global_step
+            merged.update(sr.data)
+
+        from hone.comms import CommsGetResult
+        return CommsGetResult(data=merged, global_step=global_step_first)
 
     def slash_for_missing_gradient(self, eval_uid: int) -> None:
         """Slash a peer for not submitting a gradient.
