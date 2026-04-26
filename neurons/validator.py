@@ -4490,12 +4490,28 @@ class Validator(BaseNode, Trainer):
         """
         Re-create the *exact* index pool a miner used for (uid, window) and
         return a 128-bit hex digest **plus the expected sample count**.
+
+        The pool size is ``steps_per_window * target_batch_size``. The
+        miner sets ``steps_per_window = max_inner_steps`` (NOT
+        ``inner_steps``) so it has a deterministic super-pool to draw
+        from when the headroom-based early-exit decides to keep
+        training past the nominal ``inner_steps`` -- see
+        ``trainer.set_dataloader`` lines around ``pool_steps =
+        max_steps if not validator else self.hparams.inner_steps``.
+        We must mirror that here, otherwise the digest covers a
+        4-step slice (inner_steps) while the miner hashes a
+        max_inner_steps slice and every comparison logs ``MISMATCH for
+        UID N: expected ... (4096) got ... (40960)``.
         """
+        max_inner = (
+            getattr(self.hparams, "max_inner_steps", None)
+            or self.hparams.inner_steps
+        )
         miner_sampler = hone.MinerSampler(
             dataset=self.dataset,
             uid=uid,
             window=window,
-            steps_per_window=self.hparams.inner_steps,
+            steps_per_window=max_inner,
             micro_bs=self.hparams.micro_batch_size,
             batch_size=self.hparams.batch_size,
             target_batch_size=self.hparams.target_batch_size,

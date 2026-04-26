@@ -338,11 +338,37 @@ def _evaluate_task(
 ) -> tuple[TaskResult, TaskResult]:
     """Run one MC task end to end, returning ``(acc, acc_norm)`` rows.
 
-    Each rank evaluates a *strided slice* of the dataset (``rank::ws``)
-    and we all-reduce the local correct counts at the end. With a
-    typical 1k-3k sample task and 4 GPUs each rank scores 250-750
-    examples; the ~10ms-per-example forward pass keeps wall-clock
-    sub-minute per task on a B200.
+    Implementation note (NCCL deadlock avoidance):
+
+    The earlier "strided iteration + all_reduce at the end" design hung
+    NCCL after ~30 minutes (watchdog timeout). The model is FSDP-sharded
+    across ``world_size`` ranks, so every ``model.forward()`` triggers
+    ``world_size`` participants in each per-layer ``_ALLGATHER_BASE``
+    unshard. Strided iteration only worked when:
+
+    1. Every rank had the same number of examples (i.e. ``n % world_size == 0``),
+       and
+    2. Every example had the same number of MC choices (i.e. constant
+       inner-loop length).
+
+    Both assumptions break in practice -- ARC-Challenge has 299 examples
+    (299 % 4 = 3, so rank 3 gets one fewer example) and a variable
+    number of choices per question (3, 4, or 5). When rank 3 finishes
+    its slice first and issues ``all_reduce(buf)`` for the eval counts,
+    the other ranks are still inside ``_ALLGATHER_BASE`` for FSDP
+    unshard -- different collective types in different orders -> hang.
+
+    Bulletproof fix: **every rank scores every example**. With FSDP
+    every rank already had to participate in every other rank's
+    forward (strided iteration was just bookkeeping noise that
+    pretended otherwise), so the actual GPU compute cost is roughly
+    the same. We drop the ``all_reduce`` because every rank now
+    computes identical totals from identical inputs.
+
+    Cost: each rank does the whole dataset's forwards instead of just
+    its slice, but the FSDP all_gathers were already serializing across
+    all ranks anyway. End-to-end wall-clock is comparable; correctness
+    is dramatically better.
     """
     # Heavy import isolated to first call so a missing optional dep
     # surfaces as an evaluator-only error and not at module import time.
@@ -354,16 +380,20 @@ def _evaluate_task(
         ds = ds.select(range(min(limit, len(ds))))
 
     n = len(ds)
-    # Strided slice for cheap data-parallel scoring. We don't bother
-    # with a Sampler since the dataset fits trivially in memory and we
-    # want every rank to walk the same indices in deterministic order.
-    indices = list(range(rank, n, world_size))
 
     correct_acc = 0
     correct_acc_norm = 0
-    local_n = 0
+    total_n = 0
 
-    for i in indices:
+    # ``rank`` and ``world_size`` are kept in the signature for API
+    # stability + future use, but with the all-ranks-score-all-examples
+    # design we don't actually slice anymore. Note that *every* rank
+    # contributes identically to ``correct_acc`` / ``correct_acc_norm``,
+    # so no all_reduce is needed at the end -- they're already in
+    # agreement.
+    del rank, world_size
+
+    for i in range(n):
         ex = ds[i]
         try:
             choices = spec.choices_fn(ex)
@@ -393,21 +423,7 @@ def _evaluate_task(
             correct_acc += 1
         if pred_norm == gold:
             correct_acc_norm += 1
-        local_n += 1
-
-    # All-reduce the counts across ranks.
-    if dist.is_available() and dist.is_initialized() and world_size > 1:
-        buf = torch.tensor(
-            [correct_acc, correct_acc_norm, local_n],
-            dtype=torch.long,
-            device=device,
-        )
-        dist.all_reduce(buf, op=dist.ReduceOp.SUM)
-        correct_acc = int(buf[0].item())
-        correct_acc_norm = int(buf[1].item())
-        total_n = int(buf[2].item())
-    else:
-        total_n = local_n
+        total_n += 1
 
     if total_n == 0:
         # Degenerate: no examples; emit zeros so the dashboard shows
