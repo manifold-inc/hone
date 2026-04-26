@@ -147,8 +147,18 @@ class BaseNode(abc.ABC):
         init_delay: float = 1.0,
         max_delay: float = 60.0,
     ) -> float | None:
+        # Lazy-init the subtensor RPC client. Initialization itself
+        # makes a network call that can time out -- swallow and return
+        # None so the caller can fall back to ``time.time()`` instead
+        # of crashing the run loop.
         if self.subtensor_client is None:
-            self.subtensor_client = bt.Subtensor(config=self.config)
+            try:
+                self.subtensor_client = bt.Subtensor(config=self.config)
+            except Exception as e:
+                hone.logger.warning(
+                    f"[timestamp] subtensor client init failed: {e!r}"
+                )
+                return None
 
         delay = init_delay
         for attempt in range(1, retries + 1):
@@ -165,11 +175,26 @@ class BaseNode(abc.ABC):
                 )
                 if attempt == retries:
                     return None
+                # Try to reconnect the RPC client. Both ``substrate.close()``
+                # and ``substrate.initialize()`` make network calls that
+                # can themselves time out -- if the chain RPC is genuinely
+                # down, the reconnect raises ``TimeoutError`` which would
+                # escape the outer retry loop, propagate through
+                # ``run_in_executor``, and crash the entire miner.
+                # Wrap both in try/except so the recovery path is
+                # bulletproof: at worst we sleep and try the original
+                # query again with a stale client.
                 try:
                     self.subtensor_client.substrate.close()
                 except Exception:
                     pass
-                self.subtensor_client.substrate.initialize()
+                try:
+                    self.subtensor_client.substrate.initialize()
+                except Exception as init_err:
+                    hone.logger.warning(
+                        f"[timestamp] reconnect attempt {attempt}/{retries} "
+                        f"failed: {init_err!r}; will retry"
+                    )
                 time.sleep(delay)
                 delay = min(delay * 2, max_delay)
 

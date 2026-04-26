@@ -922,9 +922,23 @@ class Miner(BaseNode, Trainer):
                 torch.cuda.empty_cache()
 
             sync_block = self.current_window * self.hparams.blocks_per_window
-            ts_value = await self.loop.run_in_executor(
-                None, self.query_block_timestamp, sync_block
-            )
+            # ``query_block_timestamp`` already retries with backoff and
+            # is *supposed* to return None on total failure (which we
+            # handle below). Defense in depth: also catch any exception
+            # that escapes (e.g. transient bittensor / substrate RPC
+            # quirks) so a single chain hiccup never takes down the
+            # miner. The ``time.time()`` fallback is acceptable for
+            # gather time-window bounds.
+            try:
+                ts_value = await self.loop.run_in_executor(
+                    None, self.query_block_timestamp, sync_block
+                )
+            except Exception as e:
+                hone.logger.warning(
+                    f"query_block_timestamp({sync_block}) raised "
+                    f"{e!r}; falling back to wall-clock time"
+                )
+                ts_value = None
             if ts_value is None:
                 hone.logger.warning(
                     f"Could not get timestamp for sync block {sync_block}. Using current time as fall back.",
