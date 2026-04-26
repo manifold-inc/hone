@@ -172,6 +172,16 @@ module.exports = {
       interpreter: "none",
       env: {
         CUDA_VISIBLE_DEVICES: "0,1,2,3",
+        // Disable torch.compile on the validator. Its evaluate_model
+        // forward path triggers Inductor codegen on first call; if the
+        // box's gcc / Triton runtime build fails to link (toolchain
+        // mismatch, missing headers, container minimal install, ...)
+        // the eval crashes with InductorError and there's no fallback.
+        // Validator only runs forward-pass loss eval N times per
+        // window per peer -- compile speedup is small, the risk is
+        // not worth it. Honoured by both Trainer._apply_torch_compile
+        // and Muon's Newton-Schulz JIT (see hone/src/hone/muon/*).
+        HONE_DISABLE_TORCH_COMPILE: "1",
       },
     },
     {
@@ -191,7 +201,13 @@ module.exports = {
         "--api-base-url", HONE_API_BASE_URL,
       ],
       interpreter: "none",
-      env: evalEnv,
+      env: {
+        ...evalEnv,
+        // Same reasoning as ``vali`` above -- the in-process eval
+        // forward also goes through compiled paths and would crash
+        // on the same gcc / Triton failure mode.
+        HONE_DISABLE_TORCH_COMPILE: "1",
+      },
     },
   ],
 };

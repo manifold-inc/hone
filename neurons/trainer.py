@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
+import os
 import time
 from collections import deque
 from contextlib import nullcontext
@@ -464,7 +465,23 @@ class Trainer:
 
         Reads ``hparams.fsdp.compile`` for the master switch (kept on
         the existing fsdp sub-namespace for back-compat).
+
+        ``HONE_DISABLE_TORCH_COMPILE=1`` env var (also honoured by
+        Muon's Newton-Schulz, see hone/src/hone/muon/muon_fsdp2.py)
+        forces this off regardless of the hparam. The intended use
+        is the validator process, whose ``evaluate_model`` forward
+        path triggers Inductor codegen on the first call: if gcc /
+        Triton's runtime build can't link (broken toolchain, missing
+        headers, ...) the eval crashes with an unhandled ``InductorError``
+        and there's no fallback. Validator gets ~no perf benefit from
+        compile (forward only, runs N times per window per peer), so
+        it's the safe one to opt out.
         """
+        if os.environ.get("HONE_DISABLE_TORCH_COMPILE", "0") == "1":
+            hone.logger.info(
+                "[Model] torch.compile skipped (HONE_DISABLE_TORCH_COMPILE=1)"
+            )
+            return
         fsdp_cfg = getattr(self.hparams, "fsdp", None) or {}
         if isinstance(fsdp_cfg, dict):
             do_compile = fsdp_cfg.get("compile", False)
