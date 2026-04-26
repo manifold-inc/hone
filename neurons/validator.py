@@ -428,7 +428,22 @@ class Validator(BaseNode, Trainer):
 
         self.xshapes = {}
         self.totalks = {}
+        # Key totalks / xshapes by *canonical* (wrapper-stripped) name --
+        # the same namespace miners use when building the upload payload
+        # in ``prepare_gradient_dict`` (which keys by ``cname``, see
+        # neurons/miner.py around the ``self.totalks[cname] = ...`` site).
+        # Without canonicalization the validator's totalks map ends up
+        # keyed by ``_orig_mod.layers.0._checkpoint_wrapped_module.<...>``
+        # while the wire payload uses ``layers.0.<...>`` -- gather then
+        # logs ``Missing totalk for parameter layers.0.self_attn.q_proj.
+        # weight from UID N, skipping UID`` and rejects every miner.
+        canon_map = hone.canonical_param_names(self.model)
         for n, p in self.model.named_parameters():
+            cname = canon_map.get(n, n)
+            if cname is None:
+                # PP-only ResBM boundary params have no validator-side
+                # canonical home; they're never aggregated either way.
+                continue
             # Stacked MoE weights are 3D ``(E, D, ffn)``; the codec only
             # speaks 1D / 2D. Collapse the leading expert dim into rows
             # so xshapes/totalks key off the same 2D shape that miners
@@ -447,8 +462,8 @@ class Validator(BaseNode, Trainer):
                 enc,
                 self.hparams.topk_compression,
             )
-            self.xshapes[n] = xshape
-            self.totalks[n] = totalk
+            self.xshapes[cname] = xshape
+            self.totalks[cname] = totalk
 
         self.openskill_model = PlackettLuce(
             beta=self.hparams.openskill_beta, tau=self.hparams.openskill_tau
@@ -3787,10 +3802,22 @@ class Validator(BaseNode, Trainer):
         Raises:
             ValueError: If any gradient data is invalid
         """
+        # Look up per-param data by canonical (wrapper-stripped) name
+        # since that's the namespace miners upload in (their own
+        # ``prepare_gradient_dict`` keys via ``cname = canon_map[n]``)
+        # and that's how we now key ``self.totalks`` / ``self.xshapes``
+        # too. Without canonicalization a wrapped model (FSDP +
+        # checkpoint_wrapper + torch.compile) would never find the
+        # miner's keys -- the same root cause as the global
+        # gather "Missing totalk for parameter ..." rejection.
+        canon_map = hone.canonical_param_names(model)
         for n, p in model.named_parameters():
-            idxs_key = n + "idxs"
-            vals_key = n + "vals"
-            quant_key = n + "quant_params"
+            cname = canon_map.get(n, n)
+            if cname is None:
+                continue
+            idxs_key = cname + "idxs"
+            vals_key = cname + "vals"
+            quant_key = cname + "quant_params"
             idxs = eval_state_dict.get(idxs_key, None)
             vals = eval_state_dict.get(vals_key, None)
             quant_params = eval_state_dict.get(quant_key, None)
@@ -3805,23 +3832,23 @@ class Validator(BaseNode, Trainer):
                 vals = vals.to(self.device)
 
                 # Validate indices are within bounds
-                if self.totalks.get(n) is None:
+                if self.totalks.get(cname) is None:
                     hone.log_with_context(
                         level="warning",
-                        message=f"Missing totalk for parameter {n}, skipping peer {eval_uid}",
+                        message=f"Missing totalk for parameter {cname}, skipping peer {eval_uid}",
                         sync_window=self.sync_window,
                         current_window=self.current_window,
                         eval_uid=eval_uid,
                     )
                     raise ValueError(
-                        f"Invalid gradient data from peer {eval_uid}: Missing totalk for parameter {n}"
+                        f"Invalid gradient data from peer {eval_uid}: Missing totalk for parameter {cname}"
                     )
 
                 # Check compressed indices are valid
                 self.comms.check_compressed_indices(
                     idxs_key,
                     idxs,
-                    self.totalks[n],
+                    self.totalks[cname],
                     allowed_topk=self.hparams.topk_compression,
                     vals=vals,
                 )
@@ -3851,6 +3878,12 @@ class Validator(BaseNode, Trainer):
         clip_norm = True  # Always true in the repo 8/13/2025
         # If all validations pass, apply the gradients
 
+        # Same canonicalization story as ``validate_gradient_data``:
+        # the wire payload uses canonical (wrapper-stripped) keys, so
+        # we must look up by canonical name. Lookups by the raw
+        # ``named_parameters()`` key would always miss when the model
+        # is wrapped (FSDP + checkpoint_wrapper + torch.compile).
+        canon_map = hone.canonical_param_names(model)
         for n, p in model.named_parameters():
             src_rank = 0
             on_src = self.is_master or not dist_helper.is_distributed()
@@ -3858,11 +3891,17 @@ class Validator(BaseNode, Trainer):
             full_grad_src = torch.empty(1, dtype=p.dtype, device=p.device)
             has_valid_gradient = True
 
+            cname = canon_map.get(n, n)
+            if cname is None:
+                # PP-only param with no validator-side aggregation
+                # target -- nothing to apply.
+                continue
+
             # Build the full dense grad on the source rank only (or always in single GPU)
             if on_src:
-                idxs_key = n + "idxs"
-                vals_key = n + "vals"
-                quant_key = n + "quant_params"
+                idxs_key = cname + "idxs"
+                vals_key = cname + "vals"
+                quant_key = cname + "quant_params"
                 idxs = eval_state_dict.get(idxs_key, None)
                 vals = eval_state_dict.get(vals_key, None)
                 quant_params = eval_state_dict.get(quant_key, None)
@@ -3909,8 +3948,8 @@ class Validator(BaseNode, Trainer):
                             ref,
                             idxs,
                             vals,
-                            self.xshapes[n],
-                            self.totalks[n],
+                            self.xshapes[cname],
+                            self.totalks[cname],
                             cast("QuantParamsT | None", quant_params),
                         )
 
