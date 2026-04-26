@@ -1058,24 +1058,36 @@ class Miner(BaseNode, Trainer):
                 self.is_master
                 and getattr(self, "pp_is_first_stage", True)
             ):
-                # Add debug data including successfully gathered peers
+                # Add debug data including successfully gathered peers.
+                # Key by canonical (wrapper-stripped) name so the
+                # validator's ``compare_model_with_debug_dict`` can find
+                # entries regardless of how the validator's own model
+                # is wrapped (FSDP + AC + torch.compile orderings differ
+                # between PP / non-PP and miner / validator).
                 debug_dict = {}
+                debug_canon_map = hone.canonical_param_names(self.model)
 
                 # Add model parameters debug info
                 for name, param in self.model.named_parameters():
-                    if param is not None:
-                        # Handle DTensor vs regular tensor
-                        if isinstance(param, DT):
-                            local_param = param.to_local()
-                            if local_param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    local_param.flatten()[10:12].detach().cpu().tolist()
-                                )
-                        else:
-                            if param.numel() >= 2:
-                                debug_dict[name + "_debug"] = (
-                                    param.flatten()[10:12].detach().cpu().tolist()
-                                )
+                    if param is None:
+                        continue
+                    cname = debug_canon_map.get(name, name)
+                    if cname is None:
+                        # PP-only param with no validator-side
+                        # canonical home (e.g. ResBM boundary).
+                        continue
+                    # Handle DTensor vs regular tensor
+                    if isinstance(param, DT):
+                        local_param = param.to_local()
+                        if local_param.numel() >= 2:
+                            debug_dict[cname + "_debug"] = (
+                                local_param.flatten()[10:12].detach().cpu().tolist()
+                            )
+                    else:
+                        if param.numel() >= 2:
+                            debug_dict[cname + "_debug"] = (
+                                param.flatten()[10:12].detach().cpu().tolist()
+                            )
 
                 # Add gradient fingerprint if available
                 if gradient_fingerprint is not None:

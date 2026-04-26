@@ -1551,16 +1551,43 @@ async def compare_model_with_debug_dict(
     tensors = 0
     step_ratio_list: list[torch.Tensor] = []
 
-    named_params = (
-        model.module.named_parameters()
+    inner = (
+        model.module
         if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-        else model.named_parameters()
+        else model
     )
+    named_params = inner.named_parameters()
+
+    # Look up debug entries by *canonical* (wrapper-stripped) name to
+    # match what writers emit -- the miner's debug_dict keys come from
+    # ``cname + "_debug"`` (canonical, no ``_orig_mod`` /
+    # ``_checkpoint_wrapped_module`` /``stage.`` prefixes), and the
+    # validator's debug-PUT path is doing the same after the recent
+    # fix. Comparing ``model.named_parameters()`` raw keys against the
+    # debug dict here would always miss when the model is wrapped
+    # (FSDP + AC + torch.compile), tensors counter would stay 0, and
+    # every metric would default to ``math.inf`` -- which then crashes
+    # ``log_sync_score`` on ``int(float("inf"))``. We also try the raw
+    # key as a fallback so older miners that haven't deployed the
+    # canonical-name change yet still get a score (better than crashing
+    # the validator).
+    canon_map = canonical_param_names(inner)
 
     for name, p in named_params:
-        key = name + "_debug"
-        if key not in debug_dict or not isinstance(debug_dict[key], list):
+        cname = canon_map.get(name, name)
+        if cname is None:
             continue
+        key = cname + "_debug"
+        if key not in debug_dict or not isinstance(debug_dict[key], list):
+            # Legacy fallback: try the raw wrapped name too so we can
+            # still score peers running pre-fix code.
+            legacy_key = name + "_debug"
+            if legacy_key in debug_dict and isinstance(
+                debug_dict[legacy_key], list
+            ):
+                key = legacy_key
+            else:
+                continue
 
         # --- grab the slice we care about --------------------------------
         if isinstance(p, DT):

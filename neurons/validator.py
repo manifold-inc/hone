@@ -21,6 +21,7 @@ import asyncio
 import concurrent.futures
 import hashlib
 import logging
+import math
 import os
 import random
 import sys
@@ -974,6 +975,20 @@ class Validator(BaseNode, Trainer):
                 with_gpu_metrics=True,
             )
 
+            # Clamp ``max_steps_behind`` before the int cast: upstream
+            # sync code uses ``inf`` as a "no data / total miss"
+            # sentinel (e.g. when the peer's gradient couldn't be
+            # fetched for comparison). ``int(float("inf"))`` raises
+            # ``OverflowError: cannot convert float infinity to
+            # integer`` and crashes the entire validator. We pin to a
+            # large but finite ceiling so the dashboard can still log
+            # the row; the caller's slashing path already treats
+            # values >= ``hparams.sync_max_steps_behind`` as "fully
+            # bad" so the int we emit doesn't need fine resolution.
+            if math.isinf(max_steps_behind) or math.isnan(max_steps_behind):
+                max_steps_behind_int = 99999
+            else:
+                max_steps_behind_int = int(max_steps_behind)
             asyncio.create_task(
                 self.dashboard_reporter.report_sync_scores(
                     window=int(self.sync_window),
@@ -982,7 +997,7 @@ class Validator(BaseNode, Trainer):
                         "l2Norm": l2_norm,
                         "avgAbsDiff": avg_abs_diff,
                         "avgStepsBehind": avg_steps_behind,
-                        "maxStepsBehind": int(max_steps_behind),
+                        "maxStepsBehind": max_steps_behind_int,
                     }],
                 )
             )
@@ -2743,24 +2758,33 @@ class Validator(BaseNode, Trainer):
                     # stash the new slice for next iteration
                     self.prev_param_state[n] = curr_cpu.flatten()[slice_idx].clone()
 
-            # Add debug data including successfully gathered peers
+            # Add debug data including successfully gathered peers.
+            # Key by canonical (wrapper-stripped) name -- this is the
+            # debug payload that catchup miners read back to compare
+            # their model against the validator's. Both sides must
+            # agree on the namespace; raw wrapped names depend on how
+            # the model was compiled / activation-checkpointed which
+            # varies between processes.
             debug_dict = {}
+            debug_canon_map = hone.canonical_param_names(self.model)
 
             # Add model parameters debug info
             for name, param in self.model.named_parameters():
-                if (
-                    param is not None and param.numel() >= 2
-                ):  # Check if tensor has at least 2 elements
-                    # Handle DTensor case - get local tensor first
-                    if isinstance(param, DT):
-                        local_param = param.to_local()
-                        debug_dict[name + "_debug"] = (
-                            local_param.flatten()[:2].detach().cpu().tolist()
-                        )
-                    else:
-                        debug_dict[name + "_debug"] = (
-                            param.flatten()[:2].detach().cpu().tolist()
-                        )
+                if param is None or param.numel() < 2:
+                    continue
+                cname = debug_canon_map.get(name, name)
+                if cname is None:
+                    continue
+                # Handle DTensor case - get local tensor first
+                if isinstance(param, DT):
+                    local_param = param.to_local()
+                    debug_dict[cname + "_debug"] = (
+                        local_param.flatten()[:2].detach().cpu().tolist()
+                    )
+                else:
+                    debug_dict[cname + "_debug"] = (
+                        param.flatten()[:2].detach().cpu().tolist()
+                    )
 
             # Add successful peers information
             if len(skipped_uids) > 0:
