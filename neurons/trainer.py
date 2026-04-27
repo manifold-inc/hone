@@ -774,9 +774,23 @@ class Trainer:
         receive each loss over the wire so every stage's ``Inner Step``
         log line shows the same value.
 
-        NOTE: MoE ``aux_loss`` from this stage's layers is currently
-        discarded -- a pre-existing PP bug that we don't fix here. Adding
-        cross-stage aux-loss accumulation is a separate, small change.
+        Each stage accumulates its own MoE ``aux_loss`` from its layers
+        (``DecoderLayer.forward`` returns ``(out, aux_loss)`` for MoE
+        blocks) and runs that scalar through the same stage-local
+        backward as the wire-driven gradient, so every stage's gate
+        weights see the load-balancing signal locally without shipping
+        aux across the wire.
+
+        On top of that, an identity regulariser on each
+        ``PipelineStageBoundary`` the stage owns pushes the encoder MLP
+        toward zero (so ``encode = encoder + id_down`` stays close to
+        ``id_down``) and the decoder MLP toward zero (so
+        ``decode = decoder + id_up`` stays close to ``id_up``). This
+        keeps boundaries near identity, which matters because miners
+        with different PP topologies do **not** aggregate boundary
+        params -- they have to look identity-like to the per-layer
+        gradients we *do* aggregate. Coefficient is read from
+        ``hparams.pipeline.identity_reg_coeff`` (default ``1e-3``).
         """
         M = len(microbatches)
         if M == 0:
@@ -807,6 +821,23 @@ class Trainer:
                 else 16
             )
         )
+
+        # Coefficient for the boundary identity regulariser (pushes
+        # encoder MLP -> 0 and decoder MLP -> 0 so each boundary stays
+        # close to its IdentityProjection residual). Read once per
+        # 1F1B cycle from ``hparams.pipeline.identity_reg_coeff`` with
+        # a safe ``1e-3`` default so older configs (no PP regulariser
+        # hparam) keep working unchanged.
+        pipeline_cfg = getattr(self.hparams, "pipeline", None)
+        if pipeline_cfg is not None:
+            if hasattr(pipeline_cfg, "identity_reg_coeff"):
+                id_reg_coeff = float(pipeline_cfg.identity_reg_coeff)
+            else:
+                id_reg_coeff = float(
+                    pipeline_cfg.get("identity_reg_coeff", 1e-3)
+                )
+        else:
+            id_reg_coeff = 1e-3
 
         # Each microbatch has identical (B, S) shape so position
         # embeddings can be built once per cycle.
@@ -856,30 +887,58 @@ class Trainer:
         if self.pp_is_first_stage:
             warmup = min(M, P - s - 1)
             steady = M - warmup
-            # Cached boundary outputs awaiting backward, in mb order. Keep
-            # the actual compressed tensor so autograd flows through
-            # output_boundary.encode(), including both encoder weights and
-            # the identity residual path.
-            pending: deque[tuple[int, torch.Tensor]] = deque()
+            ob = self.pp_stage.output_boundary
+            assert ob is not None
+            # Per-microbatch cache awaiting backward, in mb order:
+            # ``compressed`` carries the wire-driven autograd graph
+            # (encoder + id_down + layers + embed); ``local_extra`` is
+            # a single scalar combining this stage's MoE aux loss
+            # (gate-weight load balancing) and the identity regulariser
+            # on the output boundary, run through an extra local
+            # ``backward(retain_graph=True)`` BEFORE the wire-driven
+            # backward inside the same ``_sync_ctx`` block.
+            pending: deque[
+                tuple[int, torch.Tensor, torch.Tensor]
+            ] = deque()
 
             def fwd_one(mb_idx: int) -> None:
                 self._pp_microbatch_idx += 1
                 input_ids = microbatches[mb_idx]
                 h = self.model.embed_tokens(input_ids)
                 h.requires_grad_(True)
+                local_aux_sum: torch.Tensor | None = None
                 for layer in self.pp_stage.layers:
                     result = layer(h, position_embeddings)
-                    h = result[0] if isinstance(result, tuple) else result
-                compressed = self.pp_stage.output_boundary.encode(h).to(
-                    self.amp_dtype
-                )
+                    if isinstance(result, tuple):
+                        h, layer_aux = result[0], result[1]
+                        local_aux_sum = (
+                            layer_aux if local_aux_sum is None
+                            else local_aux_sum + layer_aux
+                        )
+                    else:
+                        h = result
+                # Direct encoder + id_down call so we can hold the
+                # encoder MLP output as a Python local and reuse it
+                # for the identity regulariser without re-running the
+                # encoder. ``ob.encode(x)`` is exactly
+                # ``encoder(x) + id_down(x)``; we reproduce it here.
+                enc_out = ob.encoder(h)
+                compressed_full = enc_out + ob.id_down(h)
+                compressed = compressed_full.to(self.amp_dtype)
                 transport.send_next(compressed.contiguous())
-                pending.append((mb_idx, compressed))
+                # Output-boundary identity regulariser: push encoder
+                # MLP output -> 0, leaving the id_down residual.
+                local_id_reg = enc_out.pow(2).mean() * id_reg_coeff
+                if local_aux_sum is not None:
+                    local_extra = local_aux_sum + local_id_reg
+                else:
+                    local_extra = local_id_reg
+                pending.append((mb_idx, compressed, local_extra))
                 _phase(f"s0 fwd mb={mb_idx}", self._pp_microbatch_idx)
 
             def bwd_one() -> None:
                 nonlocal bwd_count
-                mb_idx, compressed = pending.popleft()
+                mb_idx, compressed, local_extra = pending.popleft()
                 grad_compressed = transport.recv_next(
                     shape=(B, S, bottleneck_dim), dtype=self.amp_dtype
                 )
@@ -887,6 +946,14 @@ class Trainer:
                     shape=(1,), dtype=torch.float32
                 )
                 with _sync_ctx(bwd_count):
+                    if local_extra.requires_grad:
+                        # Match the last stage's normalisation
+                        # (loss / grad_accum). retain_graph keeps the
+                        # shared encoder/layer/embed graph alive for
+                        # the wire-driven backward below.
+                        (
+                            local_extra / self.sampler.grad_accum_steps
+                        ).backward(retain_graph=True)
                     compressed.backward(grad_compressed)
                 losses[mb_idx] = loss_scalar.reshape(()).to(self.device)
                 bwd_count += 1
@@ -922,13 +989,32 @@ class Trainer:
                     shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
                 )
                 compressed.requires_grad_(True)
-                h = ib.decode(compressed)
+                # Direct decoder + id_up call so we can hold the
+                # decoder MLP output for the input-side identity
+                # regulariser without re-running the decoder.
+                # ``ib.decode(c)`` is exactly ``decoder(c) + id_up(c)``.
+                dec_out = ib.decoder(compressed)
+                h = dec_out + ib.id_up(compressed)
+                local_aux_sum: torch.Tensor | None = None
                 for layer in self.pp_stage.layers:
                     result = layer(h, position_embeddings)
-                    h = result[0] if isinstance(result, tuple) else result
+                    if isinstance(result, tuple):
+                        h, layer_aux = result[0], result[1]
+                        local_aux_sum = (
+                            layer_aux if local_aux_sum is None
+                            else local_aux_sum + layer_aux
+                        )
+                    else:
+                        h = result
                 h = self.model.norm(h)
                 logits = self.model.lm_head(h)
                 loss = compute_loss(logits, labels[mb_idx])
+                if local_aux_sum is not None:
+                    loss = loss + local_aux_sum
+                # Input-boundary identity regulariser: push decoder
+                # MLP output -> 0 so decode = id_up + decoder ≈ id_up.
+                local_id_reg = dec_out.pow(2).mean() * id_reg_coeff
+                loss = loss + local_id_reg
                 loss_for_backward = loss / self.sampler.grad_accum_steps
 
                 with _sync_ctx(bwd_count):
@@ -974,8 +1060,16 @@ class Trainer:
 
             warmup = min(M, P - s - 1)
             steady = M - warmup
+            # Per-microbatch cache awaiting backward, in mb order.
+            # ``compressed_in`` / ``compressed_out`` carry the wire-
+            # driven autograd graph (decoder + layers + encoder);
+            # ``local_extra`` is a single scalar combining MoE aux
+            # loss and the *both-sided* identity regulariser
+            # (``L_id_in + L_id_out``), run through an extra local
+            # ``backward(retain_graph=True)`` BEFORE the wire-driven
+            # backward inside the same ``_sync_ctx`` block.
             pending: deque[
-                tuple[int, torch.Tensor, torch.Tensor]
+                tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
             ] = deque()  # type: ignore[no-redef]
 
             def fwd_one(mb_idx: int) -> None:
@@ -984,18 +1078,48 @@ class Trainer:
                     shape=(B, S, ib.bottleneck_dim), dtype=self.amp_dtype
                 )
                 compressed_in.requires_grad_(True)
-                h = ib.decode(compressed_in)
+                # Direct decoder + id_up so we can hold ``dec_in`` for
+                # the input-side identity regulariser. Equivalent to
+                # ``ib.decode(compressed_in)``.
+                dec_in = ib.decoder(compressed_in)
+                h = dec_in + ib.id_up(compressed_in)
+                local_aux_sum: torch.Tensor | None = None
                 for layer in self.pp_stage.layers:
                     result = layer(h, position_embeddings)
-                    h = result[0] if isinstance(result, tuple) else result
-                compressed_out = ob.encode(h).to(self.amp_dtype)
+                    if isinstance(result, tuple):
+                        h, layer_aux = result[0], result[1]
+                        local_aux_sum = (
+                            layer_aux if local_aux_sum is None
+                            else local_aux_sum + layer_aux
+                        )
+                    else:
+                        h = result
+                # Direct encoder + id_down for the output-side
+                # regulariser. Equivalent to ``ob.encode(h)``.
+                enc_out = ob.encoder(h)
+                compressed_out_full = enc_out + ob.id_down(h)
+                compressed_out = compressed_out_full.to(self.amp_dtype)
                 transport.send_next(compressed_out.contiguous())
-                pending.append((mb_idx, compressed_in, compressed_out))
+                local_id_reg = (
+                    dec_in.pow(2).mean() + enc_out.pow(2).mean()
+                ) * id_reg_coeff
+                if local_aux_sum is not None:
+                    local_extra = local_aux_sum + local_id_reg
+                else:
+                    local_extra = local_id_reg
+                pending.append(
+                    (mb_idx, compressed_in, compressed_out, local_extra)
+                )
                 _phase(f"sM fwd mb={mb_idx}", self._pp_microbatch_idx)
 
             def bwd_one() -> None:
                 nonlocal bwd_count
-                mb_idx, compressed_in, compressed_out = pending.popleft()
+                (
+                    mb_idx,
+                    compressed_in,
+                    compressed_out,
+                    local_extra,
+                ) = pending.popleft()
                 grad_compressed_out = transport.recv_next(
                     shape=tuple(compressed_out.shape), dtype=self.amp_dtype
                 )
@@ -1003,6 +1127,14 @@ class Trainer:
                     shape=(1,), dtype=torch.float32
                 )
                 with _sync_ctx(bwd_count):
+                    if local_extra.requires_grad:
+                        # Match last-stage normalisation
+                        # (loss / grad_accum). retain_graph keeps the
+                        # shared decoder/layer/encoder graph alive
+                        # for the wire-driven backward below.
+                        (
+                            local_extra / self.sampler.grad_accum_steps
+                        ).backward(retain_graph=True)
                     compressed_out.backward(grad_compressed_out)
                 grad_compressed_in = compressed_in.grad
                 if grad_compressed_in is None:
@@ -1179,20 +1311,64 @@ class Trainer:
         optimizer_config = getattr(self.hparams, "optimizer", {})
         opt_type = optimizer_config.get("type", "adamw").lower()
 
+        # Track param ids for the PP-boundary group. ResBM
+        # ``input_boundary``/``output_boundary`` MLPs are intentionally
+        # NOT aggregated across miners (each miner has its own PP
+        # topology and its own boundaries) and run on a tiny LR; their
+        # inner-optimizer momentum must survive the per-window soft
+        # decay so they can converge. Populated below per-branch and
+        # consulted in ``reset_inner_optimizer_states``.
+        self._boundary_param_ids: set[int] = set()
+
         if validator:
             dummy = nn.Parameter(torch.zeros(1), requires_grad=False)
             opt_cfg = optimizer_config.get(opt_type, {})
             default_lr = 2e-4 if opt_type == "adamw" else 0.02
             return torch.optim.SGD([dummy], lr=opt_cfg.get("learning_rate", default_lr))
 
+        def _is_boundary_name(name: str) -> bool:
+            # PP-wrapped names look like
+            # ``stage.input_boundary.encoder.fc1.weight`` /
+            # ``stage.output_boundary.decoder.fc2.weight``; substring
+            # match keeps the rule independent of the wrapper prefix.
+            return "input_boundary" in name or "output_boundary" in name
+
         if opt_type == "adamw":
             cfg = optimizer_config.get("adamw", {})
+            base_lr = cfg.get("learning_rate", 2e-4)
+            base_wd = cfg.get("weight_decay", 0.1)
+            betas = tuple(cfg.get("betas", [0.9, 0.95]))
+            eps = cfg.get("eps", 1e-8)
+            boundary_lr_scale = cfg.get("boundary_lr_scale", 0.1)
+
+            non_boundary, boundary = [], []
+            for name, p in self.model.named_parameters():
+                if not p.requires_grad:
+                    continue
+                if _is_boundary_name(name):
+                    boundary.append(p)
+                else:
+                    non_boundary.append(p)
+            self._boundary_param_ids = {id(p) for p in boundary}
+
+            groups: list[dict] = [
+                dict(params=non_boundary, lr=base_lr, weight_decay=base_wd),
+            ]
+            if boundary:
+                # Tiny boundary group: never aggregated across miners,
+                # kept near identity by the regulariser, low LR so its
+                # inner-loop drift over a single window stays small.
+                groups.append(dict(
+                    params=boundary,
+                    lr=base_lr * boundary_lr_scale,
+                    weight_decay=base_wd,
+                ))
             return torch.optim.AdamW(
-                self.model.parameters(),
-                lr=cfg.get("learning_rate", 2e-4),
-                weight_decay=cfg.get("weight_decay", 0.1),
-                betas=tuple(cfg.get("betas", [0.9, 0.95])),
-                eps=cfg.get("eps", 1e-8),
+                groups,
+                lr=base_lr,
+                weight_decay=base_wd,
+                betas=betas,
+                eps=eps,
                 fused=True,
                 foreach=False,
             )
@@ -1203,11 +1379,18 @@ class Trainer:
 
             is_fsdp = any(isinstance(p, DT) for p in self.model.parameters())
 
-            hidden_2d, embed, scalar, head = [], [], [], []
+            hidden_2d, embed, scalar, head, boundary = [], [], [], [], []
             for name, p in self.model.named_parameters():
                 if not p.requires_grad:
                     continue
-                if p.ndim >= 2 and "embed" not in name and "lm_head" not in name:
+                # Boundary classification has to come BEFORE the 2D
+                # ``hidden_2d`` bucket: encoder/decoder fc1/fc2 are 2D
+                # and would otherwise land in the Muon group, which we
+                # don't want -- Newton-Schulz orthogonalisation on
+                # tiny adapter MLPs is the wrong update geometry.
+                if _is_boundary_name(name):
+                    boundary.append(p)
+                elif p.ndim >= 2 and "embed" not in name and "lm_head" not in name:
                     hidden_2d.append(p)
                 elif "embed" in name:
                     embed.append(p)
@@ -1215,6 +1398,7 @@ class Trainer:
                     head.append(p)
                 else:
                     scalar.append(p)
+            self._boundary_param_ids = {id(p) for p in boundary}
 
             wd = self.hparams.weight_decay
             adam_groups = []
@@ -1231,6 +1415,12 @@ class Trainer:
             if scalar:
                 adam_groups.append(dict(
                     params=scalar, lr=muon_lr * cfg.get("scalar_lr_scale", 0.2),
+                    weight_decay=wd,
+                ))
+            if boundary:
+                adam_groups.append(dict(
+                    params=boundary,
+                    lr=muon_lr * cfg.get("boundary_lr_scale", 0.1),
                     weight_decay=wd,
                 ))
             adam_groups = [
@@ -1443,6 +1633,8 @@ class Trainer:
 
         t0 = time.time()
         n_states = sum(1 for _ in self._iter_inner_opt_state_tensors())
+        boundary_ids: set[int] = getattr(self, "_boundary_param_ids", set())
+        n_skipped = 0
         if factor >= 1.0:
             # Hard clear: Muon / Adam will lazily re-allocate fresh
             # zero buffers on the next ``.step()`` call, on the
@@ -1462,10 +1654,31 @@ class Trainer:
             # ``_inner_opt_offloaded`` is False, so calling it
             # unconditionally is safe and cheap.
             self.prefetch_inner_optimizer_states(log=False)
-            for s, k, v in self._iter_inner_opt_state_tensors():
-                if torch.is_tensor(v) and v.is_floating_point():
-                    v.mul_(factor)
-            mode = f"decay x{factor:.3g}"
+            # Walk ``optimizer.state.items()`` directly so we have the
+            # owning param and can skip per-window decay on the
+            # PP-boundary group: those params run on a tiny LR (no
+            # outer aggregation across miners) and need their
+            # accumulated inner-optimizer momentum to survive the
+            # window flip so the boundary can re-converge to its
+            # near-identity setpoint after each layer outer step.
+            for p, s in self.inner_optimizer.state.items():
+                if not isinstance(s, dict):
+                    continue
+                if id(p) in boundary_ids:
+                    n_skipped += sum(
+                        1 for v in s.values() if torch.is_tensor(v)
+                    )
+                    continue
+                for v in s.values():
+                    if torch.is_tensor(v) and v.is_floating_point():
+                        v.mul_(factor)
+            if n_skipped:
+                mode = (
+                    f"decay x{factor:.3g} "
+                    f"(kept {n_skipped} boundary state tensors)"
+                )
+            else:
+                mode = f"decay x{factor:.3g}"
 
         warmup_was_reset = False
         if getattr(self.hparams, "reset_warmup_per_window", True):

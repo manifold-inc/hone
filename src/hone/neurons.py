@@ -544,29 +544,107 @@ def outer_step(
     # ------------------------------------------------------------------
     # Outer-gradient clipping pre-pass (master rank only)
     # ------------------------------------------------------------------
-    # The outer-grad L2 was observed to grow unboundedly across windows
-    # (7 -> 32 -> 75 -> ... -> 727) producing ever-larger per-window
-    # parameter jumps and the loss spikes the user sees on the dashboard.
-    # We bound it the same way the inner loop does: compute the global
-    # L2 across all params we're about to update, scale every per-param
-    # ``full_grad_src`` by ``min(1, threshold / global_norm)``.
+    # We bound the global L2 of the dense post-decompress gradient (the
+    # tensor actually written into ``p.grad`` and applied by the outer
+    # optimizer) to ``max_grad_norm``. An earlier version of this pass
+    # measured ``sum(||vals||^2)`` over the dequantised top-k blocks and
+    # treated that as the global L2; that equality only holds under an
+    # orthogonal sparse-into-zero scatter, but ``batch_decompress`` runs
+    # with ``clip_norm=True`` (rescaling each block by
+    # ``median/norm_i``) and ``transformer.decode`` runs an IDCT, so the
+    # final ``full_grad_src`` has a substantially different L2 from the
+    # vals. The discrepancy was large enough that ``clip_scale`` stayed
+    # at 1.0 every window and the post-clip fingerprint global_l2 grew
+    # unbounded (~1 -> 5 -> 11 -> ... -> 375 with threshold 5).
     #
-    # Implementation choices:
-    # 1. Dequantise each peer's ``vals`` *once* up front and cache the
-    #    fp32 list in ``vals_f32_cache[cname]`` so the main loop can
-    #    skip the second ``maybe_dequantize_values`` call. Cache size is
-    #    tiny (sparse top-k vals; ~1.5 MiB for the full 8B-A1B model).
-    # 2. Use ``||vals_f32||`` (not the post-decompress / post-decode
-    #    full-tensor norm) for the threshold check: orthogonal DCT and
-    #    sparse-into-zero scatter both preserve L2, so this is exact.
-    # 3. Skip entirely when ``max_grad_norm`` is None (current behaviour
-    #    for all unaware callers) or when there's no master payload.
-    # 4. Per-stage clipping: each PP stage's ``outer_step`` only sees
-    #    its own param subset, so clipping is per-stage. That's exactly
-    #    what's needed -- spikes are per-stage param jumps too.
+    # The fix is a proper two-walk implementation:
+    #   walk 1: fully decode every param, accumulate the dense
+    #           ``||full_grad_src||^2``, free each per-param tensor
+    #           before the next decode so peak memory grows by at most
+    #           one decoded gradient at a time. Returns ``clip_scale``.
+    #   walk 2: the existing main loop below redecodes each param,
+    #           multiplies by ``clip_scale`` exactly once, then captures
+    #           the fingerprint -- so the recorded global L2 is the
+    #           post-clip norm and is bounded by ``max_grad_norm``.
+    #
+    # We pick option (a) from the recommended approaches: cache only
+    # the scalar L2 squared (no dense tensors held across walks) and
+    # accept a 2x decode cost in exchange for not bumping peak memory
+    # by a full-model gradient slice. The ``vals_f32`` dequantised
+    # cache *is* kept across walks because dequantisation is the
+    # expensive sub-step; ``batch_decompress`` does not mutate its
+    # input vals so re-using the cached list in walk 2 is safe.
+    #
+    # Per-stage clipping: each PP stage's ``outer_step`` only sees its
+    # own param subset, so the bound is applied per-stage. That's the
+    # right granularity -- spikes are per-stage param jumps too.
     vals_f32_cache: dict[str, list[torch.Tensor]] = {}
     clip_scale: float = 1.0
     pre_clip_norm: float = 0.0
+
+    def _compute_global_clip_scale() -> tuple[float, float]:
+        """Walk every param with an update, fully decode it, and accumulate
+        the dense ``||full_grad_src||^2``. Returns
+        ``(clip_scale, pre_clip_norm)`` where
+        ``clip_scale = min(1.0, max_grad_norm / max(global_l2, 1e-8))``.
+
+        Side effect: populates ``vals_f32_cache[cname]`` with the
+        dequantised vals list for each visited param so the main walk
+        can pop and reuse it. Each per-param dense gradient tensor is
+        released before the next param is decoded so peak memory only
+        grows by at most one full-model gradient slice on master.
+
+        Caller must guarantee ``src_sd is not None`` and
+        ``max_grad_norm`` is a positive float (those are the gates for
+        this function).
+        """
+        assert src_sd is not None and max_grad_norm is not None
+        total_sq_dev = torch.zeros((), device=device, dtype=torch.float32)
+        for _name, _p in model.named_parameters():
+            _cname = canon_map.get(_name, _name)
+            if _cname is None:
+                continue
+            _idxs = src_sd.get(_cname + "idxs")
+            _vals = src_sd.get(_cname + "vals")
+            _qps = src_sd.get(_cname + "quant_params")
+            if _idxs is None or _vals is None:
+                continue
+            if not isinstance(_idxs, (list, tuple)):
+                _idxs = [_idxs]
+            if not isinstance(_vals, (list, tuple)):
+                _vals = [_vals]
+            _vals_f32 = compressor.maybe_dequantize_values(_vals, _qps, device)
+            if not _vals_f32:
+                continue
+            vals_f32_cache[_cname] = _vals_f32
+            _idxs_dev = _idx_to_device(_idxs, device)
+            _block_norms = torch.stack([torch.norm(v, p=2) for v in _vals_f32])
+            _ref = torch.empty_like(_p, device=device, dtype=_p.dtype)
+            _decompressed = compressor.batch_decompress(
+                _ref,
+                _idxs_dev,
+                _vals_f32,
+                xshapes[_cname],
+                totalks[_cname],
+                quantize_params=None,
+                block_norms=_block_norms,
+                normalise=False,
+                clip_norm=True,
+            )
+            _full = transformer.decode(_decompressed, use_dct=use_dct)
+            _full = _full.to(
+                dtype=_p.dtype, device=_p.device, non_blocking=True
+            )
+            if _full.shape != _p.shape:
+                _full = _full.view(_p.shape)
+            # Single-pass fp32-accumulated L2; no full-size fp32 copy
+            # of ``_full`` is materialised.
+            _norm = torch.linalg.vector_norm(_full, ord=2, dtype=torch.float32)
+            total_sq_dev.add_(_norm * _norm)
+            del _decompressed, _full, _norm, _ref, _block_norms, _idxs_dev
+        _pre = float(total_sq_dev.sqrt().item())
+        _scale = min(1.0, max_grad_norm / max(_pre, 1e-8))
+        return _scale, _pre
 
     if (
         on_src
@@ -574,31 +652,7 @@ def outer_step(
         and max_grad_norm is not None
         and max_grad_norm > 0.0
     ):
-        # Accumulate sum-of-squares on-device into a single scalar so
-        # we only sync to host once at the end, regardless of how many
-        # params / chunks we walked.
-        total_sq_dev = torch.zeros((), device=device, dtype=torch.float32)
-        for name, p in model.named_parameters():
-            cname = canon_map.get(name, name)
-            if cname is None:
-                continue
-            idxs = src_sd.get(cname + "idxs")
-            vals = src_sd.get(cname + "vals")
-            qps = src_sd.get(cname + "quant_params")
-            if idxs is None or vals is None:
-                continue
-            if not isinstance(vals, (list, tuple)):
-                vals = [vals]
-            vals_f32 = compressor.maybe_dequantize_values(vals, qps, device)
-            if not vals_f32:
-                continue
-            vals_f32_cache[cname] = vals_f32
-            for v in vals_f32:
-                vf = v.to(torch.float32)
-                total_sq_dev.add_(torch.dot(vf.flatten(), vf.flatten()))
-        pre_clip_norm = float(total_sq_dev.sqrt().item())
-        if pre_clip_norm > max_grad_norm:
-            clip_scale = max_grad_norm / max(pre_clip_norm, 1e-8)
+        clip_scale, pre_clip_norm = _compute_global_clip_scale()
         if fingerprint is not None:
             fingerprint["pre_clip_norm"] = pre_clip_norm
             fingerprint["clip_scale"] = clip_scale
