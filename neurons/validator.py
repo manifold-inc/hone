@@ -2594,6 +2594,17 @@ class Validator(BaseNode, Trainer):
             self.outer_optimizer.zero_grad()
             self.model.zero_grad()
 
+            # Auto-clip EMA state, lazily allocated so it persists
+            # across the validator's outer steps (mirrors the miner's
+            # ``Trainer.outer_step`` wrapper). Catchup-time outer_step
+            # calls in ``catchup_with_aggregation_server`` deliberately
+            # pass ``auto_clip_state=None`` so a fresh restart doesn't
+            # contaminate the live EMA with rapid replay magnitudes.
+            if not hasattr(self, "_outer_auto_clip_state"):
+                self._outer_auto_clip_state: dict = {}
+            auto_on = bool(
+                getattr(self.hparams, "outer_grad_norm_auto", False)
+            )
             gradient_fingerprint = hone.neurons.outer_step(
                 self.model,
                 self.outer_optimizer,
@@ -2610,6 +2621,15 @@ class Validator(BaseNode, Trainer):
                 global_step=self.global_step,
                 max_grad_norm=getattr(
                     self.hparams, "outer_max_grad_norm", None
+                ),
+                auto_clip_state=(
+                    self._outer_auto_clip_state if auto_on else None
+                ),
+                auto_clip_factor=float(
+                    getattr(self.hparams, "outer_grad_norm_auto_factor", 1.5)
+                ),
+                auto_clip_ema_decay=float(
+                    getattr(self.hparams, "outer_grad_norm_ema_decay", 0.95)
                 ),
             )
             self.global_step += 1  # Increment only when we actually do an outer step

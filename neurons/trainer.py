@@ -2121,6 +2121,15 @@ class Trainer:
         }
 
     def outer_step(self, gather_result, log_wandb: bool = False):
+        # Lazy-init the auto-clip EMA state so it survives across
+        # outer steps within this miner's lifetime. ``outer_step`` only
+        # mutates the dict on the source rank (master), but every rank
+        # safely owns its own (empty) reference. Toggle and tuning
+        # live in hparams; defaults match the legacy fixed-cap
+        # behaviour when ``outer_grad_norm_auto`` is missing/false.
+        if not hasattr(self, "_outer_auto_clip_state"):
+            self._outer_auto_clip_state: dict = {}
+        auto_on = bool(getattr(self.hparams, "outer_grad_norm_auto", False))
         return hone.neurons.outer_step(
             self.model,
             self.outer_optimizer,
@@ -2137,5 +2146,14 @@ class Trainer:
             global_step=self.global_step,
             max_grad_norm=getattr(
                 self.hparams, "outer_max_grad_norm", None
+            ),
+            auto_clip_state=(
+                self._outer_auto_clip_state if auto_on else None
+            ),
+            auto_clip_factor=float(
+                getattr(self.hparams, "outer_grad_norm_auto_factor", 1.5)
+            ),
+            auto_clip_ema_decay=float(
+                getattr(self.hparams, "outer_grad_norm_ema_decay", 0.95)
             ),
         )

@@ -456,6 +456,9 @@ def outer_step(
     wandb_run: Run | None = None,
     global_step: int | None = None,
     max_grad_norm: float | None = None,
+    auto_clip_state: dict | None = None,
+    auto_clip_factor: float = 1.5,
+    auto_clip_ema_decay: float = 0.95,
 ) -> dict | None:
     """
     Memory-minimizing variant:
@@ -515,6 +518,16 @@ def outer_step(
             # threshold.
             "pre_clip_norm": 0.0,
             "clip_scale": 1.0,
+            # Self-tuning EMA threshold bookkeeping. When
+            # ``auto_clip_state`` is supplied, ``effective_max`` is the
+            # dynamic bound actually used this step
+            # (= ``min(max_grad_norm, auto_clip_factor * ema)``) and
+            # ``auto_ema`` is the post-step EMA value. Both default to
+            # ``max_grad_norm`` / ``0.0`` when auto-clip is disabled or
+            # the state dict is None, which matches the legacy fixed-cap
+            # behaviour and is unambiguous in dashboards.
+            "effective_max": float(max_grad_norm) if max_grad_norm is not None else 0.0,
+            "auto_ema": 0.0,
         }
 
     def _idx_to_device(obj, dev: str):
@@ -581,12 +594,18 @@ def outer_step(
     vals_f32_cache: dict[str, list[torch.Tensor]] = {}
     clip_scale: float = 1.0
     pre_clip_norm: float = 0.0
+    # Defaults reported in the fingerprint when auto-clip is off so
+    # the keys are always present for downstream dashboards.
+    effective_max: float = float(max_grad_norm) if max_grad_norm is not None else 0.0
+    auto_ema_after: float = (
+        float(auto_clip_state.get("ema", 0.0))
+        if isinstance(auto_clip_state, dict) else 0.0
+    )
 
-    def _compute_global_clip_scale() -> tuple[float, float]:
+    def _compute_pre_clip_norm() -> float:
         """Walk every param with an update, fully decode it, and accumulate
-        the dense ``||full_grad_src||^2``. Returns
-        ``(clip_scale, pre_clip_norm)`` where
-        ``clip_scale = min(1.0, max_grad_norm / max(global_l2, 1e-8))``.
+        the dense ``||full_grad_src||^2``. Returns the pre-clip global
+        L2 of the aggregated outer gradient.
 
         Side effect: populates ``vals_f32_cache[cname]`` with the
         dequantised vals list for each visited param so the main walk
@@ -594,11 +613,11 @@ def outer_step(
         released before the next param is decoded so peak memory only
         grows by at most one full-model gradient slice on master.
 
-        Caller must guarantee ``src_sd is not None`` and
-        ``max_grad_norm`` is a positive float (those are the gates for
-        this function).
+        Caller must guarantee ``src_sd is not None`` (the only gate
+        for this function -- the auto-clip path needs the pre-clip L2
+        even when ``max_grad_norm`` is None to seed the EMA).
         """
-        assert src_sd is not None and max_grad_norm is not None
+        assert src_sd is not None
         total_sq_dev = torch.zeros((), device=device, dtype=torch.float32)
         for _name, _p in model.named_parameters():
             _cname = canon_map.get(_name, _name)
@@ -642,20 +661,68 @@ def outer_step(
             _norm = torch.linalg.vector_norm(_full, ord=2, dtype=torch.float32)
             total_sq_dev.add_(_norm * _norm)
             del _decompressed, _full, _norm, _ref, _block_norms, _idxs_dev
-        _pre = float(total_sq_dev.sqrt().item())
-        _scale = min(1.0, max_grad_norm / max(_pre, 1e-8))
-        return _scale, _pre
+        return float(total_sq_dev.sqrt().item())
 
+    # Auto-clip threshold algorithm (master rank only). When the caller
+    # provides an ``auto_clip_state`` dict we tighten the static cap
+    # ``max_grad_norm`` toward ``auto_clip_factor * ema(post_clip_norm)``
+    # so each outer step is bounded relative to its recent neighbours
+    # rather than to a fixed magnitude. Tracking the EMA on the
+    # post-clip value (not pre-clip) prevents one bad spike from
+    # permanently inflating the threshold:
+    #
+    #   effective_max  = min(max_grad_norm, auto_clip_factor * ema)
+    #   clip_scale     = min(1.0, effective_max / pre_clip_norm)
+    #   post_clip_norm = pre_clip_norm * clip_scale
+    #   ema_next       = decay*ema + (1-decay)*post_clip_norm
+    #
+    # On the first call ``state["ema"]`` is unset; we bootstrap it
+    # with the static ``max_grad_norm`` floor so the very first step
+    # behaves exactly like the legacy code path. Subsequent steps
+    # tighten as data flows in.
     if (
         on_src
         and src_sd is not None
         and max_grad_norm is not None
         and max_grad_norm > 0.0
     ):
-        clip_scale, pre_clip_norm = _compute_global_clip_scale()
+        pre_clip_norm = _compute_pre_clip_norm()
+        if (
+            isinstance(auto_clip_state, dict)
+            and auto_clip_factor > 0.0
+            and 0.0 < auto_clip_ema_decay < 1.0
+        ):
+            ema_prev = auto_clip_state.get("ema")
+            if ema_prev is None or float(ema_prev) <= 0.0:
+                effective_max = float(max_grad_norm)
+            else:
+                effective_max = min(
+                    float(max_grad_norm),
+                    float(auto_clip_factor) * float(ema_prev),
+                )
+            clip_scale = min(
+                1.0, effective_max / max(pre_clip_norm, 1e-8)
+            )
+            post_clip_norm = pre_clip_norm * clip_scale
+            if ema_prev is None or float(ema_prev) <= 0.0:
+                auto_ema_after = float(post_clip_norm)
+            else:
+                auto_ema_after = (
+                    float(auto_clip_ema_decay) * float(ema_prev)
+                    + (1.0 - float(auto_clip_ema_decay)) * float(post_clip_norm)
+                )
+            auto_clip_state["ema"] = auto_ema_after
+        else:
+            effective_max = float(max_grad_norm)
+            clip_scale = min(
+                1.0, effective_max / max(pre_clip_norm, 1e-8)
+            )
+            auto_ema_after = 0.0
         if fingerprint is not None:
             fingerprint["pre_clip_norm"] = pre_clip_norm
             fingerprint["clip_scale"] = clip_scale
+            fingerprint["effective_max"] = effective_max
+            fingerprint["auto_ema"] = auto_ema_after
 
     for name, p in model.named_parameters():
         cname = canon_map.get(name, name)
