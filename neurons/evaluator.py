@@ -181,10 +181,22 @@ def _openbookqa_gold(ex: dict) -> int:
 
 
 # Built-in registry. Pass ``--tasks`` as a comma-separated list of names.
+#
+# All ``hf_path`` values point at parquet-converted mirrors. The legacy
+# script-based repos (``piqa``, ``openbookqa``, ``hellaswag``,
+# ``winogrande``, ``ai2_arc``) bundle a ``{name}.py`` builder that
+# ``datasets>=4.0`` refuses to execute (it raises
+# ``RuntimeError: Dataset scripts are no longer supported, but found
+# {name}.py``). PIQA in particular has no parquet fallback under the
+# old name -- it just fails. OpenBookQA / HellaSwag / Winogrande / ARC
+# do have parquet fallbacks but only after a multi-second HEAD-redirect
+# chain to the S3 script bucket. Switching to canonical parquet mirrors
+# fixes both: PIQA loads at all, and the others load in a single round
+# trip.
 TASK_REGISTRY: dict[str, TaskSpec] = {
     "arc_challenge": TaskSpec(
         name="arc_challenge",
-        hf_path="ai2_arc",
+        hf_path="allenai/ai2_arc",
         hf_name="ARC-Challenge",
         split="validation",
         prompt_fn=_arc_prompt,
@@ -193,7 +205,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     ),
     "arc_easy": TaskSpec(
         name="arc_easy",
-        hf_path="ai2_arc",
+        hf_path="allenai/ai2_arc",
         hf_name="ARC-Easy",
         split="validation",
         prompt_fn=_arc_prompt,
@@ -202,7 +214,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     ),
     "hellaswag": TaskSpec(
         name="hellaswag",
-        hf_path="hellaswag",
+        hf_path="Rowan/hellaswag",
         hf_name=None,
         split="validation",
         prompt_fn=_hellaswag_prompt,
@@ -211,7 +223,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     ),
     "winogrande": TaskSpec(
         name="winogrande",
-        hf_path="winogrande",
+        hf_path="allenai/winogrande",
         hf_name="winogrande_xl",
         split="validation",
         prompt_fn=_winogrande_prompt,
@@ -220,8 +232,10 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     ),
     "piqa": TaskSpec(
         name="piqa",
-        hf_path="piqa",
-        hf_name=None,
+        hf_path="ybisk/piqa",
+        # Required since ybisk/piqa exposes the parquet under the
+        # ``plain_text`` config; lighteval uses the same name.
+        hf_name="plain_text",
         split="validation",
         prompt_fn=_piqa_prompt,
         choices_fn=_piqa_choices,
@@ -229,7 +243,7 @@ TASK_REGISTRY: dict[str, TaskSpec] = {
     ),
     "openbookqa": TaskSpec(
         name="openbookqa",
-        hf_path="openbookqa",
+        hf_path="allenai/openbookqa",
         hf_name="main",
         split="validation",
         prompt_fn=_openbookqa_prompt,
