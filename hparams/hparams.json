@@ -20,7 +20,7 @@
     "outer_lr_schedule": "cosine",
     "outer_lr_t_max": 1000,
     "outer_lr_min_factor": 0.1,
-    "reset_inner_optimizer_per_window": 1.0,
+    "reset_inner_optimizer_per_window": 0.0,
     "reset_warmup_per_window": false,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
