@@ -627,20 +627,10 @@ class Evaluator(Trainer):
 
         # Set the minimal Trainer attributes that ``init_model``
         # reads off self before invoking the inherited init pipeline
-        # (``_pp_setup`` -> ``_apply_activation_checkpointing`` ->
-        # ``_apply_fsdp`` -> ``_apply_torch_compile``). We're inherited
-        # from Trainer so all those methods are bound on us.
-        #
-        # ``pp_degree=1`` -- evaluator never runs PP. Even when running
-        # 4 ranks, those ranks form a single FSDP DP group and walk a
-        # single (full) model copy; PP is meaningless for read-only
-        # forward-pass scoring.
-        self.dp_shard = int(
-            getattr(self.hparams.fsdp, "dp_shard", self.world_size)
-        )
+        # (``_apply_activation_checkpointing`` -> ``_apply_fsdp`` ->
+        # ``_apply_torch_compile``). We're inherited from Trainer so all
+        # those methods are bound on us.
         self.amp_dtype = torch.bfloat16
-        self.pp_stage_id = 0
-        self.pp_degree = 1
         self.init_model(validator=True, meta=True)
         # Materialize on device; weights are filled by DCP load.
         self.model = self.model.to_empty(device=str(self.device))

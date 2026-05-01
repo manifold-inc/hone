@@ -54,87 +54,28 @@ def _safe(obj) -> str:
 
 # ── Model-only Stateful (Titan-compatible distributed state dicts) ─────────────
 class AppState(Stateful):
-    """Wraps a model so DCP ``save`` / ``load`` use a topology-agnostic
-    on-disk schema.
+    """Wraps a model so DCP ``save`` / ``load`` use a wrapper-token-
+    insensitive on-disk schema.
 
-    The validator runs a plain ``LoopLM`` whose ``state_dict`` keys are
-    ``layers.{global_idx}.X``, ``embed_tokens.weight`` etc. The miner runs
-    a ``_PipelineStageModel`` whose keys carry a ``stage.`` prefix and
-    locally-indexed ``stage.layers.{local_idx}.X`` plus PP-only ResBM
-    boundary modules (``stage.input_boundary.*`` / ``stage.output_boundary.*``).
-
-    Without translation the DCP planner crashes the miner with
-    ``RuntimeError: Missing key in checkpoint state_dict:
-    app.stage.layers.0.self_attn.q_proj.weight`` when loading any
-    validator-saved checkpoint, because the miner's local key namespace
-    doesn't match the on-disk one.
-
-    Fix: at this Stateful boundary we route every key through the same
-    canonical-name map already used by the outer-step / gradient-
-    aggregation paths in ``hone.neurons``:
-
-    - ``state_dict()`` rewrites local keys to canonical (so on-disk is
-      always the canonical / plain-LoopLM namespace, regardless of who
-      saves);
-    - ``load_state_dict()`` rewrites canonical back to local before
-      handing off to ``set_model_state_dict``.
-
-    PP-only ResBM boundary params have no canonical home (canonical=None)
-    and are intentionally excluded from the saved state-dict; they're
-    miner-private and stay at whatever value the inner optimizer trains
-    them to (boundary regulariser keeps them near identity, so a fresh
-    init on a restart is OK). A plain-LoopLM model has the identity
-    mapping, so its on-disk schema is unchanged by this translation.
+    ``get_model_state_dict`` (used by ``state_dict()`` below) calls
+    ``_get_fqns`` internally which strips PyTorch wrapper tokens
+    (``_orig_mod.``, ``_checkpoint_wrapped_module.``), so the dict it
+    returns is keyed by *clean* names like
+    ``layers.0.self_attn.q_proj.weight``. ``load_state_dict`` is run
+    with ``strict=False`` so a checkpoint produced under a slightly
+    different wrapper composition is still loadable.
     """
 
     def __init__(self, model):
         self.model = model
-        # ``canonical_param_names`` is keyed by raw ``named_parameters()``
-        # names which still carry wrapper tokens (``_orig_mod.``,
-        # ``_checkpoint_wrapped_module.``) when ``torch.compile`` and
-        # selective AC are applied. ``get_model_state_dict`` (used by
-        # ``state_dict()`` below) calls ``_get_fqns`` internally which
-        # strips those tokens, so the dict it returns is keyed by
-        # *clean* names like ``stage.layers.0.self_attn.q_proj.weight``.
-        # We rebuild the canonical map under the clean key namespace so
-        # the lookup in ``state_dict()`` actually finds the entry. The
-        # strip helper is the same ``_strip_wrapper_prefixes`` that
-        # ``canonical_param_names`` uses on the dst side.
-        from hone.neurons import _strip_wrapper_prefixes
-        raw = hone.canonical_param_names(model)
-        self._canon: dict[str, str | None] = {
-            _strip_wrapper_prefixes(src): dst for src, dst in raw.items()
-        }
-        self._inv: dict[str, str] = {
-            dst: src for src, dst in self._canon.items() if dst is not None
-        }
 
     def state_dict(self) -> dict[str, ValueType]:
-        local = get_model_state_dict(self.model)
-        out: dict[str, ValueType] = {}
-        for k, v in local.items():
-            canon = self._canon.get(k, k)
-            if canon is None:
-                continue
-            out[canon] = v
-        return out
+        return get_model_state_dict(self.model)
 
     def load_state_dict(self, state: dict[str, ValueType]) -> None:
-        # Translate the incoming canonical-namespace dict back to the
-        # local model's namespace before ``set_model_state_dict`` walks
-        # it. ``strict=False`` is still required: when a PP miner loads
-        # a full-model checkpoint the local model only owns one stage's
-        # subset of canonical keys, so the incoming ``state`` may carry
-        # keys this rank's model doesn't have (other stages' layers).
-        # It also keeps schema-version skew (extra keys on disk) from
-        # being a hard failure.
-        translated: dict[str, ValueType] = {}
-        for k, v in state.items():
-            local = self._inv.get(k, k)
-            translated[local] = v
         from torch.distributed.checkpoint.state_dict import StateDictOptions
         set_model_state_dict(
-            self.model, translated, options=StateDictOptions(strict=False)
+            self.model, state, options=StateDictOptions(strict=False)
         )
 
 

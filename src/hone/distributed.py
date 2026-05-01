@@ -141,19 +141,11 @@ class DistributedHelper:
     def _force_reshard(self, model: torch.nn.Module) -> None:
         """Force every FSDP2 unit in ``model`` back to the sharded state.
 
-        ``_pp_run_1f1b`` calls leaf submodules (``embed_tokens``,
-        ``lm_head``, ``model.norm``, ``output_boundary.encoder``,
-        ``output_boundary.decoder``, ...) directly, NOT through the
-        root model's forward. FSDP2's post-backward reshard callback
-        is hooked off the root forward; when that root forward never
-        runs, some leaf units are left in the *unsharded* state where
-        ``param.data`` is the full-shape plain Tensor instead of the
-        local-shard DTensor. Iterating ``model.parameters()`` then
-        observes a mix of sharded (DTensor, local shape (32, 2048))
-        and unsharded (plain Tensor, full shape (64, 2048)) params,
-        which breaks any code (offload/restore/checkpoint/etc.) that
-        assumes a consistent state across all params.
-
+        FSDP2's post-backward reshard callback is hooked off the root
+        forward, so any code path that calls leaf submodules directly
+        (or that snapshots params between forwards) can leave an
+        FSDP unit in the unsharded state where ``param.data`` is the
+        full-shape plain Tensor instead of the local-shard DTensor.
         ``FSDPModule.reshard()`` (added by ``fully_shard``) puts the
         unit back to the sharded state synchronously. Walking the
         module tree and calling it on every FSDP unit is cheap and
@@ -242,9 +234,8 @@ class DistributedHelper:
         params_offloaded: list,
         param_specs: list,
     ) -> None:
-        # Same rationale as in ``get_offloaded_params``: FSDP2 may have
-        # left some leaf units in the unsharded state after
-        # ``_pp_run_1f1b``'s direct submodule calls. Reshard before
+        # Same rationale as in ``get_offloaded_params``: ensure every
+        # FSDP unit is back in its sharded (DTensor) state before
         # iterating so ``isinstance(p, DT)`` agrees with what we saved.
         self._force_reshard(model)
         stream = self._get_offload_stream(model)

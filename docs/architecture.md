@@ -83,18 +83,9 @@ Available MoE configurations:
 | `1.4B-moe` | 8 | 2 | No | Same as dense |
 | `35B-A3B` | 256 | 8 | Yes (dim 512) | 512 |
 
-### Pipeline Parallelism: ResBM
-
-For model-parallel training across nodes connected by limited bandwidth, Hone uses ResBM (Residual Bottleneck Models) to compress activations at pipeline stage boundaries.
-
-- **BottleneckEncoder**: `hidden_dim` -> `bottleneck_dim` via a two-layer network with SiLU
-- **BottleneckDecoder**: `bottleneck_dim` -> `hidden_dim` (mirror of encoder)
-- **IdentityProjection**: rectangular identity for the residual path across dimension changes
-- With `hidden_dim=2048` and `bottleneck_dim=16`, activations are compressed **128x** before crossing the network boundary
-
 ## Parallelism Strategy
 
-Hone combines three levels of parallelism:
+Hone combines two levels of parallelism:
 
 ### Intra-Node: FSDP2
 
@@ -110,13 +101,6 @@ Gradient exchange between nodes uses the DeMo compressed communication protocol.
 
 - Compression ratios of 100-1000x depending on `topk_compression` and model size
 - Asynchronous — miners upload at their own pace within the window
-
-### Inter-Node Model Parallel: Pipeline Parallelism
-
-For models too large to fit on a single node, pipeline parallelism splits the model across machines. Activations are compressed via ResBM before crossing the network boundary over TCP.
-
-- Configured via `pipeline.enabled`, `pipeline.num_stages`, `pipeline.bottleneck_dim`
-- 128x activation compression reduces bandwidth requirements to practical levels
 
 ## Compression Pipeline (DeMo)
 

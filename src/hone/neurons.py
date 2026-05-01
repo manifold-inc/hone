@@ -83,38 +83,18 @@ def _strip_wrapper_prefixes(name: str) -> str:
     return _WRAPPER_TOKEN_RE.sub("", name)
 
 
-def canonical_param_names(model: nn.Module) -> dict[str, str | None]:
+def canonical_param_names(model: nn.Module) -> dict[str, str]:
     """Map ``model.named_parameters()`` keys to cross-rank-stable canonical
-    names so PP miners and plain-``LoopLM`` validators can agree on the
-    namespace used in compressed gradient uploads.
-
-    A value of ``None`` means the parameter has no canonical home in the
-    validator's model (e.g. PP-only ResBM boundary modules) and should be
-    skipped from gradient aggregation entirely. Callers that own the
-    parameter still train it locally via the inner optimizer; we just
-    don't ship its gradient over the wire.
-
-    Models that don't define ``get_canonical_param_names`` are assumed to
-    already use the canonical namespace (the validator's plain ``LoopLM``
-    falls into this bucket), so we return an identity mapping.
+    names used in compressed gradient uploads.
 
     All returned canonical names are post-processed to strip PyTorch
     wrapper tokens (``_orig_mod.``, ``_checkpoint_wrapped_module.``,
     ``_fsdp_wrapped_module.``) so callers don't have to reason about
     whether the model was compiled / activation-checkpointed / FSDP-
-    wrapped, in what order. Wrapping order varies between PP and
-    non-PP code paths and used to silently break gradient
-    aggregation across miner/validator topologies.
+    wrapped, in what order. Wrapping order silently broke gradient
+    aggregation across topologies before this helper existed.
     """
-    fn = getattr(model, "get_canonical_param_names", None)
-    if callable(fn):
-        raw = fn()
-    else:
-        raw = {n: n for n, _ in model.named_parameters()}
-    return {
-        src: (None if dst is None else _strip_wrapper_prefixes(dst))
-        for src, dst in raw.items()
-    }
+    return {n: _strip_wrapper_prefixes(n) for n, _ in model.named_parameters()}
 
 
 def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = False):
@@ -197,8 +177,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         g_is_dt = is_dtensor(g)
 
         # Resolve the canonical (cross-rank-stable) name we publish under.
-        # ``cname is None`` means PP-only boundary param: skip aggregation
-        # entirely (still trained locally by the inner optimizer).
         cname = canon_map.get(n, n)
 
         # --- 1) Grad full_tensor rendezvous (GFULL) ---
@@ -213,14 +191,6 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                 continue
             assert g is not None, f"p.grad is None for {n}"
             grad_full = g.to(p.device)
-
-        # PP boundary params are local-only: every rank participated in
-        # the GFULL collective above so we don't deadlock peers, but we
-        # never compress or upload these. The inner optimizer already
-        # consumed their grad in the inner step, so just drop and move on.
-        if cname is None:
-            p.grad = None
-            continue
 
         # Non-owners: after participating in grad collective, drop grad and continue.
         if not owned:
@@ -548,10 +518,9 @@ def outer_step(
             return tuple(_idx_to_device(x, dev) for x in obj)
         return obj
 
-    # Walk our local model in the canonical namespace so PP-wrapped
-    # miners (whose ``named_parameters()`` keys carry a ``stage.`` prefix
-    # and PP-only ResBM boundaries) can still match against state-dicts
-    # gathered from peers / from a plain-LoopLM validator.
+    # Walk our local model in the canonical (wrapper-stripped) namespace
+    # so the keys we look up here match the keys peers publish in
+    # ``prepare_gradient_dict``.
     canon_map = canonical_param_names(model)
 
     # ------------------------------------------------------------------
@@ -621,8 +590,6 @@ def outer_step(
         total_sq_dev = torch.zeros((), device=device, dtype=torch.float32)
         for _name, _p in model.named_parameters():
             _cname = canon_map.get(_name, _name)
-            if _cname is None:
-                continue
             _idxs = src_sd.get(_cname + "idxs")
             _vals = src_sd.get(_cname + "vals")
             _qps = src_sd.get(_cname + "quant_params")
@@ -1452,13 +1419,6 @@ async def catchup_with_aggregation_server(
                         )
 
                     # ---- Gather fallback ----------------------------------------
-                    pp_cfg = getattr(instance.hparams, "pipeline", None)
-                    if isinstance(pp_cfg, dict):
-                        _pp_num_stages = int(pp_cfg.get("num_stages", 1))
-                    elif pp_cfg is not None:
-                        _pp_num_stages = int(getattr(pp_cfg, "num_stages", 1))
-                    else:
-                        _pp_num_stages = 1
                     gather_ns = await instance.comms.gather(
                         my_uid=instance.uid,
                         uids=instance.comms.peers,
@@ -1472,7 +1432,6 @@ async def catchup_with_aggregation_server(
                         compressor=instance.compressor,
                         time_min=time_min,
                         time_max=time_max,
-                        pp_num_stages=_pp_num_stages,
                     )
 
                 if gather_ns is None:
@@ -1696,8 +1655,6 @@ async def compare_model_with_debug_dict(
 
     for name, p in named_params:
         cname = canon_map.get(name, name)
-        if cname is None:
-            continue
         key = cname + "_debug"
         if key not in debug_dict or not isinstance(debug_dict[key], list):
             # Legacy fallback: try the raw wrapped name too so we can

@@ -28,7 +28,7 @@ After merging, the system constructs a `SimpleNamespace` with all fields, attach
 | `sequence_length` | int | `4096` | Token sequence length per sample. |
 | `micro_batch_size` | int | -- | Number of sequences per micro-batch (per gradient accumulation step). |
 | `target_batch_size` | int | -- | Target total batch size across all miners in the network. Used to compute gradient scaling. |
-| `batch_size` | int | `8` | Local batch size per miner per inner step. Tokens per inner step = `batch_size * sequence_length`. With pipeline parallelism, microbatches per inner step `M = batch_size / (micro_batch_size * world_size_per_stage)` -- raising `batch_size` (or lowering `micro_batch_size`) grows `M` and shrinks the PP bubble fraction `P / (P + M - 1)`. Recommended setting for the 8B-A1B genesis_moe config: `128` (M=16 at world=2, bubble ~17% at PP=3). |
+| `batch_size` | int | `8` | Local batch size per miner per inner step. Tokens per inner step = `batch_size * sequence_length`. Number of gradient accumulation microbatches per inner step is `batch_size / (micro_batch_size * world_size)`. |
 | `inner_steps` | int | -- | Number of local optimizer steps per training window before uploading gradients. Tokens per window = `batch_size * sequence_length * inner_steps`. When `batch_size` is increased to grow PP microbatches, drop `inner_steps` proportionally to keep the window's wall-clock similar; e.g. `batch_size: 32 + inner_steps: 30 -> batch_size: 128 + inner_steps: 8` keeps tokens/window roughly constant while cutting the PP bubble in half. |
 | `max_inner_steps` | int | -- | Upper bound on inner steps. Caps how many local steps a miner can take if the window is long. Scale with `inner_steps`. |
 | `outer_learning_rate` | float | -- | Learning rate for the outer (global) gradient aggregation step. Controls how aggressively aggregated gradients are applied to the global model. |
@@ -189,29 +189,9 @@ Controls PyTorch Fully Sharded Data Parallelism for intra-node GPU sharding.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `fsdp.dp_shard` | int | -- | Number of GPUs to shard across with FSDP. Typically set to the number of GPUs per node (e.g., 4 or 8). |
-| `fsdp.compile` | bool | -- | Whether to use `torch.compile` for the model. In PP mode the compile is applied per-leaf submodule (`embed_tokens`, every `pp_stage.layers[i]`, ResBM `boundary.encoder`/`boundary.decoder`, `lm_head`, `norm`) since `_pp_run_1f1b` calls leaves directly and a root-level compile would be a no-op. In non-PP mode the whole model is compiled end-to-end. |
+| `fsdp.compile` | bool | -- | Whether to use `torch.compile` on the model end-to-end. |
 | `fsdp.mixed_precision` | str \| null | `null` | Mixed precision policy passed to `MixedPrecisionPolicy(param_dtype=..., reduce_dtype=fp32)` on every `fully_shard(...)` call. Accepts `"bfloat16"`/`"bf16"` (recommended), `"float16"`/`"fp16"`, `"float32"`/`"fp32"`, or `null` to disable the policy entirely (legacy behaviour, all-gathers in fp32). With `bfloat16` the per-layer all-gather wire bandwidth is halved and a redundant fp32->bf16 cast inside autocast is removed; `reduce_dtype` is pinned to fp32 for grad-reduce stability. |
-| `fsdp.activation_checkpoint` | str \| null | `null` | Selective activation checkpointing on transformer blocks. `null` / `"none"` / `false` disables AC. `"selective"` (recommended) wraps each `Block` in `checkpoint_wrapper(..., NO_REENTRANT)`, trading ~25% extra backward compute for substantially lower activation memory -- in MoE this frees enough room to grow `batch_size`/`micro_batch_size` and shrink the PP bubble. `"full"` is reserved for a future per-submodule policy and currently behaves like `"selective"`. AC is applied before FSDP wrapping so it sees plain `nn.Module` children. |
-
-## Pipeline Parallelism
-
-Controls inter-node pipeline parallelism with ResBM activation compression. See the [Pipeline Parallelism guide](pipeline-parallelism.md) for full details.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `pipeline.enabled` | bool | `false` | Enable pipeline parallelism. When true, the model's layers are split across PP stages. |
-| `pipeline.num_stages` | int | `4` | Number of pipeline stages. Layers are distributed evenly across stages. Must match `--pp-num-stages` on the per-stage `torchrun` invocations *and* the validator's expectation -- bumping this requires consensus across the network. |
-| `pipeline.bottleneck_dim` | int | `16` | Bottleneck dimension for ResBM activation compression. Compression ratio = `hidden_dim / bottleneck_dim`. |
-
-## PP Transport
-
-Controls the cross-stage activation/gradient transport used by `_pp_run_1f1b`. Two backends are supported under one class (`hone.PPTransport`): asynchronous TCP (default, works cross-node without RDMA) and an opt-in NCCL-P2P fast path for same-node setups.
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `pp_transport.async_send` | bool | `true` | Enable the background sender thread + bounded outbound queue. With `true`, `send_next` / `send_prev` enqueue the (already-staged-to-CPU) tensor and return immediately; a per-direction worker drains the queue to the socket while the next forward/backward microbatch runs on the GPU. With `false` the send is fully synchronous (legacy behaviour, useful for debugging). |
-| `pp_transport.send_queue_depth` | int | `2` | Maximum number of in-flight queued tensors per direction. The bound exists to cap CPU memory growth under a slow peer; `2` lets the next forward overlap with the previous send, which is sufficient when stages are roughly balanced. Raise (e.g. `4`) only if the peer is consistently slower than compute. |
-| `pp_transport.intra_node_nccl` | bool | `false` | Opt into the NCCL P2P fast path when both adjacent stages are on loopback. When enabled, builds a side `ProcessGroupNCCL` from a shared `TCPStore` rendezvous (`PP_NCCL_INIT_METHOD` env, default `tcp://127.0.0.1:29800`) and ships activations GPU-to-GPU over NVLink, skipping the D2H+serialize+H2D round-trip. Requires the side rendezvous to be reachable from every PP-stage process; falls back to async TCP transport on any bringup error. Default `false` so out-of-the-box runs use the (already-fast) async TCP path. |
+| `fsdp.activation_checkpoint` | str \| null | `null` | Selective activation checkpointing on transformer blocks. `null` / `"none"` / `false` disables AC. `"selective"` (recommended) wraps each `Block` in `checkpoint_wrapper(..., NO_REENTRANT)`, trading ~25% extra backward compute for substantially lower activation memory -- in MoE this frees enough room to grow `batch_size`/`micro_batch_size`. `"full"` is reserved for a future per-submodule policy and currently behaves like `"selective"`. AC is applied before FSDP wrapping so it sees plain `nn.Module` children. |
 
 ## DataLoader
 

@@ -22,7 +22,6 @@ Two MoE configs are available out of the box:
 - 4-8x GPUs with 80GB+ VRAM each (A100 80GB or H100/H200)
 - ~35B params at bf16 = ~70 GB weights + optimizer states
 - FSDP across all GPUs is required
-- For multi-node: pipeline parallelism needed (see [pipeline-parallelism.md](pipeline-parallelism.md))
 
 ### General
 
@@ -178,7 +177,6 @@ This makes layers 0-5 and 18-23 use dense MLPs, and layers 6-17 use MoE. This is
 - Add more GPUs with FSDP.
 - Use `moe_intermediate_size` to reduce per-expert FFN size.
 - Use `moe_layers` to limit which layers are MoE.
-- For very large configs (qwen-moe), pipeline parallelism is needed across multiple nodes.
 
 ### Slow training
 

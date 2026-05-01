@@ -16,5 +16,4 @@
 ## Deep Dives
 
 - [MoE Training](moe.md) — MoE architecture details and configuration reference
-- [Pipeline Parallelism](pipeline-parallelism.md) — Multi-node training with ResBM activation compression
 - [Compression](compression.md) — DeMo gradient compression tuning guide

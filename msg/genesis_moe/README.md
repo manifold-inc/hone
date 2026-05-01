@@ -27,24 +27,9 @@ The compression pipeline handles MoE naturally. Each expert's gradients compress
 
 The load balancing auxiliary loss is critical in the decentralized setting. Without it, routing collapse concentrates all tokens on one or two experts, which wastes capacity and creates gradient imbalance across peers. The auxiliary loss keeps routing distributed, ensuring that all experts receive meaningful gradient signal from every peer.
 
-## Pipeline parallelism: training models larger than a single GPU
-
-MoE alone scales parameter count, but the model still needs to fit somewhere during training. For models that exceed single-node memory, we've implemented pipeline parallelism with ResBM (Residual Bottleneck Models) for activation compression.
-
-The problem with pipeline parallelism over the internet is bandwidth. A standard pipeline stage boundary transmits activations of shape `(batch, seq_len, hidden_dim)` — for a 2048-dim model with sequence length 4096, that's 64 MiB per microbatch per boundary in bf16. At consumer internet speeds (80 Mbps), that's a 6-second stall per microbatch. Training would be completely communication-bound.
-
-ResBM solves this with learned bottleneck layers at pipeline boundaries:
-
-- **128x activation compression** — hidden_dim 2048 compresses to bottleneck_dim 16
-- **Identity-preserving residual path** — the bottleneck operates alongside the residual stream, not on it, so gradient flow through the identity path is unimpeded
-- **~3.3% parameter overhead** — the encoder/decoder pairs add negligible parameters
-- **End-to-end trainable** — bottleneck weights train with the same optimizer as the rest of the model, no special constrained optimization needed
-
-With 128x compression, that 64 MiB activation becomes 0.5 MiB — transferable in ~50ms at 80 Mbps. Pipeline parallelism becomes practical over consumer internet.
-
 ## Compression improvements
 
-Alongside MoE and pipeline parallelism, we've tuned the DeMo-based gradient compression:
+Alongside MoE, we've tuned the DeMo-based gradient compression:
 
 - **DCT enabled** — the Discrete Cosine Transform concentrates gradient energy into fewer coefficients before top-k selection, improving compression quality at the same bandwidth
 - **Top-k reduced from 64 to 32** — with DCT compensating for quality, we halve the per-window upload with no convergence penalty
@@ -56,8 +41,6 @@ Alongside MoE and pipeline parallelism, we've tuned the DeMo-based gradient comp
 The infrastructure is in place. The immediate path forward:
 
 1. **Ablation runs** — dense vs MoE at matched active parameters, measuring convergence per token and per FLOP
-2. **Pipeline parallelism validation** — multi-node training with ResBM boundaries over real internet links
-3. **Expert parallelism** — distributing different experts across GPUs within a node for larger expert counts
-4. **Scaling to 7B+ active parameters** — MoE with pipeline parallelism removes the single-node constraint entirely
+2. **Expert parallelism** — distributing different experts across GPUs within a node for larger expert counts
 
 The system trains dense and MoE with the same codebase, the same compression pipeline, the same scoring mechanism. The only difference is a config flag. That's the point — making the architecture decision orthogonal to the distributed training infrastructure, so we can scale model capacity without scaling complexity.

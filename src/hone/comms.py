@@ -1295,7 +1295,6 @@ class Comms(ChainManager):
         global_step: int = 0,
         local: bool = True,
         stale_retention: int = 10,
-        stage_id: int | None = None,
     ) -> float:
         """
         Saves a state dictionary to either local storage or a remote S3 bucket.
@@ -1333,16 +1332,7 @@ class Comms(ChainManager):
                 secret_access_key=credentials["secret_access_key"],
             )
         else:
-            # Per-stage gradient uploads keyed with `-stage{n}` so multiple
-            # PP stages of the same UID don't overwrite each other in R2.
-            # All other key types (debug, etc.) keep the legacy naming.
-            if stage_id is not None and key == "gradient":
-                filename = (
-                    f"gradient-{window}-{uid}-stage{stage_id}"
-                    f"-v{hone.__version__}.pt"
-                )
-            else:
-                filename = f"{key}-{window}-{uid}-v{hone.__version__}.pt"
+            filename = f"{key}-{window}-{uid}-v{hone.__version__}.pt"
             bucket = None
         hone.logger.debug(f"PUT {filename} -->")
 
@@ -1394,7 +1384,6 @@ class Comms(ChainManager):
         uid: int,
         window: int,
         version: str = hone.__version__,
-        stage_id: int | None = None,
     ) -> float:
         """
         Retrieves the last-modified timestamp of a gradient file from S3.
@@ -1407,8 +1396,6 @@ class Comms(ChainManager):
             uid (int): The UID of the miner who owns the gradient.
             window (int): The window number for the gradient.
             version (str, optional): The templar version string. Defaults to `hone.__version__`.
-            stage_id (int, optional): The PP stage. When set, the lookup uses the
-                ``-stage{n}-`` suffixed filename written by per-stage uploads.
 
         Returns:
             float: The POSIX timestamp (seconds since epoch) of the file's
@@ -1420,31 +1407,9 @@ class Comms(ChainManager):
             return 0.0
         try:
             s3 = await self._get_s3_client(bucket)
-            if stage_id is not None:
-                key = f"gradient-{window}-{uid}-stage{stage_id}-v{version}.pt"
-                hdr = await s3.head_object(Bucket=bucket.name, Key=key)
-                return hdr["LastModified"].timestamp()
-            # ``stage_id`` not specified: try the legacy single-file
-            # naming first; if that 404s (typical for PP miners), fall
-            # back to a prefix listing that catches any per-stage upload
-            # and returns the latest LastModified.
-            legacy_key = f"gradient-{window}-{uid}-v{version}.pt"
-            try:
-                hdr = await s3.head_object(Bucket=bucket.name, Key=legacy_key)
-                return hdr["LastModified"].timestamp()
-            except Exception:
-                pass
-            prefix = f"gradient-{window}-{uid}-stage"
-            resp = await s3.list_objects_v2(
-                Bucket=bucket.name, Prefix=prefix
-            )
-            contents = resp.get("Contents", [])
-            if not contents:
-                return 0.0
-            # Use the most recent stage upload as the "miner finished"
-            # timestamp; gather time-window checks should be valid as
-            # long as the LAST stage's payload arrived in window.
-            return max(c["LastModified"].timestamp() for c in contents)
+            key = f"gradient-{window}-{uid}-v{version}.pt"
+            hdr = await s3.head_object(Bucket=bucket.name, Key=key)
+            return hdr["LastModified"].timestamp()
         except Exception:
             await self._purge_s3_client(bucket)
             return 0.0
@@ -1461,7 +1426,6 @@ class Comms(ChainManager):
         time_max: datetime | None = None,
         show_progress: bool = True,
         map_location: str | None = None,
-        stage_id: int | None = None,
     ) -> CommsGetResult:
         """
         Retrieves an object from storage, either locally or from a remote S3 bucket.
@@ -1492,11 +1456,6 @@ class Comms(ChainManager):
         """
         if key == "aggregator":
             filename = f"{key}-{window}-v{hone.__version__}.pt"
-        elif stage_id is not None and key == "gradient":
-            filename = (
-                f"gradient-{window}-{uid}-stage{stage_id}"
-                f"-v{hone.__version__}.pt"
-            )
         else:
             filename = f"{key}-{window}-{uid}-v{hone.__version__}.pt"
         hone.logger.debug(f"GET {filename} -->")
@@ -1584,7 +1543,6 @@ class Comms(ChainManager):
         time_max: datetime | None = None,
         show_progress: bool = False,
         map_location: str | None = None,
-        stage_id: int | None = None,
     ) -> CommsGetResult | None:
         """
         Attempts to retrieve an object from storage with a retry mechanism.
@@ -1658,7 +1616,6 @@ class Comms(ChainManager):
                 time_max=time_max,
                 show_progress=show_progress,
                 map_location=map_location,
-                stage_id=stage_id,
             )
 
             if result.success:
@@ -1692,8 +1649,6 @@ class Comms(ChainManager):
         time_min: datetime | None = None,
         time_max: datetime | None = None,
         xshapes: dict[str, tuple] | None = None,
-        pp_num_stages: int = 1,
-        stage_id_filter: int | None = None,
     ) -> SimpleNamespace | None:
         """
         Gathers and processes gradients from a list of peer UIDs.
@@ -1760,88 +1715,17 @@ class Comms(ChainManager):
         uids = sorted(uids)
 
         async def _fetch_uid(uid: int) -> CommsGetResult | None:
-            """Fetch one peer's gradient.
-
-            Three modes:
-
-            1. ``pp_num_stages <= 1``: legacy single-file naming. Used by
-               non-PP runs.
-            2. ``stage_id_filter is not None``: PP miner gathering from
-               peers. Each peer's stage ``stage_id_filter`` is what this
-               local miner needs to apply (own-stage params only); the
-               other stages' files would carry foreign-namespace keys
-               and trip the totalks-check anyway. Fetch only that one
-               file, no merge.
-            3. ``pp_num_stages > 1`` and no filter: validator path.
-               Download every per-stage file in parallel and merge into
-               a single state dict so the un-carved validator model can
-               apply the full-model gradient. Param namespaces between
-               stages are disjoint by construction.
-            """
-            if pp_num_stages <= 1:
-                return await self.get_with_retry(
-                    uid=str(uid),
-                    window=window,
-                    key=key,
-                    timeout=timeout,
-                    local=local,
-                    stale_retention=stale_retention,
-                    time_min=time_min,
-                    time_max=time_max,
-                    map_location=device,
-                )
-
-            if stage_id_filter is not None:
-                return await self.get_with_retry(
-                    uid=str(uid),
-                    window=window,
-                    key=key,
-                    timeout=timeout,
-                    local=local,
-                    stale_retention=stale_retention,
-                    time_min=time_min,
-                    time_max=time_max,
-                    map_location=device,
-                    stage_id=stage_id_filter,
-                )
-
-            stage_results = await asyncio.gather(
-                *(
-                    self.get_with_retry(
-                        uid=str(uid),
-                        window=window,
-                        key=key,
-                        timeout=timeout,
-                        local=local,
-                        stale_retention=stale_retention,
-                        time_min=time_min,
-                        time_max=time_max,
-                        map_location=device,
-                        stage_id=s,
-                    )
-                    for s in range(pp_num_stages)
-                ),
-                return_exceptions=True,
+            return await self.get_with_retry(
+                uid=str(uid),
+                window=window,
+                key=key,
+                timeout=timeout,
+                local=local,
+                stale_retention=stale_retention,
+                time_min=time_min,
+                time_max=time_max,
+                map_location=device,
             )
-
-            # Any stage missing / errored => the whole UID's payload is
-            # unusable; signal NOT_FOUND so the gather loop tags it skipped.
-            merged: dict[str, Any] = {}
-            global_step_first: int = 0
-            for s_idx, sr in enumerate(stage_results):
-                if isinstance(sr, Exception) or sr is None or not sr.success:
-                    hone.logger.debug(
-                        f"UID {uid} stage {s_idx}: missing/failed "
-                        f"({sr if not isinstance(sr, Exception) else sr})"
-                    )
-                    return None
-                if sr.data is None:
-                    return None
-                if s_idx == 0:
-                    global_step_first = sr.global_step
-                merged.update(sr.data)
-
-            return CommsGetResult(data=merged, global_step=global_step_first)
 
         async with self.gather_semaphore:
             batch_tasks = [_fetch_uid(uid) for uid in uids]
@@ -2142,8 +2026,6 @@ class Comms(ChainManager):
         gather_uids: list[int],
         reserve_uids: list[int],
         expected_compressed_params: set[str] | None = None,
-        pp_num_stages: int = 1,
-        stage_id_filter: int | None = None,
         **kwargs,
     ) -> SimpleNamespace | None:
         """
@@ -2186,8 +2068,6 @@ class Comms(ChainManager):
             my_uid=my_uid,
             uids=gather_uids,
             expected_compressed_params=expected_compressed_params,
-            pp_num_stages=pp_num_stages,
-            stage_id_filter=stage_id_filter,
             **kwargs,
         )
 
@@ -2226,8 +2106,6 @@ class Comms(ChainManager):
                 fallback = await self.gather(
                     my_uid=my_uid,
                     uids=replacements,
-                    pp_num_stages=pp_num_stages,
-                    stage_id_filter=stage_id_filter,
                     **kwargs,
                 )
                 if fallback:

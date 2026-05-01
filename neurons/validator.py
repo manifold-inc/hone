@@ -370,11 +370,6 @@ class Validator(BaseNode, Trainer):
         self.device = torch.device(self.config.device)
         hone.logger.info(f"[Init] device set → {self.device}")
 
-        # Parallelization config must be set BEFORE init_model so the
-        # trainer's meta path applies FSDP across the validator's GPUs.
-        # Validator does not currently support PP; pin pp_degree=1.
-        self.pp_degree = 1
-
         # Initialize model on meta device first
         self.init_model(validator=True, meta=True)
         # Move model from meta to actual device (allocates memory but no initialization)
@@ -382,7 +377,6 @@ class Validator(BaseNode, Trainer):
         self.model_initialized = False  # Track if model has actual weights
 
         # ---------------- DIAGNOSTIC: confirm what init_model actually did ----------------
-        # Gated on --debug. Skips the per-param iteration entirely when off.
         if hone.logger.isEnabledFor(logging.DEBUG):
             _rank = int(os.getenv("RANK", 0))
             _ws = int(os.getenv("WORLD_SIZE", 1))
@@ -394,11 +388,7 @@ class Validator(BaseNode, Trainer):
             first_shape = tuple(first_p.shape) if first_p is not None else ()
             hone.logger.debug(
                 f"[Diag/Validator] post-init_model: world_size={_ws} rank={_rank} "
-                f"local_rank={_local_rank} "
-                f"pp_stages(in_trainer)={getattr(self, 'pp_stages', '<unset>')} "
-                f"pp_stage_id={getattr(self, 'pp_stage_id', '<unset>')} "
-                f"pp_stage_ranks={getattr(self, 'pp_stage_ranks', '<unset>')} "
-                f"pp_stage_module_present={getattr(self, 'pp_stage', None) is not None}"
+                f"local_rank={_local_rank}"
             )
             hone.logger.debug(
                 f"[Diag/Validator] model: total_params={n_total / 1e9:.4f}B "
@@ -441,10 +431,6 @@ class Validator(BaseNode, Trainer):
         canon_map = hone.canonical_param_names(self.model)
         for n, p in self.model.named_parameters():
             cname = canon_map.get(n, n)
-            if cname is None:
-                # PP-only ResBM boundary params have no validator-side
-                # canonical home; they're never aggregated either way.
-                continue
             # Stacked MoE weights are 3D ``(E, D, ffn)``; the codec only
             # speaks 1D / 2D. Collapse the leading expert dim into rows
             # so xshapes/totalks key off the same 2D shape that miners
@@ -1598,13 +1584,6 @@ class Validator(BaseNode, Trainer):
                     hone.logger.info(
                         f"Rank {dist_helper.rank} starting gather_with_reserve for window {self.sync_window}"
                     )
-                    pp_cfg = getattr(self.hparams, "pipeline", None)
-                    if isinstance(pp_cfg, dict):
-                        pp_num_stages = int(pp_cfg.get("num_stages", 1))
-                    elif pp_cfg is not None:
-                        pp_num_stages = int(getattr(pp_cfg, "num_stages", 1))
-                    else:
-                        pp_num_stages = 1
                     gather_result = await self.comms.gather_with_reserve(
                         my_uid=self.uid,
                         gather_uids=self.comms.peers,
@@ -1620,7 +1599,6 @@ class Validator(BaseNode, Trainer):
                         time_min=time_min,
                         time_max=time_max,
                         expected_compressed_params=self.expected_compressed_params,
-                        pp_num_stages=pp_num_stages,
                     )
                     hone.logger.info(
                         f"Rank {dist_helper.rank} completed gather_with_reserve for window {self.sync_window}"
@@ -2055,7 +2033,7 @@ class Validator(BaseNode, Trainer):
 
                 if self.is_master:
                     try:
-                        eval_result = await self._fetch_peer_gradient_pp_aware(
+                        eval_result = await self._fetch_peer_gradient(
                             eval_uid=eval_uid,
                             window=self.sync_window,
                             time_min=time_min,
@@ -2793,8 +2771,6 @@ class Validator(BaseNode, Trainer):
                 if param is None or param.numel() < 2:
                     continue
                 cname = debug_canon_map.get(name, name)
-                if cname is None:
-                    continue
                 # Handle DTensor case - get local tensor first
                 if isinstance(param, DT):
                     local_param = param.to_local()
@@ -3656,7 +3632,7 @@ class Validator(BaseNode, Trainer):
         if uid not in self.openskill_ratings:
             self.openskill_ratings[uid] = self.openskill_model.rating(name=str(uid))
 
-    async def _fetch_peer_gradient_pp_aware(
+    async def _fetch_peer_gradient(
         self,
         *,
         eval_uid: int,
@@ -3664,99 +3640,16 @@ class Validator(BaseNode, Trainer):
         time_min,
         time_max,
     ):
-        """Fetch a single peer's gradient for per-UID evaluation, with
-        the same PP-stage merge logic the gather flow uses.
-
-        The legacy ``self.comms.get(uid, window, key='gradient')`` call
-        looks for ``gradient-{w}-{uid}-v{version}.pt`` -- a single-file
-        upload that PP miners NEVER produce. PP miners upload one file
-        per stage (``gradient-{w}-{uid}-stage{N}-v{version}.pt``). Under
-        ``pipeline.num_stages > 1`` the legacy call always 404s and the
-        per-UID eval slashes the peer with "No gradient received from
-        UID N" even though the peer's gradient was published correctly
-        and the global gather happily downloaded it via ``_fetch_uid``
-        in src/hone/comms.py (which knows about stages).
-
-        This helper mirrors that gather-side per-stage fetch + merge so
-        the per-UID eval finds the same data.
-        """
-        # Resolve PP stage count from chain hparams (same lookup the
-        # gather path uses around validator.py:1586). Validator itself
-        # always runs pp_degree=1; the topology number here is what
-        # peers (miners) configured.
-        pp_cfg = getattr(self.hparams, "pipeline", None)
-        if isinstance(pp_cfg, dict):
-            pp_num_stages = int(pp_cfg.get("num_stages", 1))
-        elif pp_cfg is not None:
-            pp_num_stages = int(getattr(pp_cfg, "num_stages", 1))
-        else:
-            pp_num_stages = 1
-
-        if pp_num_stages <= 1:
-            return await self.comms.get(
-                uid=str(eval_uid),
-                window=window,
-                key="gradient",
-                local=False,
-                stale_retention=10,
-                time_min=time_min,
-                time_max=time_max,
-            )
-
-        # PP > 1: fetch every per-stage file in parallel, then merge.
-        # Param namespaces between stages are disjoint by construction
-        # (each stage owns its own layers), so a flat ``dict.update``
-        # is the right merge primitive (matches comms._fetch_uid).
-        stage_results = await asyncio.gather(
-            *(
-                self.comms.get(
-                    uid=str(eval_uid),
-                    window=window,
-                    key="gradient",
-                    local=False,
-                    stale_retention=10,
-                    time_min=time_min,
-                    time_max=time_max,
-                    stage_id=s,
-                )
-                for s in range(pp_num_stages)
-            ),
-            return_exceptions=True,
+        """Fetch a single peer's gradient for per-UID evaluation."""
+        return await self.comms.get(
+            uid=str(eval_uid),
+            window=window,
+            key="gradient",
+            local=False,
+            stale_retention=10,
+            time_min=time_min,
+            time_max=time_max,
         )
-
-        merged: dict = {}
-        global_step_first: int = 0
-        for s_idx, sr in enumerate(stage_results):
-            # Any stage missing / exception -> the whole peer payload
-            # is unusable. Return a NOT_FOUND-equivalent so the caller
-            # follows its existing slashing path.
-            if isinstance(sr, Exception):
-                hone.logger.warning(
-                    f"[validator] per-UID PP stage {s_idx} fetch raised "
-                    f"for UID {eval_uid}: {sr!r} -- marking missing"
-                )
-                from hone.comms import CommsGetResult
-                return CommsGetResult(status="NOT_FOUND")
-            if sr is None or not sr.success or sr.data is None:
-                hone.logger.info(
-                    f"[validator] per-UID PP stage {s_idx} missing for "
-                    f"UID {eval_uid} -- marking missing"
-                )
-                from hone.comms import CommsGetResult
-                return CommsGetResult(status="NOT_FOUND")
-            if isinstance(sr.data, dict) and sr.data.get("__status") in (
-                "TOO_LATE",
-                "TOO_EARLY",
-            ):
-                # Treat any-stage-too-late as the whole UID being late;
-                # consistent with the gather-side behaviour.
-                return sr
-            if s_idx == 0:
-                global_step_first = sr.global_step
-            merged.update(sr.data)
-
-        from hone.comms import CommsGetResult
-        return CommsGetResult(data=merged, global_step=global_step_first)
 
     def slash_for_missing_gradient(self, eval_uid: int) -> None:
         """Slash a peer for not submitting a gradient.
@@ -3956,8 +3849,6 @@ class Validator(BaseNode, Trainer):
         canon_map = hone.canonical_param_names(model)
         for n, p in model.named_parameters():
             cname = canon_map.get(n, n)
-            if cname is None:
-                continue
             idxs_key = cname + "idxs"
             vals_key = cname + "vals"
             quant_key = cname + "quant_params"
@@ -4035,10 +3926,6 @@ class Validator(BaseNode, Trainer):
             has_valid_gradient = True
 
             cname = canon_map.get(n, n)
-            if cname is None:
-                # PP-only param with no validator-side aggregation
-                # target -- nothing to apply.
-                continue
 
             # Build the full dense grad on the source rank only (or always in single GPU)
             if on_src:

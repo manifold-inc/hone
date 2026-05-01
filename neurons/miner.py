@@ -29,7 +29,6 @@ import random
 import sys
 import time
 from datetime import datetime, timedelta, timezone
-from types import SimpleNamespace
 from typing import cast
 
 import bittensor as bt
@@ -147,43 +146,6 @@ class Miner(BaseNode, Trainer):
         parser.add_argument("--debug", action="store_true", help="Enable debug logging")
         parser.add_argument("--trace", action="store_true", help="Enable trace logging")
         parser.add_argument(
-            "--pp-stage", type=int, default=0,
-            help="0-indexed pipeline stage that THIS torchrun job is running.",
-        )
-        parser.add_argument(
-            "--pp-num-stages", type=int, default=1,
-            help="Total number of pipeline-parallel stages. 1 = no PP (default).",
-        )
-        parser.add_argument(
-            "--pp-peer-host-prev", type=str, default="127.0.0.1",
-            help="Hostname/IP of the previous PP stage. Unused on stage 0.",
-        )
-        parser.add_argument(
-            "--pp-peer-host-next", type=str, default="127.0.0.1",
-            help="Hostname/IP of the next PP stage. Unused on the last stage.",
-        )
-        parser.add_argument(
-            "--pp-peer-port-base-prev", type=int, default=50100,
-            help="Previous stage's listen-port base. Each rank R adds R to it. "
-                 "Currently unused (we don't initiate connections to prev) but "
-                 "kept for symmetry / future use.",
-        )
-        parser.add_argument(
-            "--pp-peer-port-base-next", type=int, default=50100,
-            help="Next stage's listen-port base. Each rank R connects to "
-                 "(peer_host_next, peer_port_base_next + R).",
-        )
-        parser.add_argument(
-            "--pp-listen-host", type=str, default="0.0.0.0",
-            help="Address to bind the PP transport listener.",
-        )
-        parser.add_argument(
-            "--pp-listen-port-base", type=int, default=50000,
-            help="My own listen-port base. Each rank R listens on "
-                 "(pp_listen_host, pp_listen_port_base + R) for the previous "
-                 "stage's connect.",
-        )
-        parser.add_argument(
             "--store-gathers",
             action="store_true",
             help="Store gathered gradients in R2",
@@ -274,66 +236,13 @@ class Miner(BaseNode, Trainer):
         hone.logger.info("[Init] Bittensor wallet loaded")
         super().__init__()
 
-        # Parallelization config must be set BEFORE init_model so the
-        # trainer's meta path knows whether to carve into pipeline stages
-        # and apply FSDP. Reading these via getattr inside init_model
-        # silently defaulted to 1 when assigned afterwards, which left the
-        # miner running an unsharded full model on every rank.
-        fsdp_cfg = getattr(self.hparams, "fsdp", SimpleNamespace())
-        self.tp_degree = 1
-        # Each torchrun job is one PP stage; world_size = ranks within the
-        # stage. ``pp_num_stages`` is the total stage count across the
-        # logical pipeline; ``pp_stage_id`` is which stage THIS torchrun is.
-        self.pp_num_stages = int(getattr(self.config, "pp_num_stages", 1))
-        self.pp_stage_id = int(getattr(self.config, "pp_stage", 0))
-        self.pp_degree = self.pp_num_stages  # alias the trainer reads
-        self.cp_degree = 1
-        self.dp_replicate = int(getattr(fsdp_cfg, "dp_replicate", 1))
-        self.dp_shard = int(getattr(fsdp_cfg, "dp_shard", 1))
-
         # Initialize model on meta device first
         self.init_model(meta=True)
         # Move model from meta to actual device (allocates memory but no initialization)
         self.model = self.model.to_empty(device=str(self.device))
         self.model_initialized = False  # Track if model has actual weights
 
-        # ----- Cross-stage TCP transport (replaces NCCL P2P) -----
-        # We keep one TCP connection per (stage S rank R, stage S+1 rank R)
-        # pair. Activations and gradients both flow over this socket;
-        # FSDP-internal NCCL stays untouched. Skipped when pp_num_stages == 1.
-        self.pp_transport: hone.PPTransport | None = None
-        if self.pp_num_stages > 1:
-            # Per-transport hparams. ``async_send`` enables the
-            # background sender thread (decouples next-microbatch
-            # compute from socket I/O), ``send_queue_depth`` bounds
-            # how many in-flight tensors we let pile up on the wire,
-            # and ``intra_node_nccl`` opts into the NCCL P2P fast
-            # path when both adjacent stages are on loopback (still
-            # falls back to TCP if NCCL bringup fails).
-            pp_t_cfg = getattr(self.hparams, "pp_transport", None) or {}
-            if not isinstance(pp_t_cfg, dict):
-                pp_t_cfg = {}
-            self.pp_transport = hone.PPTransport(
-                my_stage=self.pp_stage_id,
-                num_stages=self.pp_num_stages,
-                my_local_rank=self.local_rank,
-                ranks_per_stage=self.world_size,
-                peer_host_prev=self.config.pp_peer_host_prev,
-                peer_port_base_prev=int(self.config.pp_peer_port_base_prev),
-                peer_host_next=self.config.pp_peer_host_next,
-                peer_port_base_next=int(self.config.pp_peer_port_base_next),
-                listen_host=self.config.pp_listen_host,
-                listen_port_base=int(self.config.pp_listen_port_base),
-                device=self.device,
-                amp_dtype=self.amp_dtype,
-                async_send=bool(pp_t_cfg.get("async_send", True)),
-                send_queue_depth=int(pp_t_cfg.get("send_queue_depth", 2)),
-                intra_node_nccl=bool(pp_t_cfg.get("intra_node_nccl", False)),
-            )
-            self.pp_transport.start()
-
         # ---------------- DIAGNOSTIC: confirm what init_model actually did ----------------
-        # Gated on --debug. Cheap to compute but noisy in normal logs.
         if hone.logger.isEnabledFor(logging.DEBUG):
             n_total = sum(p.numel() for p in self.model.parameters())
             n_dt = sum(1 for p in self.model.parameters() if isinstance(p, DT))
@@ -342,14 +251,7 @@ class Miner(BaseNode, Trainer):
             first_shape = tuple(first_p.shape) if first_p is not None else ()
             hone.logger.debug(
                 f"[Diag/Miner] post-init_model: world_size={self.world_size} rank={self.rank} "
-                f"local_rank={self.local_rank} "
-                f"pp_degree(set_in_miner)={self.pp_degree} "
-                f"pp_stages(in_trainer)={getattr(self, 'pp_stages', '<unset>')} "
-                f"pp_stage_id={getattr(self, 'pp_stage_id', '<unset>')} "
-                f"pp_stage_ranks={getattr(self, 'pp_stage_ranks', '<unset>')} "
-                f"pp_send_rank={getattr(self, 'pp_send_rank', '<unset>')} "
-                f"pp_recv_rank={getattr(self, 'pp_recv_rank', '<unset>')} "
-                f"pp_stage_module_present={getattr(self, 'pp_stage', None) is not None}"
+                f"local_rank={self.local_rank}"
             )
             hone.logger.debug(
                 f"[Diag/Miner] model: total_params={n_total / 1e9:.4f}B "
@@ -381,18 +283,15 @@ class Miner(BaseNode, Trainer):
         self.xshapes = {}
         self.totalks = {}
         # Map ``model.named_parameters()`` keys to validator-compatible
-        # canonical names. ``cname is None`` flags PP-only ResBM boundary
-        # params: those are trained locally by the inner optimizer but
-        # never aggregated, so we skip them from owned_params/totalks
-        # (no compressed-payload slot, no entry in ``expected_compressed_params``).
+        # canonical (wrapper-stripped) names so the local error-feedback
+        # buffers and uploaded compressed-payload keys live in the same
+        # namespace the validator iterates in.
         canon_map = hone.canonical_param_names(self.model)
         model_iterator = self.model.named_parameters()
 
         compressible_idx = 0
         for n, p in model_iterator:
             cname = canon_map.get(n, n)
-            if cname is None:
-                continue
 
             if compressible_idx % self.world_size == self.rank:
                 # this rank "owns" the parameter — error feedback / inner
@@ -497,20 +396,8 @@ class Miner(BaseNode, Trainer):
         self.wandb = NullMetricsLogger()
         self.metrics_logger = NullMetricsLogger()
 
-        # Dashboard reporter: ONE per miner total -- stage-0 master.
-        #
-        # ``self.is_master`` is per-torchrun (i.e. the local rank-0 of
-        # this stage's process group), so under PP > 1 every stage has
-        # its own master. Without the extra ``pp_stage_id == 0`` gate,
-        # every PP stage would register a separate run, open its own
-        # WebSocket as the same hotkey, and race on POST /ingest/*.
-        # The dashboard's ws server then disconnects duplicates and
-        # we see the "POST /ingest/inner-step failed" + WS timeout
-        # cascade in the logs. With PP=2 + dp=4 we'd otherwise have
-        # 2 real reporters; keep it at 1.
-        self.is_dashboard_master = (
-            self.is_master and int(getattr(self, "pp_stage_id", 0)) == 0
-        )
+        # Dashboard reporter: ONE per miner total -- the local rank-0.
+        self.is_dashboard_master = self.is_master
         if self.is_dashboard_master:
             self.dashboard_reporter = hone.DashboardReporter(
                 hotkey=str(self.wallet.hotkey.ss58_address),
@@ -667,9 +554,6 @@ class Miner(BaseNode, Trainer):
                 window=self.current_window,
                 key="gradient",
                 local=False,
-                stage_id=(
-                    self.pp_stage_id if self.pp_num_stages > 1 else None
-                ),
             )
             hone.logger.info("Dummy gradient posted successfully")
 
@@ -901,9 +785,6 @@ class Miner(BaseNode, Trainer):
                     global_step=self.global_step,
                     local=False,
                     stale_retention=100,
-                    stage_id=(
-                        self.pp_stage_id if self.pp_num_stages > 1 else None
-                    ),
                 )
 
                 upload_size = sum(
@@ -983,22 +864,6 @@ class Miner(BaseNode, Trainer):
                     time_min=time_min,
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
-                    pp_num_stages=self.pp_num_stages,
-                    # PP miner: only fetch each peer's *own-stage*
-                    # gradient. Stage 0 has totalks/xshapes for
-                    # ``layers.0..N/2-1`` only; pulling stage 1 too and
-                    # merging would dump ``layers.N/2..N-1`` keys into
-                    # the state dict that the per-key totalks-check then
-                    # rejects (``Missing totalk for parameter
-                    # layers.X.self_attn.q_proj.weight from UID Y,
-                    # skipping UID``), wasting both bandwidth and
-                    # peer-aggregation opportunities. Validators leave
-                    # this ``None`` because they DO want all stages.
-                    stage_id_filter=(
-                        self.pp_stage_id
-                        if self.pp_num_stages > 1
-                        else None
-                    ),
                 )
                 hone.logger.info("Gather task completed!")
                 gather_time = hone.T() - gather_start
@@ -1056,28 +921,13 @@ class Miner(BaseNode, Trainer):
                     f"{hone.P(step_window, 0)} Skipped outer step (no gradients gathered)"
                 )
 
-            # Debug snapshot is uploaded under the un-suffixed key
-            # ``debug-{window}-{uid}-vX.pt`` (no ``-stage{N}-`` infix
-            # like ``gradient-...`` has), so when both stage 0's and
-            # stage N-1's masters race to PUT, they share a single
-            # ``/tmp/{uid}/temp_debug-...pt`` staging path. One stage's
-            # cleanup deletes the file while the other is still calling
-            # ``os.path.getsize`` on it -> ``FileNotFoundError`` and a
-            # cascading SIGTERM that takes the run down. Restrict the
-            # upload to stage-0's master so there's exactly one writer
-            # for that path. The debug payload only contains stage-0's
-            # local param slices anyway -- stage-N's were already being
-            # silently overwritten in the racy old path.
-            if (
-                self.is_master
-                and getattr(self, "pp_is_first_stage", True)
-            ):
+            if self.is_master:
                 # Add debug data including successfully gathered peers.
                 # Key by canonical (wrapper-stripped) name so the
                 # validator's ``compare_model_with_debug_dict`` can find
                 # entries regardless of how the validator's own model
                 # is wrapped (FSDP + AC + torch.compile orderings differ
-                # between PP / non-PP and miner / validator).
+                # between miner and validator).
                 debug_dict = {}
                 debug_canon_map = hone.canonical_param_names(self.model)
 
@@ -1086,10 +936,6 @@ class Miner(BaseNode, Trainer):
                     if param is None:
                         continue
                     cname = debug_canon_map.get(name, name)
-                    if cname is None:
-                        # PP-only param with no validator-side
-                        # canonical home (e.g. ResBM boundary).
-                        continue
                     # Handle DTensor vs regular tensor
                     if isinstance(param, DT):
                         local_param = param.to_local()
@@ -1208,31 +1054,6 @@ class Miner(BaseNode, Trainer):
                         wandb_metrics["miner/gradient_fingerprint/total_elements"] = (
                             gradient_fingerprint["total_elements"]
                         )
-
-                    # PP transport timing -- pop_timing_metrics returns
-                    # the *cumulative* counters since the last pop, so
-                    # the values we log are per-window aggregates of
-                    # send/recv wait time, byte counts, and op counts.
-                    # Lets us watch the bubble shrink as async_send
-                    # engages and confirm the new transport actually
-                    # overlaps with compute.
-                    if self.pp_transport is not None:
-                        pp_metrics = self.pp_transport.pop_timing_metrics()
-                        # Computed bubble-style indicator: total time
-                        # blocked on PP I/O / total training_time. >0.5
-                        # means we're still pipeline-bound; <0.1 means
-                        # PP overhead has been amortized.
-                        if training_time > 0:
-                            total_pp_wait_s = (
-                                pp_metrics["pp/send_wait_us_next"]
-                                + pp_metrics["pp/send_wait_us_prev"]
-                                + pp_metrics["pp/recv_wait_us_next"]
-                                + pp_metrics["pp/recv_wait_us_prev"]
-                            ) / 1e6
-                            wandb_metrics["pp/wait_fraction"] = (
-                                total_pp_wait_s / training_time
-                            )
-                        wandb_metrics.update(pp_metrics)
 
                     self.wandb.log(wandb_metrics, step=self.global_step)
 

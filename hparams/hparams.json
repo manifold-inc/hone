@@ -8,8 +8,8 @@
     "micro_batch_size": 8,
     "target_batch_size": 1024,
     "batch_size": 256,
-    "inner_steps": 40,
-    "max_inner_steps": 50,
+    "inner_steps": 30,
+    "max_inner_steps": 40,
     "outer_learning_rate": 0.4,
     "outer_momentum": 0.0,
     "outer_nesterov": false,
@@ -24,7 +24,7 @@
     "reset_warmup_per_window": false,
     "weight_decay": 0.1,
     "max_grad_norm": 1.0,
-    "blocks_per_window": 35,
+    "blocks_per_window": 30,
     "windows_per_weights": 3,
     "outer_steps_per_shard": 455,
     "momentum_decay": 0.95,
@@ -75,7 +75,6 @@
             "eps": 1e-8,
             "weight_decay": 0.1,
             "learning_rate": 3e-4,
-            "boundary_lr_scale": 0.1,
             "scheduler": {
                 "warmup_steps": 300,
                 "warmup_inner_steps": 60,
@@ -89,7 +88,6 @@
             "head_lr_scale": 0.2,
             "embed_lr_scale": 0.2,
             "scalar_lr_scale": 0.2,
-            "boundary_lr_scale": 0.1,
             "learning_rate": 2e-3,
             "scheduler": {
                 "warmup_steps": 300,
@@ -102,23 +100,10 @@
 
     "offload_optimizer_states": true,
     "fsdp": {
-        "dp_shard": 4,
+        "dp_shard": 8,
         "compile": true,
         "mixed_precision": "bfloat16",
         "activation_checkpoint": "selective"
-    },
-
-    "pipeline": {
-        "enabled": true,
-        "num_stages": 2,
-        "bottleneck_dim": 128,
-        "identity_reg_coeff": 1e-3
-    },
-
-    "pp_transport": {
-        "async_send": true,
-        "send_queue_depth": 2,
-        "intra_node_nccl": false
     },
 
     "dataloader": {
