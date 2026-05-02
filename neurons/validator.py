@@ -1628,35 +1628,31 @@ class Validator(BaseNode, Trainer):
             dist_helper.broadcast(seed_tensor, src=0)
             random_seed = int(seed_tensor.item())
 
-            # P5 async pre-compute: kick off ``L(base_model)`` on the
-            # chain-bound eval batch concurrently with gather. Both run
-            # on the asyncio event loop; ``evaluate_model`` yields at
-            # the end of each batch (``await asyncio.sleep(0)``), so
-            # gather's network I/O naturally interleaves with the eval
-            # forwards. On a validator with no other CPU/GPU pressure
-            # this is mostly free; when bandwidth-bound it saves roughly
-            # one ``evaluate_model`` wall-clock per window.
+            # P5 async pre-compute DISABLED after 2026-05-02 production
+            # incident (vali-error.log 21:26:30): the
+            # ``asyncio.create_task(evaluate_model(...))`` pattern races
+            # with NCCL collectives. ``evaluate_model`` calls
+            # ``dist_helper.all_ok`` (ALLREDUCE) per batch — safe only
+            # when every rank runs it in lockstep. In the async version:
             #
-            # NOTE: This is deliberately NOT using a second CUDA stream.
-            # P4 (parallel ``outer_step`` on a 2nd stream) is a separate
-            # wave; keeping the base_loss on the default stream here
-            # avoids pre-empting P4's stream budget. The interleaving is
-            # purely at the asyncio layer: gather awaits network I/O,
-            # base_loss awaits after each batch.
+            #  * master (rank 0) awaits ``gather_with_reserve`` at
+            #    L1689 → yields → asyncio schedules the task → master
+            #    enters ALLREDUCE (work seq N).
+            #  * non-master ranks skip the master-only gather block and
+            #    never yield before the ``broadcast(skip_tensor)`` at
+            #    L1744 → enter BROADCAST (work seq N).
+            #
+            # Result: collective-op mismatch → 30-minute NCCL watchdog
+            # timeout → SIGABRT across all ranks. The synchronous
+            # fallback at L~2335 below runs in the lockstep eval path
+            # (all ranks call ``evaluate_model`` together) and
+            # deterministically computes ``L(base_model)`` on the
+            # chain-bound seed. The "concurrent with gather" wall-clock
+            # savings can be reintroduced later with proper NCCL op
+            # ordering (pre-allocated groups; explicit rank-synchronous
+            # yield points) — out of scope for this hotfix.
             self.sampler.set_window_uid(random_seed, self.sync_window)
             base_loss_task: asyncio.Task | None = None
-            try:
-                base_loss_task = asyncio.create_task(
-                    self.evaluate_model(self.model, self.loader)
-                )
-            except Exception as e:
-                hone.log_with_context(
-                    level="warning",
-                    message=f"[P5] failed to start async base_loss task: {e}; falling back to sync",
-                    sync_window=self.sync_window,
-                    current_window=self.current_window,
-                )
-                base_loss_task = None
 
             gather_start = hone.T()
             skipped_uids: list[int] = []
@@ -2316,10 +2312,13 @@ class Validator(BaseNode, Trainer):
                 loss_before_random: float
                 n_batches: int
 
-                # P5: collect the base_loss that was started concurrently
-                # with gather. If the task failed for any reason, fall back
-                # to a synchronous compute on the chain-bound seed so the
-                # per-peer eval pipeline still gets a valid ``L(base_model)``.
+                # P5 base_loss: computed synchronously on the chain-bound
+                # seed so every rank enters ``evaluate_model`` together
+                # (``all_ok`` ALLREDUCE per batch requires lockstep). The
+                # async-task path is permanently disabled above; the
+                # ``if base_loss_task is not None`` branch below is dead
+                # defense-in-depth for any future re-introduction of a
+                # collective-safe async variant.
                 base_loss_fallback = True
                 if base_loss_task is not None:
                     try:
