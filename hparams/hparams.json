@@ -62,7 +62,7 @@
     "num_evaluation_bins": 5,
     "quantization_bins": 4,
     "quantization_range": 6,
-    "pack_values_2bit": false,
+    "pack_values_2bit": true,
     "eval_single_forward": false,
     "count_sketch_buckets": 1024,
     "count_sketch_min_weight": 0.5,
