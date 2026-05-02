@@ -16,5 +16,9 @@ from .checkpoint import DCPCheckpointer
 from .model import LoopLM, LoopLMConfig
 from .loss import compute_loss
 from .reporter import DashboardReporter
+from .sketch import CountSketch, soft_weight_from_cosine
 from . import muon
 from . import distributed
+from . import schemas
+from . import turboquant_audit
+from . import turboquant

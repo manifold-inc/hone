@@ -127,6 +127,57 @@ const HF_HOME = process.env.HF_HOME || path.join(HOME, ".cache", "huggingface");
 const HF_DATASETS_CACHE =
   process.env.HF_DATASETS_CACHE || path.join(HF_HOME, "datasets");
 
+// One-shot wipe of Hone-owned __pycache__ trees. Runs at config load
+// time (i.e. on ``pm2 start`` / ``pm2 reload`` of this ecosystem), NOT
+// on every auto-restart. That's the right granularity: once
+// PYTHONDONTWRITEBYTECODE=1 is in effect below, the ranks can never
+// produce a new corrupt .pyc, so we only need to clear leftovers from
+// a previous crash loop.
+//
+// Why this matters: torchrun spawns N simultaneous Python ranks that
+// each compile ``hone/src/hone/*.py`` -> ``.pyc`` on first import. On
+// shared / overlay filesystems that don't fully honour POSIX
+// ``rename(2)`` atomicity, a sibling rank can read a partially-written
+// .pyc and die with ``EOFError: marshal data too short`` -- aborting
+// the whole distributed run. pm2 restarts, the corrupt .pyc is still
+// on disk, the loop continues. See README "SIGTERM troubleshooting".
+function cleanStalePyCache(cwd) {
+  if (!fs.existsSync(cwd)) return 0;
+  let removed = 0;
+  for (const relRoot of ["src/hone", "neurons"]) {
+    const absRoot = path.join(cwd, relRoot);
+    if (!fs.existsSync(absRoot)) continue;
+    const stack = [absRoot];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch (_) {
+        continue;
+      }
+      for (const ent of entries) {
+        if (!ent.isDirectory()) continue;
+        const full = path.join(dir, ent.name);
+        if (ent.name === "__pycache__") {
+          try {
+            fs.rmSync(full, { recursive: true, force: true });
+            removed++;
+          } catch (err) {
+            console.error(
+              `[ecosystem.validator] failed to remove ${full}: ${err.message}`
+            );
+          }
+        } else {
+          stack.push(full);
+        }
+      }
+    }
+  }
+  return removed;
+}
+const _pycachePurged = cleanStalePyCache(CWD);
+
 // Surface the resolved paths so a quick ``pm2 logs`` shows what we picked
 // instead of forcing the operator to re-derive it from the trace. Don't
 // log the actual key -- just whether we resolved one and where from.
@@ -137,7 +188,9 @@ console.error(
   `[ecosystem.validator] resolved UV=${UV} CWD=${CWD} ` +
     `HF_HOME=${HF_HOME} HONE_API_BASE_URL=${HONE_API_BASE_URL} ` +
     `HONE_EVAL_API_KEY=${_evalKeyState} ` +
-    `(dotenv loaded ${Object.keys(_dotenvLoaded).length} keys)`
+    `(dotenv loaded ${Object.keys(_dotenvLoaded).length} keys, ` +
+    `purged ${_pycachePurged} __pycache__ dir(s); ` +
+    `PYTHONDONTWRITEBYTECODE=1 will be set on all ranks)`
 );
 
 // Build the env block for the ``eval`` PM2 app. We only include
@@ -150,6 +203,10 @@ const evalEnv = {
   CUDA_VISIBLE_DEVICES: "4,5,6,7",
   HF_HOME: HF_HOME,
   HF_DATASETS_CACHE: HF_DATASETS_CACHE,
+  // Belt-and-braces with the config-load-time __pycache__ wipe above:
+  // every Python process in the pm2 -> uv -> torchrun -> N ranks tree
+  // inherits this and never writes a .pyc. See cleanStalePyCache().
+  PYTHONDONTWRITEBYTECODE: "1",
 };
 for (const k of ["HONE_EVAL_API_KEY", "HF_TOKEN", "WANDB_API_KEY"]) {
   if (process.env[k]) evalEnv[k] = process.env[k];
@@ -182,7 +239,35 @@ module.exports = {
         // not worth it. Honoured by both Trainer._apply_torch_compile
         // and Muon's Newton-Schulz JIT (see hone/src/hone/muon/*).
         HONE_DISABLE_TORCH_COMPILE: "1",
+        // Belt-and-braces with the config-load-time __pycache__ wipe
+        // above: every Python process in the pm2 -> uv -> torchrun ->
+        // 4 ranks tree inherits this and never writes a .pyc. See
+        // cleanStalePyCache().
+        PYTHONDONTWRITEBYTECODE: "1",
       },
+      // Supervision: keep pm2 from masking crash loops.
+      //   min_uptime             -- process is "stable" only after
+      //                             60s; faster exits count against
+      //                             max_restarts.
+      //   max_restarts           -- stop after 5 consecutive unstable
+      //                             exits; operator must intervene.
+      //   restart_delay          -- 5s between restarts (paired with
+      //                             exp_backoff_restart_delay below
+      //                             so repeated failures back off).
+      //   exp_backoff_restart_delay -- 100ms base; doubles each
+      //                             consecutive failure.
+      //   kill_timeout           -- 30s for workers to drain the
+      //                             in-flight gather (up to 600s
+      //                             timeout) / R2 PUTs / NCCL handles
+      //                             before SIGKILL. Matters because
+      //                             SIGTERM mid-gather strands peer
+      //                             uploads.
+      autorestart: true,
+      min_uptime: "60s",
+      max_restarts: 5,
+      restart_delay: 5000,
+      exp_backoff_restart_delay: 100,
+      kill_timeout: 30000,
     },
     {
       name: "eval",
@@ -208,6 +293,16 @@ module.exports = {
         // on the same gcc / Triton failure mode.
         HONE_DISABLE_TORCH_COMPILE: "1",
       },
+      // Same supervision profile as ``vali`` -- see comment block on
+      // that app for details. kill_timeout is 30s here too because
+      // the evaluator holds open a POST to hone-api while publishing
+      // benchmark scores; cutting it short drops the POST mid-flight.
+      autorestart: true,
+      min_uptime: "60s",
+      max_restarts: 5,
+      restart_delay: 5000,
+      exp_backoff_restart_delay: 100,
+      kill_timeout: 30000,
     },
   ],
 };

@@ -18,6 +18,7 @@
 
 # Global imports
 import asyncio
+import random
 from collections import defaultdict
 from types import SimpleNamespace
 
@@ -31,6 +32,174 @@ from pydantic import ValidationError
 # Local imports
 from .logging import logger
 from .schemas import Bucket
+
+
+# ───────────────────────────── chain-bound randomness ────────────────────
+# P5a anti-overfit prerequisite: derive any security-sensitive seed from a
+# block hash the miner physically could not see at upload time. The eval
+# batch, Count-Sketch projection, and any future quorum-selection rolls
+# route through here so a single-forward delta-loss eval (P5b) is safe
+# against post-hoc overfitting on the validator's own eval distribution.
+#
+# Kept as a standalone module-level helper (not a ``ChainManager`` method)
+# because P3's quorum-change path needs it too, and it has zero
+# ChainManager state dependencies -- just a substrate handle and a target
+# block.
+def get_chain_bound_seed(
+    substrate,
+    target_block: int,
+    retries: int = 3,
+) -> int | None:
+    """Fetch a 32-bit seed from a chain block hash with bounded retries.
+
+    The block hash for ``target_block`` is an ``0x``-prefixed 64-char hex
+    string. We interpret the first 8 hex chars (32 bits) as an unsigned
+    int; that is plenty of entropy for a sampler seed while fitting in
+    numpy's 32-bit seed contract.
+
+    If the target block's hash can't be fetched (transient RPC error,
+    block not yet finalized, etc.) we walk forward one block at a time,
+    up to ``retries`` times. A hash arriving on a slightly later block
+    is equally unpredictable to the miner since all candidates are after
+    gather close. If every retry fails, return ``None`` so the caller can
+    decide whether to hard-fail or fall back to non-chain randomness
+    (offline dev runs typically fall back to ``random.randint``).
+
+    Args:
+        substrate: A live ``substrate`` client -- typically
+            ``self.comms.subtensor.substrate`` from Validator or any
+            ``ChainManager`` subclass.
+        target_block: Block number to pin the seed to. For P5a this is
+            the first block of the window AFTER gather close, so the
+            upload is chronologically frozen before the seed is known.
+        retries: Max number of block-hash fetches to attempt, walking
+            forward one block per failed attempt. Default 3.
+
+    Returns:
+        32-bit ``int`` derived from the block hash, or ``None`` on
+        persistent fetch failure. ``None`` is the caller's signal to
+        fall back (e.g. to ``random.randint`` plus a loud log line).
+    """
+    attempted_block = target_block
+    last_err: Exception | None = None
+    for attempt in range(retries):
+        try:
+            block_hash = substrate.get_block_hash(attempted_block)
+        except Exception as e:
+            last_err = e
+            logger.warning(
+                "[get_chain_bound_seed] block %d attempt %d/%d failed: %r; "
+                "advancing to block %d",
+                attempted_block,
+                attempt + 1,
+                retries,
+                e,
+                attempted_block + 1,
+            )
+            attempted_block += 1
+            continue
+
+        if not block_hash:
+            logger.warning(
+                "[get_chain_bound_seed] block %d returned empty hash "
+                "(attempt %d/%d); advancing to block %d",
+                attempted_block,
+                attempt + 1,
+                retries,
+                attempted_block + 1,
+            )
+            attempted_block += 1
+            continue
+
+        if isinstance(block_hash, bytes):
+            hex_str = block_hash.hex()
+        else:
+            hex_str = str(block_hash)
+        if hex_str.startswith("0x") or hex_str.startswith("0X"):
+            hex_str = hex_str[2:]
+        if len(hex_str) < 8:
+            logger.warning(
+                "[get_chain_bound_seed] block %d hash too short: %r",
+                attempted_block,
+                block_hash,
+            )
+            attempted_block += 1
+            continue
+
+        try:
+            seed = int(hex_str[:8], 16)
+        except ValueError as e:
+            last_err = e
+            logger.warning(
+                "[get_chain_bound_seed] block %d hash parse failed: %r",
+                attempted_block,
+                e,
+            )
+            attempted_block += 1
+            continue
+
+        if attempted_block != target_block:
+            logger.info(
+                "[get_chain_bound_seed] using block %d (target was %d) "
+                "after %d retries",
+                attempted_block,
+                target_block,
+                attempt,
+            )
+        return seed
+
+    logger.error(
+        "[get_chain_bound_seed] exhausted %d retries for block %d: %r",
+        retries,
+        target_block,
+        last_err,
+    )
+    return None
+
+
+def chain_bound_seed_or_fallback(
+    substrate,
+    target_block: int,
+    *,
+    retries: int = 3,
+    production: bool,
+    fallback_rng: random.Random | None = None,
+) -> int:
+    """Convenience wrapper around :func:`get_chain_bound_seed`.
+
+    Returns a usable seed unconditionally. If chain fetch fails and
+    ``production`` is True, emits a loud ``ERROR`` log (single line,
+    per plan P5 — not a WARN). In non-production (dev / offline
+    testing) a WARN is enough because there is no incentive attacker.
+
+    The fallback uses ``fallback_rng.randint(1000, 10_000_000)`` to
+    match the legacy pre-P5 seed range; callers may inject a seeded
+    ``Random`` instance for deterministic tests.
+    """
+    seed = get_chain_bound_seed(substrate, target_block, retries=retries)
+    if seed is not None:
+        return seed
+
+    rng = fallback_rng or random
+    fallback = rng.randint(1000, 10_000_000)
+    if production:
+        logger.error(
+            "[chain_bound_seed_or_fallback] PRODUCTION FALLBACK: block %d "
+            "hash unavailable after %d retries; using non-chain-bound seed "
+            "%d. This temporarily weakens the P5 anti-overfit defense -- "
+            "if this repeats across windows, investigate RPC health.",
+            target_block,
+            retries,
+            fallback,
+        )
+    else:
+        logger.warning(
+            "[chain_bound_seed_or_fallback] dev fallback: block %d hash "
+            "unavailable; using seed %d",
+            target_block,
+            fallback,
+        )
+    return fallback
 
 
 class ChainManager:

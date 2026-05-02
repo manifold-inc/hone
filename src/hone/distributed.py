@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import timedelta
 from typing import Any
 
@@ -320,3 +320,97 @@ class DistributedHelper:
 
 
 dist_helper = DistributedHelper()
+
+
+# P4: dedicated CUDA stream for parallel ``outer_step``. The validator
+# main loop snapshots the current weights, enqueues ``outer_step`` on
+# this secondary stream, and runs peer evaluation on the default
+# stream concurrently. A CUDA event records completion of the
+# secondary-stream work so the eval-side restore + memory free lands
+# only after every outer-step kernel has finished writing to live
+# parameters.
+#
+# This stream is intentionally distinct from:
+#   - ``DistributedHelper._get_offload_stream`` (FSDP CPU-offload
+#     all-gather/reduce-scatter pipeline), which is per-model and
+#     drives FSDP collectives; reusing it would deadlock against the
+#     reshard hook that fires inside eval forward passes.
+#   - the asyncio-only ``base_loss`` path in P5 (which is NOT a
+#     CUDA stream — gather and base_loss interleave at the asyncio
+#     layer, both still on the default CUDA stream).
+#
+# Lazy-initialised on first call so import-time CUDA queries don't
+# crash CPU-only test runs. Priority ``-1`` (low) is intentional:
+# eval work on the default stream gets GPU cycles first; outer_step
+# fills the slack windows.
+_outer_step_stream: torch.cuda.Stream | None = None
+
+
+def get_outer_step_stream() -> torch.cuda.Stream | None:
+    """Return the dedicated CUDA stream for parallel ``outer_step``.
+
+    Returns ``None`` when CUDA is unavailable so callers can branch on
+    ``stream is None`` to fall back to the legacy serial path. Safe
+    to call from any rank; the stream is bound to whichever device
+    is current on this process at first call.
+    """
+    global _outer_step_stream
+    if not torch.cuda.is_available():
+        return None
+    if _outer_step_stream is None:
+        _outer_step_stream = torch.cuda.Stream(priority=-1)
+    return _outer_step_stream
+
+
+@contextmanager
+def use_snapshot(
+    model: torch.nn.Module,
+    snapshot: dict[str, torch.Tensor] | None,
+):
+    """P4: temporarily redirect ``model``'s param ``.data`` at ``snapshot``
+    tensors for the duration of the ``with`` body, restoring on exit.
+
+    Used by the validator main loop to point peer evaluation at a frozen
+    pre-outer-step copy of the weights while ``outer_step`` writes the
+    new merged update onto the LIVE parameters concurrently on a
+    secondary CUDA stream (``get_outer_step_stream``).
+
+    Why ``p.data = snapshot[n]`` instead of a full ``load_state_dict``:
+      - ``load_state_dict`` triggers FSDP2 re-shard checks on every
+        param (slow + can fail when partial shards are present).
+      - ``p.data = ...`` is a thin pointer redirect: the wrapper tensor
+        ``p`` keeps its identity (same DTensor placements, same
+        sharding metadata), only its inner storage handle changes.
+        Subsequent FSDP all-gather/reshard cycles inside eval forwards
+        operate against ``p.data`` (now snapshot's local shard) the
+        same way they would against the live shard.
+      - Restore on exit ALWAYS runs (even on exceptions / ``continue``
+        out of the body) because ``contextmanager`` wraps the yield
+        with a ``finally``. This is load-bearing: the validator main
+        loop has multiple ``continue`` paths inside the eval block,
+        and a leaked snapshot pointer would silently feed stale
+        weights to the next window.
+
+    ``snapshot is None`` is a documented no-op (keeps the legacy
+    serial-outer-step path identical to pre-P4).
+
+    The snapshot dict's keys must match ``model.named_parameters()``
+    1:1; missing entries are skipped silently (the param keeps its
+    live ``.data``). Callers building partial snapshots (e.g. to skip
+    embedding when ``parallel_outer_snapshot_full=false``) rely on
+    this behaviour.
+    """
+    if snapshot is None:
+        yield
+        return
+    saved: dict[str, torch.Tensor] = {}
+    for n, p in model.named_parameters():
+        if n in snapshot:
+            saved[n] = p.data
+            p.data = snapshot[n]
+    try:
+        yield
+    finally:
+        for n, p in model.named_parameters():
+            if n in saved:
+                p.data = saved[n]

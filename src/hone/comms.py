@@ -137,6 +137,112 @@ class Comms(ChainManager):
         # Limit how many TransferManagers run concurrently (protects threads/conn pool)
         self.upload_sem = asyncio.Semaphore(4)
 
+        # P3: K_quorum + adaptive grace window state. ``_ema_step_seconds``
+        # tracks the full outer-step wall-clock (validator feeds back via
+        # ``record_step_time``); ``_ema_quorum_seconds`` is measured in the
+        # gather loops below; ``_ema_sync_seconds`` tracks post-gather
+        # outer_step apply+merge (validator feeds back via
+        # ``record_sync_time``). Bootstrap: ``_ema_step_seconds`` seeds to
+        # ``blocks_per_window * 12s`` until the first real sample lands so
+        # ``_compute_grace_window_seconds`` returns a conservative
+        # ~4.8 * blocks_per_window bound on the very first gather (≈ 144s
+        # at the default ``blocks_per_window=30``, well inside the 600s
+        # hard timeout).
+        _bpw = int(getattr(self.hparams, "blocks_per_window", 30)) if self.hparams else 30
+        self._ema_step_seconds: float = float(_bpw) * 12.0
+        self._ema_quorum_seconds: float = 0.0
+        self._ema_sync_seconds: float = 0.0
+        self._ema_step_samples: int = 0
+        self._ema_sync_samples: int = 0
+        self._ema_quorum_samples: int = 0
+        # Hysteresis signal: set to True whenever the previous window hit
+        # ``K_quorum`` inside its overall timeout. Exposed for dashboards
+        # + future policy (don't drop the K_quorum floor unless the prior
+        # window was grace-window-late by >= ξ_step per plan line 137).
+        # The 600s overall timeout always wins; this flag is observational.
+        self._last_window_quorum_hit: bool = False
+        # Telemetry feed-forward: last gather's measured quorum_hit time
+        # (seconds from gather start) and the adaptive grace deadline that
+        # was armed. ``None`` when K_quorum=0 or K_quorum was not reached.
+        # Validator reads these after gather_with_reserve to populate the
+        # new ``timing_gather_quorum_seconds`` / ``timing_gather_grace_seconds``
+        # fields on ``DashboardReporter.report_window``.
+        self._last_gather_quorum_seconds: float | None = None
+        self._last_gather_grace_seconds: float | None = None
+
+    def _compute_grace_window_seconds(self) -> float:
+        """Decoupled DiLoCo eq. 3 adaptive grace window.
+
+        ``ξ_grace = γ · (τ · ξ_step − ξ_quorum − ξ_sync)`` with γ from
+        ``gather_grace_window_factor`` and τ from ``gather_grace_tau``.
+        Bootstrap note: ``_ema_step_seconds`` seeds to
+        ``blocks_per_window * 12s`` so the first gather gets a conservative
+        bound (no live step sample yet).
+
+        Clamped to ``[0.0, overall_timeout)`` so we can never set a grace
+        deadline past the 600s hard ceiling.
+        """
+        gamma = float(getattr(self.hparams, "gather_grace_window_factor", 0.2)) if self.hparams else 0.2
+        tau = float(getattr(self.hparams, "gather_grace_tau", 2.0)) if self.hparams else 2.0
+        grace = gamma * (
+            tau * self._ema_step_seconds
+            - self._ema_quorum_seconds
+            - self._ema_sync_seconds
+        )
+        if grace < 0.0:
+            grace = 0.0
+        # Pin below the hard 600s overall ceiling even if ema_step is huge.
+        if grace > 600.0:
+            grace = 600.0
+        return grace
+
+    def record_step_time(self, seconds: float) -> None:
+        """Feed back the full-window wall-clock (``timing_window_total``).
+
+        Alpha = ``gather_grace_ema_alpha``. Validator calls this once per
+        window near ``report_window`` so the next gather's
+        ``_compute_grace_window_seconds`` reflects recent step durations.
+        """
+        if not (seconds > 0.0 and math.isfinite(seconds)):
+            return
+        alpha = float(getattr(self.hparams, "gather_grace_ema_alpha", 0.2)) if self.hparams else 0.2
+        if self._ema_step_samples == 0:
+            self._ema_step_seconds = float(seconds)
+        else:
+            self._ema_step_seconds = (
+                alpha * float(seconds) + (1.0 - alpha) * self._ema_step_seconds
+            )
+        self._ema_step_samples += 1
+
+    def record_sync_time(self, seconds: float) -> None:
+        """Feed back post-gather sync+apply wall-clock.
+
+        Per plan: ``outer_step_timings["apply_seconds"] + outer_step_timings["merge_seconds"]``.
+        """
+        if not (seconds >= 0.0 and math.isfinite(seconds)):
+            return
+        alpha = float(getattr(self.hparams, "gather_grace_ema_alpha", 0.2)) if self.hparams else 0.2
+        if self._ema_sync_samples == 0:
+            self._ema_sync_seconds = float(seconds)
+        else:
+            self._ema_sync_seconds = (
+                alpha * float(seconds) + (1.0 - alpha) * self._ema_sync_seconds
+            )
+        self._ema_sync_samples += 1
+
+    def _record_quorum_time(self, seconds: float) -> None:
+        """Internal: update ``_ema_quorum_seconds`` from inside the gather loop."""
+        if not (seconds >= 0.0 and math.isfinite(seconds)):
+            return
+        alpha = float(getattr(self.hparams, "gather_grace_ema_alpha", 0.2)) if self.hparams else 0.2
+        if self._ema_quorum_samples == 0:
+            self._ema_quorum_seconds = float(seconds)
+        else:
+            self._ema_quorum_seconds = (
+                alpha * float(seconds) + (1.0 - alpha) * self._ema_quorum_seconds
+            )
+        self._ema_quorum_samples += 1
+
     async def _get_s3_client(self, bucket: Bucket) -> AioBaseClient:
         """
         Retrieves or creates a persistent S3 client for the given bucket.
@@ -1290,7 +1396,13 @@ class Comms(ChainManager):
         self,
         state_dict: dict[str, Any],
         window: int,
-        key: Literal["debug", "gradient", "aggregator"],
+        # P1: widened from a strict Literal to ``str`` so the fragmented
+        # upload path can pass ``"gradient-frag{i:02d}"`` without dropping
+        # the type-system contract for the legacy keys (filename derivation
+        # below treats anything not equal to "aggregator" as a per-uid blob,
+        # which is correct for both legacy "gradient"/"debug" and new
+        # "gradient-frag*" keys).
+        key: str,
         uid: str | None = None,
         global_step: int = 0,
         local: bool = True,
@@ -1418,7 +1530,10 @@ class Comms(ChainManager):
         self,
         uid: str,
         window: int,
-        key: Literal["debug", "gradient", "aggregator"],
+        # P1: widened from Literal to str to accept per-fragment subkeys
+        # (``"gradient-frag{i:02d}"``). Aggregator/debug/gradient continue
+        # to dispatch through the same filename derivation below.
+        key: str,
         local: bool = True,
         stale_retention: int = 10,
         timeout: int = 30,
@@ -1649,6 +1764,7 @@ class Comms(ChainManager):
         time_min: datetime | None = None,
         time_max: datetime | None = None,
         xshapes: dict[str, tuple] | None = None,
+        num_fragments: int | None = None,
     ) -> SimpleNamespace | None:
         """
         Gathers and processes gradients from a list of peer UIDs.
@@ -1681,6 +1797,17 @@ class Comms(ChainManager):
             xshapes (dict[str, tuple] | None, optional): Expected shapes for gradient
                 tensors, used to validate that received gradients have the correct
                 dimensions. Defaults to None.
+            num_fragments (int | None, optional): When ``None`` or ``1``, fetches a
+                single blob per UID (legacy path; key is ``key``). When > 1, fans
+                out to ``num_fragments × len(uids)`` GETs against per-fragment keys
+                ``f"{key}-frag{i:02d}"``. Out-of-order arrival is fine; the result
+                preserves the legacy ``state_dict`` list-per-key shape (each
+                fragment contributes disjoint tensor keys, so per-key list length
+                equals the number of UIDs that uploaded a fragment containing that
+                key). The result also exposes ``fragments_seen_per_uid`` and
+                ``uids_per_param`` so downstream consumers (notably
+                ``check_uid_index_overlap``) can disambiguate which UID contributed
+                each tensor instead of assuming positional alignment with ``uids``.
 
         Returns:
             SimpleNamespace | None: A namespace containing the aggregated state dict,
@@ -1689,6 +1816,24 @@ class Comms(ChainManager):
         """
         if not expected_compressed_params:
             expected_compressed_params = set()
+        if num_fragments is not None and num_fragments > 1:
+            return await self._gather_fragmented(
+                my_uid=my_uid,
+                uids=uids,
+                window=window,
+                key=key,
+                timeout=timeout,
+                device=device,
+                totalks=totalks,
+                compressor=compressor,
+                num_fragments=num_fragments,
+                expected_compressed_params=expected_compressed_params,
+                local=local,
+                stale_retention=stale_retention,
+                time_min=time_min,
+                time_max=time_max,
+                xshapes=xshapes,
+            )
 
         start_time = time.time()
         metrics = {"upload_bytes": 0, "download_bytes": 0, "successes": []}
@@ -1710,6 +1855,15 @@ class Comms(ChainManager):
         skipped_uids = []
         skip_reasons: dict[int, str] = {}
         global_steps = []
+        # FU4: per-UID ``UploadMetadata.to_wire()`` dict captured at gather
+        # time so the validator can populate ``_peer_c_tokens`` /
+        # ``_peer_c_steps`` BEFORE the parallel outer_step dispatch.
+        # Without this, ``token_weighted_aggregation`` was incompatible
+        # with ``parallel_outer_step`` because the eval-loop metadata
+        # read raced with the outer_step kernels. Peers without a
+        # ``metadata`` field (legacy / malformed) are silently skipped
+        # to keep parity with the pre-FU4 path.
+        metadata_per_uid: dict[int, dict] = {}
 
         # Ensure deterministic order across processes/ranks
         uids = sorted(uids)
@@ -1728,29 +1882,163 @@ class Comms(ChainManager):
             )
 
         async with self.gather_semaphore:
-            batch_tasks = [_fetch_uid(uid) for uid in uids]
+            # P3: per-UID task map so we can resolve a future back to its UID
+            # when using ``asyncio.wait(FIRST_COMPLETED)`` (as_completed loses
+            # the per-task identity we need). All tasks start concurrently;
+            # the early-fire loop below cancels pending tasks once the grace
+            # deadline expires.
+            tasks: dict[asyncio.Task, int] = {
+                asyncio.create_task(_fetch_uid(uid)): uid for uid in uids
+            }
+            pending: set[asyncio.Task] = set(tasks.keys())
+            responses_by_uid: dict[int, Any] = {}
 
             try:
                 download_start = hone.T()
                 # Overall timeout for all downloads: 10 minutes max
                 # This prevents indefinite hangs from rate limiting or network issues
                 gather_timeout = 600  # 10 minutes
-                try:
-                    batch_responses = await asyncio.wait_for(
-                        asyncio.gather(*batch_tasks, return_exceptions=True),
-                        timeout=gather_timeout,
+                # P3: K_quorum throughput trigger. ``gather_min_quorum=0``
+                # (default in hparams.json) disables the early-fire loop and
+                # falls back to "wait for all tasks up to 600s", byte-for-byte
+                # the pre-P3 behaviour. Operator flips to 4 after fleet soak
+                # per plan line 139. The overall 600s gather_timeout is the
+                # hard ceiling; K_quorum + grace just triggers EARLIER success.
+                k_quorum = int(
+                    getattr(self.hparams, "gather_min_quorum", 0)
+                    if self.hparams is not None
+                    else 0
+                )
+                start_t_monotonic = time.monotonic()
+                successful = 0
+                quorum_hit_time: float | None = None
+                grace_seconds: float = 0.0
+                deadline_by_quorum_grace: float | None = None
+
+                while pending:
+                    now = time.monotonic()
+                    elapsed = now - start_t_monotonic
+                    overall_remaining = float(gather_timeout) - elapsed
+                    if overall_remaining <= 0.0:
+                        break
+                    if deadline_by_quorum_grace is not None:
+                        grace_remaining = deadline_by_quorum_grace - now
+                        if grace_remaining <= 0.0:
+                            break
+                        wait_timeout = min(grace_remaining, overall_remaining)
+                    else:
+                        wait_timeout = overall_remaining
+
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=wait_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
                     )
-                except asyncio.TimeoutError:
+                    if not done:
+                        # Outer timeout fired before any completion.
+                        break
+
+                    for task in done:
+                        task_uid = tasks[task]
+                        try:
+                            resp = task.result()
+                        except asyncio.CancelledError:
+                            responses_by_uid[task_uid] = None
+                            continue
+                        except Exception as exc:
+                            responses_by_uid[task_uid] = exc
+                            continue
+                        responses_by_uid[task_uid] = resp
+                        # Count a response as "successful" for the quorum
+                        # count iff the peer returned a non-None payload.
+                        # Validation (quant params, shapes, etc.) happens
+                        # below — if validation fails post-hoc the UID just
+                        # gets added to skipped_uids, identical to the
+                        # pre-P3 contract.
+                        if resp is not None:
+                            successful += 1
+                            if (
+                                k_quorum > 0
+                                and successful >= k_quorum
+                                and quorum_hit_time is None
+                            ):
+                                quorum_hit_time = time.monotonic()
+                                grace_seconds = self._compute_grace_window_seconds()
+                                deadline_by_quorum_grace = (
+                                    quorum_hit_time + grace_seconds
+                                )
+                                hone.logger.info(
+                                    f"[gather] K_quorum={k_quorum} hit at "
+                                    f"{quorum_hit_time - start_t_monotonic:.1f}s; "
+                                    f"grace deadline in {grace_seconds:.1f}s"
+                                )
+
+                # Cancel stragglers (grace-window-cut peers). Their slots
+                # are filled either by whatever already landed or, below in
+                # ``gather_with_reserve``, by the reserve tier.
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in pending:
+                    task_uid = tasks[task]
+                    if task_uid not in responses_by_uid:
+                        responses_by_uid[task_uid] = None
+
+                # Record EMAs + surface per-gather telemetry on the Comms
+                # instance for validator's report_window feed-forward.
+                if k_quorum > 0 and quorum_hit_time is not None:
+                    self._record_quorum_time(
+                        quorum_hit_time - start_t_monotonic
+                    )
+                    self._last_gather_quorum_seconds = float(
+                        quorum_hit_time - start_t_monotonic
+                    )
+                    self._last_gather_grace_seconds = float(grace_seconds)
+                    self._last_window_quorum_hit = True
+                else:
+                    self._last_gather_quorum_seconds = None
+                    self._last_gather_grace_seconds = None
+                    self._last_window_quorum_hit = k_quorum == 0 and successful > 0
+
+                total_elapsed = time.monotonic() - start_t_monotonic
+                _quorum_log = (
+                    f"{(quorum_hit_time - start_t_monotonic):.1f}s"
+                    if quorum_hit_time is not None
+                    else "-"
+                )
+                hone.logger.info(
+                    f"[gather] uids={len(uids)} successful={successful} "
+                    f"elapsed={total_elapsed:.1f}s "
+                    f"quorum_hit={_quorum_log} grace={grace_seconds:.1f}s "
+                    f"ema_step={self._ema_step_seconds:.1f}s "
+                    f"ema_quorum={self._ema_quorum_seconds:.1f}s "
+                    f"fragmented=False"
+                )
+
+                # Hysteresis: if K_quorum is armed and we didn't land enough
+                # successful fetches inside the overall 600s budget, abort
+                # the window (mirrors the pre-P3 "return None on timeout"
+                # semantics). When K_quorum=0 this is a no-op; we fall
+                # through to the "if not valid_uids: return None" check.
+                if k_quorum > 0 and successful < k_quorum:
                     hone.logger.error(
-                        f"Gather download phase timed out after {gather_timeout}s - "
-                        f"possible rate limiting or network issue. Aborting gather."
+                        f"Gather K_quorum={k_quorum} not hit within "
+                        f"{gather_timeout}s (successful={successful}). "
+                        f"Aborting gather."
                     )
                     return None
+
                 hone.logger.info(
                     f"{hone.P(window, hone.T() - download_start)} Downloaded peer gradients <--"
                 )
                 process_start = hone.T()
-                for uid, response in zip(uids, batch_responses):
+                # Preserve the pre-P3 iteration order (sorted UIDs) so rank
+                # positions in ``aggregated_state_dict[k]`` lists stay
+                # deterministic across processes.
+                for uid in uids:
+                    response = responses_by_uid.get(uid)
                     received_compressed_params = set()
 
                     if isinstance(response, Exception):
@@ -1800,11 +2088,38 @@ class Comms(ChainManager):
                     for param_name, tensor in state_dict_resp.items():
                         received_compressed_params.add(param_name)
 
+                        # FU1 (P6b) TurboQuant payload. The legacy validation
+                        # below (12-bit index unpack, ``totalks`` lookup, qparams
+                        # tuple shape) doesn't apply to the ``tq_idxs`` /
+                        # ``tq_codes`` / ``tq_meta`` triple: tq_idxs is a raw
+                        # int64 top-K index tensor (NOT a 12-bit packed
+                        # uint8), tq_codes is a raw uint8 codebook tensor
+                        # (no qparams companion), and tq_meta is a Python
+                        # dict (not a 5/7-tuple). Skip the legacy suffix-
+                        # based checks for these keys; the downstream
+                        # ``batch_decompress_turboquant`` in ``outer_step``
+                        # is what actually consumes them and will reject
+                        # malformed payloads loudly. Matches how the legacy
+                        # ``maybe_dequantize_values`` path tolerates a
+                        # missing / non-tuple qparams on vals-only uploads.
+                        if (
+                            param_name.endswith("tq_idxs")
+                            or param_name.endswith("tq_codes")
+                            or param_name.endswith("tq_meta")
+                        ):
+                            continue
+
                         # ----------------------------------------------------------
                         # (1)  Validate quantisation parameters themselves
                         # ----------------------------------------------------------
                         if param_name.endswith("quant_params"):
-                            shift, scale, offset, lookup, dtype = tensor
+                            # P0b: qparams may be a 5-tuple (legacy raw uint8
+                            # values) or a 7-tuple when the sender opted into
+                            # 2-bit value packing. The tail (pack_version,
+                            # original_last_dim) is consumed by ``_dequantize_values``;
+                            # the validator only needs shift/scale/lookup
+                            # finiteness checks here.
+                            shift, scale, offset, lookup, dtype, *_extras = tensor
                             if (
                                 (not torch.isfinite(shift))
                                 or isinstance(scale, float)
@@ -1848,8 +2163,15 @@ class Comms(ChainManager):
                                 if isinstance(totalk_value, int)
                                 else totalk_value.numel()
                             )
-                            # Get corresponding vals tensor for 12-bit unpacking
+                            # Get corresponding vals tensor for 12-bit unpacking.
+                            # qparams may be 5-tuple (legacy raw uint8 vals) or
+                            # 7-tuple (PACK_VERSION_2BIT). The 2-bit-packed
+                            # path needs the original_last_dim from qparams to
+                            # know how many indices the row encodes.
                             vals_tensor = state_dict_resp.get(base_name + "vals", None)
+                            qparams_tensor = state_dict_resp.get(
+                                base_name + "quant_params", None
+                            )
                             try:
                                 self.check_compressed_indices(
                                     param_name,
@@ -1857,6 +2179,7 @@ class Comms(ChainManager):
                                     totalk,
                                     allowed_topk=self.hparams.topk_compression,
                                     vals=vals_tensor,
+                                    qparams=qparams_tensor,
                                 )
                             except Exception as e:
                                 hone.logger.warning(
@@ -1936,8 +2259,32 @@ class Comms(ChainManager):
                                         valid_response = False
                                         break
 
+                    # FU1: a TurboQuant-encoded param ships ``cname +
+                    # {'tq_idxs','tq_codes','tq_meta'}`` INSTEAD of
+                    # ``cname + {'idxs','vals','quant_params'}``. The
+                    # ``expected_compressed_params`` set (built by
+                    # ``Trainer.get_expected_params`` from the legacy
+                    # suffix triple) would therefore flag every
+                    # TurboQuant-encoded param as missing. Expand
+                    # received_compressed_params so each tq_ triple
+                    # "satisfies" the legacy expectation for the same
+                    # canonical name. This keeps a TurboQuant-only peer
+                    # valid without changing the expected set (and a
+                    # mixed peer stays valid on both codecs for free).
+                    virtual_received = set(received_compressed_params)
+                    for rk in received_compressed_params:
+                        for tq_suffix, legacy_suffix in (
+                            ("tq_idxs", "idxs"),
+                            ("tq_codes", "vals"),
+                            ("tq_meta", "quant_params"),
+                        ):
+                            if rk.endswith(tq_suffix):
+                                base = rk[: -len(tq_suffix)]
+                                virtual_received.add(base + legacy_suffix)
+                                break
+
                     missing_params = (
-                        expected_compressed_params - received_compressed_params
+                        expected_compressed_params - virtual_received
                     )
                     if missing_params:
                         hone.logger.warning(
@@ -1956,7 +2303,46 @@ class Comms(ChainManager):
                     # ---------- End Compressed Indices and Values Check ----------
 
                     # Process tensors - keep everything quantized to save memory
+                    # FU1: a key like ``cname + "tq_idxs"`` also ends with
+                    # ``"idxs"``, so the legacy ``endswith("idxs")`` arm
+                    # would catch it — BUT its payload bytes still need
+                    # accounting and we want the comms contract to be
+                    # explicit about which codec we're routing. The
+                    # dedicated ``tq_*`` arms below handle the three
+                    # TurboQuant keys before the legacy arms see them;
+                    # ``tq_codes`` / ``tq_meta`` don't match any legacy
+                    # suffix so they'd be silently dropped otherwise.
                     for param_name, tensor in state_dict_resp.items():
+                        # FU1 TurboQuant payload ----------------------------------------------
+                        if param_name.endswith("tq_idxs"):
+                            aggregated_state_dict.setdefault(param_name, []).append(
+                                tensor
+                            )
+                            if isinstance(tensor, torch.Tensor):
+                                metrics["download_bytes"] += (
+                                    tensor.element_size() * tensor.nelement()
+                                )
+                            continue
+                        if param_name.endswith("tq_codes"):
+                            aggregated_state_dict.setdefault(param_name, []).append(
+                                tensor
+                            )
+                            if isinstance(tensor, torch.Tensor):
+                                metrics["download_bytes"] += (
+                                    tensor.element_size() * tensor.nelement()
+                                )
+                            continue
+                        if param_name.endswith("tq_meta"):
+                            # tq_meta is a Python dict (not a tensor).
+                            # torch.save pickles it; we pass the object
+                            # through unchanged so ``outer_step``'s
+                            # decode branch can feed it to
+                            # ``dequantize_turboquant`` as-is.
+                            aggregated_state_dict.setdefault(param_name, []).append(
+                                tensor
+                            )
+                            continue
+
                         # 1️⃣  Indices are kept as‑is -----------------------------------------
                         if param_name.endswith("idxs"):
                             aggregated_state_dict.setdefault(param_name, []).append(
@@ -1983,6 +2369,23 @@ class Comms(ChainManager):
                                 tensor
                             )
 
+                    # FU4: capture per-peer ``UploadMetadata.to_wire()`` dict
+                    # before it gets dropped on the floor below. Legacy peers
+                    # (pre-P2 miners) don't ship this field; ``meta`` will be
+                    # ``None`` for them and the UID is simply absent from
+                    # ``metadata_per_uid``. Validator-side
+                    # ``token_weighted_aggregation`` falls back to a uniform
+                    # weight for any UID missing here, identical to the
+                    # pre-FU4 contract.
+                    meta = state_dict_resp.get("metadata")
+                    if isinstance(meta, dict):
+                        metadata_per_uid[uid] = meta
+                    else:
+                        hone.logger.info(
+                            f"[gather] uid={uid} no metadata field in payload "
+                            f"(legacy or malformed); skipping metadata_per_uid"
+                        )
+
                     valid_uids.append(uid)
                     global_steps.append(global_step_resp)
 
@@ -1998,10 +2401,29 @@ class Comms(ChainManager):
             return None
 
         total_time = time.time() - start_time
+        # P1 R2 amplification telemetry (legacy single-blob branch). Op-side
+        # comparison against the fragmented branch's same line — risk #6 in
+        # the plan's register tracks R2 P95 latency once 24× fan-out lands.
+        hone.logger.info(
+            f"[gather] r2_fetches total={len(uids)} successful={len(valid_uids)} "
+            f"wall_clock_seconds={total_time:.2f} fragmented=False"
+        )
         hone.logger.info(
             f"Gather done in {total_time:.2f}s. Success rate: {len(valid_uids)}/{len(uids)}, "
             f"Upload: {metrics['upload_bytes']} bytes, Download: {metrics['download_bytes']} bytes"
         )
+
+        # ``fragments_seen_per_uid`` and ``uids_per_param`` are populated only
+        # by the fragmented branch (see ``_gather_fragmented``). Here we set
+        # the canonical "every UID has 1 fragment, every param sees all valid
+        # UIDs in order" so callers like ``check_uid_index_overlap`` can use
+        # the same lookup pattern in both modes without branching.
+        uids_per_param: dict[str, list[int]] = {
+            k: list(valid_uids) for k in aggregated_state_dict.keys()
+        }
+        fragments_seen_per_uid: dict[int, set[int]] = {
+            uid: {0} for uid in valid_uids
+        }
 
         result = SimpleNamespace(
             time=total_time,
@@ -2013,6 +2435,640 @@ class Comms(ChainManager):
             global_steps=global_steps,
             skipped_uids=skipped_uids,
             skip_reasons=skip_reasons,
+            fragments_seen_per_uid=fragments_seen_per_uid,
+            uids_per_param=uids_per_param,
+            fragment_byte_counts=[],  # populated only in fragmented mode
+            # FU4: per-UID ``UploadMetadata.to_wire()`` dict. Used by the
+            # validator to populate ``_peer_c_tokens`` / ``_peer_c_steps``
+            # immediately after gather, BEFORE outer_step dispatch — so
+            # ``token_weighted_aggregation`` and ``parallel_outer_step``
+            # can finally coexist.
+            metadata_per_uid=metadata_per_uid,
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # _gather_fragmented –– per-(uid, fragment) fan-out for streaming uploads
+    # ------------------------------------------------------------------
+    async def _gather_fragmented(
+        self,
+        *,
+        my_uid: int | None,
+        uids: list[int],
+        window: int,
+        key: str,
+        timeout: int,
+        device: str,
+        totalks: dict[str, torch.Tensor],
+        compressor: TopKCompressor,
+        num_fragments: int,
+        expected_compressed_params: set[str],
+        local: bool,
+        stale_retention: int,
+        time_min: datetime | None,
+        time_max: datetime | None,
+        xshapes: dict[str, tuple] | None,
+    ) -> SimpleNamespace | None:
+        """Fragmented sibling of ``gather``.
+
+        Fans out ``num_fragments × len(uids)`` GETs against per-fragment keys
+        ``f"{key}-frag{i:02d}"``. Each fragment file contributes a *disjoint*
+        subset of (idxs, vals, quant_params) triplets per the upstream
+        ``prepare_gradient_buckets`` partition. Per-fragment validation is
+        identical to the legacy per-blob check; an invalid fragment drops
+        only that fragment, leaving the rest of the UID's contributions intact.
+
+        Returns the same ``SimpleNamespace`` shape as ``gather`` plus:
+          * ``fragments_seen_per_uid: dict[int, set[int]]`` — the fragment
+            indexes each UID successfully uploaded.
+          * ``uids_per_param: dict[str, list[int]]`` — for each tensor key in
+            ``state_dict``, the UIDs that contributed (in the same order as
+            the per-key tensor list). Required by ``check_uid_index_overlap``
+            to drop the broken positional ``idxs_all[i]==uids[i]`` assumption.
+        """
+        start_time = time.time()
+        metrics = {"upload_bytes": 0, "download_bytes": 0, "successes": []}
+
+        hone.logger.info(
+            f"[gather] fragmented start window={window} key={key} "
+            f"num_fragments={num_fragments} peers={len(uids)} "
+            f"total_fetches={len(uids) * num_fragments}"
+        )
+
+        uids = sorted(uids)
+        # Flat fan-out: every (uid, frag_idx) gets its own task. Out-of-order
+        # arrival is fine — we group results by uid below before validating.
+        fragment_keys = [f"{key}-frag{i:02d}" for i in range(num_fragments)]
+
+        async def _fetch(uid: int, frag_idx: int) -> CommsGetResult | None:
+            return await self.get_with_retry(
+                uid=str(uid),
+                window=window,
+                key=fragment_keys[frag_idx],
+                timeout=timeout,
+                local=local,
+                stale_retention=stale_retention,
+                time_min=time_min,
+                time_max=time_max,
+                map_location=device,
+            )
+
+        fetch_specs: list[tuple[int, int]] = [
+            (uid, frag_idx) for uid in uids for frag_idx in range(num_fragments)
+        ]
+
+        async with self.gather_semaphore:
+            try:
+                download_start = hone.T()
+                gather_timeout = 600  # 10 minutes — same budget as legacy
+                # P3: K_quorum throughput trigger — default-off
+                # (``gather_min_quorum=0`` in hparams.json reproduces today's
+                # "wait for all tasks up to 600s" semantics). In fragmented
+                # mode, "successful" means "the UID returned a non-None
+                # response for at least one fragment"; per-fragment
+                # validation happens unchanged below so partially-uploaded
+                # peers still count toward quorum and their validated
+                # fragments land in the aggregated state_dict.
+                k_quorum = int(
+                    getattr(self.hparams, "gather_min_quorum", 0)
+                    if self.hparams is not None
+                    else 0
+                )
+                fetch_tasks: dict[asyncio.Task, tuple[int, int]] = {
+                    asyncio.create_task(_fetch(uid, frag_idx)): (uid, frag_idx)
+                    for uid, frag_idx in fetch_specs
+                }
+                pending: set[asyncio.Task] = set(fetch_tasks.keys())
+                responses_by_uid: dict[int, list[tuple[int, Any]]] = {}
+                peers_with_hit: set[int] = set()
+                start_t_monotonic = time.monotonic()
+                quorum_hit_time: float | None = None
+                grace_seconds: float = 0.0
+                deadline_by_quorum_grace: float | None = None
+
+                while pending:
+                    now = time.monotonic()
+                    elapsed = now - start_t_monotonic
+                    overall_remaining = float(gather_timeout) - elapsed
+                    if overall_remaining <= 0.0:
+                        break
+                    if deadline_by_quorum_grace is not None:
+                        grace_remaining = deadline_by_quorum_grace - now
+                        if grace_remaining <= 0.0:
+                            break
+                        wait_timeout = min(grace_remaining, overall_remaining)
+                    else:
+                        wait_timeout = overall_remaining
+
+                    done, pending = await asyncio.wait(
+                        pending,
+                        timeout=wait_timeout,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not done:
+                        break
+
+                    for task in done:
+                        task_uid, task_frag = fetch_tasks[task]
+                        try:
+                            resp = task.result()
+                        except asyncio.CancelledError:
+                            responses_by_uid.setdefault(task_uid, []).append(
+                                (task_frag, None)
+                            )
+                            continue
+                        except Exception as exc:
+                            responses_by_uid.setdefault(task_uid, []).append(
+                                (task_frag, exc)
+                            )
+                            continue
+                        responses_by_uid.setdefault(task_uid, []).append(
+                            (task_frag, resp)
+                        )
+                        # Count this peer as contributing to quorum on the
+                        # first non-None fragment response. Post-hoc per-
+                        # fragment validation may still drop this fragment
+                        # (and even all of the peer's fragments) — the
+                        # peer then falls into ``skipped_uids``, same
+                        # semantics as the legacy path.
+                        if (
+                            resp is not None
+                            and task_uid not in peers_with_hit
+                        ):
+                            peers_with_hit.add(task_uid)
+                            if (
+                                k_quorum > 0
+                                and len(peers_with_hit) >= k_quorum
+                                and quorum_hit_time is None
+                            ):
+                                quorum_hit_time = time.monotonic()
+                                grace_seconds = self._compute_grace_window_seconds()
+                                deadline_by_quorum_grace = (
+                                    quorum_hit_time + grace_seconds
+                                )
+                                hone.logger.info(
+                                    f"[gather] K_quorum={k_quorum} hit at "
+                                    f"{quorum_hit_time - start_t_monotonic:.1f}s; "
+                                    f"grace deadline in {grace_seconds:.1f}s "
+                                    f"(fragmented)"
+                                )
+
+                # Cancel stragglers — peers who haven't finished uploading
+                # fragments by the grace deadline just contribute whatever
+                # landed in time. ``gather_with_reserve`` may promote
+                # reserve peers if fewer than ``K_safety`` UIDs made the
+                # cutoff.
+                for task in pending:
+                    if not task.done():
+                        task.cancel()
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                for task in pending:
+                    task_uid, task_frag = fetch_tasks[task]
+                    existing = responses_by_uid.setdefault(task_uid, [])
+                    if not any(f == task_frag for f, _ in existing):
+                        existing.append((task_frag, None))
+
+                # Record EMAs + surface per-gather telemetry on the Comms
+                # instance for validator's report_window feed-forward.
+                successful_peers = len(peers_with_hit)
+                if k_quorum > 0 and quorum_hit_time is not None:
+                    self._record_quorum_time(
+                        quorum_hit_time - start_t_monotonic
+                    )
+                    self._last_gather_quorum_seconds = float(
+                        quorum_hit_time - start_t_monotonic
+                    )
+                    self._last_gather_grace_seconds = float(grace_seconds)
+                    self._last_window_quorum_hit = True
+                else:
+                    self._last_gather_quorum_seconds = None
+                    self._last_gather_grace_seconds = None
+                    self._last_window_quorum_hit = (
+                        k_quorum == 0 and successful_peers > 0
+                    )
+
+                total_elapsed = time.monotonic() - start_t_monotonic
+                _quorum_log = (
+                    f"{(quorum_hit_time - start_t_monotonic):.1f}s"
+                    if quorum_hit_time is not None
+                    else "-"
+                )
+                hone.logger.info(
+                    f"[gather] uids={len(uids)} successful={successful_peers} "
+                    f"elapsed={total_elapsed:.1f}s "
+                    f"quorum_hit={_quorum_log} grace={grace_seconds:.1f}s "
+                    f"ema_step={self._ema_step_seconds:.1f}s "
+                    f"ema_quorum={self._ema_quorum_seconds:.1f}s "
+                    f"fragmented=True num_fragments={num_fragments}"
+                )
+
+                if k_quorum > 0 and successful_peers < k_quorum:
+                    hone.logger.error(
+                        f"Fragmented gather K_quorum={k_quorum} not hit "
+                        f"within {gather_timeout}s "
+                        f"(successful_peers={successful_peers}). "
+                        f"Aborting gather."
+                    )
+                    return None
+
+                _total_responses = sum(
+                    len(v) for v in responses_by_uid.values()
+                )
+                hone.logger.info(
+                    f"{hone.P(window, hone.T() - download_start)} "
+                    f"Downloaded {_total_responses} peer fragments <--"
+                )
+            except Exception as e:
+                hone.logger.error(
+                    f"Error during fragmented fetch dispatch: {e}", exc_info=True
+                )
+                return None
+
+        process_start = hone.T()
+        aggregated_state_dict: dict[str, list] = {}
+        uids_per_param: dict[str, list[int]] = {}
+        valid_uids: list[int] = []
+        skipped_uids: list[int] = []
+        skip_reasons: dict[int, str] = {}
+        global_steps: list[int] = []
+        fragments_seen_per_uid: dict[int, set[int]] = {}
+        fragment_byte_counts: list[int] = []
+        successful_fetches = 0
+        # FU4: per-UID canonical ``UploadMetadata.to_wire()`` dict captured
+        # at gather time. In fragmented mode the miner generates the
+        # metadata once per window before ``prepare_gradient_buckets``
+        # (see ``hone.neurons.miner`` ~L862-882), so every fragment of
+        # a given UID carries the SAME dict. We pick the most-common
+        # entry across that UID's valid fragments and WARN if any
+        # disagree — disagreement means a buggy / malicious miner spliced
+        # different metadata into different fragments and we want
+        # operators to see it.
+        metadata_per_uid: dict[int, dict] = {}
+
+        # Iterate UIDs in sorted order so per-key tensor lists end up in a
+        # deterministic order across ranks (the existing outer_step merge
+        # iterates them positionally).
+        for uid in uids:
+            uid_responses = responses_by_uid.get(uid, [])
+            # Each entry: (frag_idx, valid_state_dict_resp, global_step_resp,
+            # received_param_keys, fragment_bytes)
+            valid_fragments: list[tuple[int, dict, int, set[str], int]] = []
+
+            for frag_idx, response in sorted(uid_responses, key=lambda t: t[0]):
+                if isinstance(response, Exception):
+                    hone.logger.debug(
+                        f"[gather-frag] uid={uid} frag={frag_idx} error: {response}"
+                    )
+                    continue
+                if response is None:
+                    continue
+                response = cast(CommsGetResult, response)
+                state_dict_resp = response.data
+                global_step_resp = response.global_step
+                if state_dict_resp is None:
+                    continue
+
+                # Run the same per-tensor validation legacy gather does, but
+                # scoped to this fragment only. A failed check drops the
+                # fragment, not the whole UID — partial uploads are by design
+                # in the streaming path.
+                fragment_valid = True
+                fragment_failure = ""
+                received: set[str] = set()
+                fragment_bytes = 0
+                for param_name, tensor in state_dict_resp.items():
+                    received.add(param_name)
+                    # FU1 (P6b) TurboQuant payload — skip the legacy
+                    # suffix-based validation; see the same comment in
+                    # the legacy gather path above for rationale.
+                    # ``tq_idxs`` matches ``endswith("idxs")`` in the
+                    # legacy arm but is a raw int64 top-K index tensor,
+                    # not a 12-bit-packed uint8 tensor, so the legacy
+                    # unpack would fail — the dedicated skip keeps the
+                    # fragment valid end-to-end.
+                    if (
+                        param_name.endswith("tq_idxs")
+                        or param_name.endswith("tq_codes")
+                        or param_name.endswith("tq_meta")
+                    ):
+                        if isinstance(tensor, torch.Tensor):
+                            fragment_bytes += (
+                                tensor.element_size() * tensor.nelement()
+                            )
+                        continue
+                    if param_name.endswith("quant_params"):
+                        # Mirror legacy 5-tuple/7-tuple unpack from comms.gather
+                        # (P0b: pack_version + original_last_dim are the trailing
+                        # two when 2-bit pack is on; we only verify shift/scale/
+                        # lookup finiteness here, same as the legacy path).
+                        shift, scale, _offset, lookup, _dtype, *_extras = tensor
+                        if (
+                            (not torch.isfinite(shift))
+                            or (
+                                isinstance(scale, float)
+                                and (
+                                    not math.isfinite(scale)
+                                    or abs(scale) < 1e-12
+                                    or abs(scale) > 1e4
+                                )
+                            )
+                        ):
+                            fragment_valid = False
+                            fragment_failure = (
+                                f"bad quant params in {param_name}"
+                            )
+                            break
+                        if torch.is_tensor(lookup) and (
+                            not torch.isfinite(lookup).all()
+                        ):
+                            fragment_valid = False
+                            fragment_failure = (
+                                f"non-finite lookup table in {param_name}"
+                            )
+                            break
+                        continue
+
+                    if param_name.endswith("idxs"):
+                        base_name = param_name[:-4]
+                        totalk_value = totalks.get(base_name)
+                        if totalk_value is None:
+                            fragment_valid = False
+                            fragment_failure = f"missing totalk for {base_name}"
+                            break
+                        totalk = (
+                            totalk_value
+                            if isinstance(totalk_value, int)
+                            else totalk_value.numel()
+                        )
+                        vals_tensor = state_dict_resp.get(
+                            base_name + "vals", None
+                        )
+                        qparams_tensor = state_dict_resp.get(
+                            base_name + "quant_params", None
+                        )
+                        try:
+                            self.check_compressed_indices(
+                                param_name,
+                                tensor,
+                                totalk,
+                                allowed_topk=self.hparams.topk_compression,
+                                vals=vals_tensor,
+                                qparams=qparams_tensor,
+                            )
+                        except Exception as e:
+                            fragment_valid = False
+                            fragment_failure = (
+                                f"compressed indices check failed for "
+                                f"{param_name}: {str(e)[:120]}"
+                            )
+                            break
+                        if isinstance(tensor, torch.Tensor):
+                            fragment_bytes += (
+                                tensor.element_size() * tensor.nelement()
+                            )
+                        continue
+
+                    if param_name.endswith("vals"):
+                        if isinstance(tensor, torch.Tensor):
+                            if tensor.dtype == torch.uint8:
+                                if tensor.nelement() == 0:
+                                    fragment_valid = False
+                                    fragment_failure = (
+                                        f"empty tensor in {param_name}"
+                                    )
+                                    break
+                            else:
+                                tensor_to_check = tensor.to(device)
+                                if (
+                                    torch.isnan(tensor_to_check).any()
+                                    or torch.isinf(tensor_to_check).any()
+                                ):
+                                    fragment_valid = False
+                                    fragment_failure = f"NaN/Inf in {param_name}"
+                                    del tensor_to_check
+                                    break
+                                del tensor_to_check
+                            fragment_bytes += (
+                                tensor.element_size() * tensor.nelement()
+                            )
+                        qparams = state_dict_resp.get(
+                            param_name[:-4] + "quant_params", None
+                        )
+                        if (
+                            qparams is None
+                            and isinstance(tensor, torch.Tensor)
+                            and tensor.dtype == torch.uint8
+                        ):
+                            fragment_valid = False
+                            fragment_failure = (
+                                f"missing quant_params for {param_name}"
+                            )
+                            break
+                        if xshapes is not None:
+                            base_name = param_name[:-4]
+                            expected_shape = xshapes.get(base_name)
+                            if expected_shape is not None and isinstance(
+                                tensor, torch.Tensor
+                            ):
+                                if len(expected_shape) == 4:
+                                    expected_vals_prefix = expected_shape[:2]
+                                else:
+                                    expected_vals_prefix = expected_shape[:1]
+                                actual_vals_prefix = tensor.shape[:-1]
+                                if tuple(actual_vals_prefix) != tuple(
+                                    expected_vals_prefix
+                                ):
+                                    fragment_valid = False
+                                    fragment_failure = (
+                                        f"shape mismatch for {param_name}: "
+                                        f"expected {expected_vals_prefix}, "
+                                        f"got {actual_vals_prefix}"
+                                    )
+                                    break
+
+                if not fragment_valid:
+                    hone.logger.warning(
+                        f"[gather-frag] uid={uid} frag={frag_idx} dropped: "
+                        f"{fragment_failure}"
+                    )
+                    continue
+
+                valid_fragments.append(
+                    (
+                        frag_idx,
+                        state_dict_resp,
+                        global_step_resp,
+                        received,
+                        fragment_bytes,
+                    )
+                )
+
+            if not valid_fragments:
+                # Either no fragment arrived or every fragment failed validation.
+                # Treat this UID as fully skipped, mirroring the legacy contract.
+                if uid in responses_by_uid and any(
+                    r is None or isinstance(r, Exception)
+                    for _, r in responses_by_uid[uid]
+                ):
+                    skip_reasons[uid] = "all fragments failed/missing"
+                else:
+                    skip_reasons[uid] = "no valid fragments"
+                skipped_uids.append(uid)
+                continue
+
+            # Append this UID's contributions to the per-key tensor lists in
+            # frag_idx order so the layout is deterministic across ranks.
+            # Match the legacy gather contract: only compressed-tensor keys
+            # (idxs/vals/quant_params, or the FU1 TurboQuant
+            # tq_idxs/tq_codes/tq_meta triple) end up in
+            # ``aggregated_state_dict`` — ``metadata`` rides along inside
+            # each fragment file and is surfaced separately via
+            # ``metadata_per_uid`` (FU4) for validator-side
+            # ``token_weighted_aggregation`` consumption.
+            for (
+                frag_idx,
+                state_dict_resp,
+                global_step_resp,
+                _received,
+                fragment_bytes,
+            ) in valid_fragments:
+                fragment_byte_counts.append(fragment_bytes)
+                metrics["download_bytes"] += fragment_bytes
+                successful_fetches += 1
+                fragments_seen_per_uid.setdefault(uid, set()).add(frag_idx)
+                for param_name, tensor in state_dict_resp.items():
+                    # FU1 TurboQuant keys: checked BEFORE the legacy
+                    # ``endswith("idxs")`` arm because ``tq_idxs`` also
+                    # matches ``idxs``. Without the explicit check the
+                    # legacy arm would accept the tq_idxs into the
+                    # aggregated dict but ``tq_codes`` / ``tq_meta``
+                    # would still be dropped (neither ends with a legacy
+                    # suffix) and the validator-side decode would fail
+                    # with a KeyError. An explicit allowlist keeps the
+                    # three-key triple coherent in the aggregated dict.
+                    if (
+                        param_name.endswith("tq_idxs")
+                        or param_name.endswith("tq_codes")
+                        or param_name.endswith("tq_meta")
+                    ):
+                        aggregated_state_dict.setdefault(param_name, []).append(
+                            tensor
+                        )
+                        uids_per_param.setdefault(param_name, []).append(uid)
+                        continue
+                    if not (
+                        param_name.endswith("idxs")
+                        or param_name.endswith("vals")
+                        or param_name.endswith("quant_params")
+                    ):
+                        continue
+                    aggregated_state_dict.setdefault(param_name, []).append(
+                        tensor
+                    )
+                    uids_per_param.setdefault(param_name, []).append(uid)
+
+            # FU4: extract the canonical ``UploadMetadata.to_wire()`` for
+            # this UID. Miners generate the dict once per window before
+            # ``prepare_gradient_buckets`` so every fragment carries an
+            # identical copy. We tally frozen-dict keys across the UID's
+            # valid fragments and pick the most common entry; any
+            # disagreement is logged at WARN. If a UID's fragments all
+            # lack a metadata field (legacy / malformed), the UID is
+            # absent from ``metadata_per_uid`` and the validator falls
+            # back to a uniform weight for that peer.
+            frag_metas: list[dict] = []
+            for _frag_idx, frag_state, _gstep, _recv, _bytes in valid_fragments:
+                m = frag_state.get("metadata")
+                if isinstance(m, dict):
+                    frag_metas.append(m)
+            if frag_metas:
+                # Use a hashable canonical form so we can tally identical
+                # dicts. ``json.dumps(sort_keys=True)`` survives the
+                # ``UploadMetadata.to_wire()`` payload (all values are
+                # ints / strs / a stable str digest).
+                tally: dict[str, tuple[int, dict]] = {}
+                for m in frag_metas:
+                    try:
+                        canon = json.dumps(m, sort_keys=True, default=str)
+                    except (TypeError, ValueError):
+                        # A peer who shipped a non-JSON metadata payload
+                        # is malformed; skip without crashing the gather.
+                        continue
+                    if canon not in tally:
+                        tally[canon] = (1, m)
+                    else:
+                        cnt, ref = tally[canon]
+                        tally[canon] = (cnt + 1, ref)
+                if tally:
+                    if len(tally) > 1:
+                        hone.logger.warning(
+                            f"[gather-frag] uid={uid} fragments disagree on "
+                            f"metadata: {len(tally)} distinct dicts across "
+                            f"{len(frag_metas)} fragment(s); using majority "
+                            f"value (FU4)."
+                        )
+                    # Majority value (ties broken by first-seen order via
+                    # dict insertion order, which is fragment-idx-sorted).
+                    _best = max(tally.values(), key=lambda t: t[0])
+                    metadata_per_uid[uid] = _best[1]
+            else:
+                hone.logger.info(
+                    f"[gather-frag] uid={uid} no metadata in any fragment "
+                    f"(legacy or malformed); skipping metadata_per_uid"
+                )
+
+            # Use the global_step of the *first* (lowest-frag-idx) successful
+            # fragment for this UID. They should all be identical (one upload
+            # round per window) but defending against malformed peers.
+            valid_uids.append(uid)
+            global_steps.append(valid_fragments[0][2])
+
+        hone.logger.info(
+            f"{hone.P(window, hone.T() - process_start)} "
+            f"Processed peer fragments <--"
+        )
+
+        if not valid_uids:
+            hone.logger.info("No valid fragmented gradients received from any UID")
+            return None
+
+        total_time = time.time() - start_time
+        # P1 R2 amplification telemetry. The 24× fan-out is the headline risk
+        # called out in the plan's risk register (#6); operators tail this
+        # line to monitor R2 P95 latency before flipping ``fragmented_uploads``
+        # default-on across the fleet.
+        total_fetches = len(uids) * num_fragments
+        hone.logger.info(
+            f"[gather] r2_fetches total={total_fetches} "
+            f"successful={successful_fetches} "
+            f"wall_clock_seconds={total_time:.2f} fragmented=True "
+            f"num_fragments={num_fragments}"
+        )
+        hone.logger.info(
+            f"Fragmented gather done in {total_time:.2f}s. "
+            f"Success rate: {len(valid_uids)}/{len(uids)} peers, "
+            f"{successful_fetches}/{total_fetches} fragments. "
+            f"Download: {metrics['download_bytes']} bytes"
+        )
+
+        result = SimpleNamespace(
+            time=total_time,
+            upload_bytes=metrics["upload_bytes"],
+            download_bytes=metrics["download_bytes"],
+            success_rate=len(valid_uids) / len(uids) if uids else 0.0,
+            state_dict=SimpleNamespace(**aggregated_state_dict),
+            uids=valid_uids,
+            global_steps=global_steps,
+            skipped_uids=skipped_uids,
+            skip_reasons=skip_reasons,
+            fragments_seen_per_uid=fragments_seen_per_uid,
+            uids_per_param=uids_per_param,
+            fragment_byte_counts=fragment_byte_counts,
+            # FU4: per-UID ``UploadMetadata.to_wire()`` dict — same shape
+            # as the legacy gather branch so callers can read it
+            # uniformly across fragmented and non-fragmented modes.
+            metadata_per_uid=metadata_per_uid,
         )
         return result
 
@@ -2082,6 +3138,12 @@ class Comms(ChainManager):
                 global_steps=[],
                 skipped_uids=gather_uids.copy(),
                 skip_reasons={uid: "no valid gradients received" for uid in gather_uids},
+                fragments_seen_per_uid={},
+                uids_per_param={},
+                fragment_byte_counts=[],
+                # FU4: empty metadata dict so downstream callers can read
+                # ``primary.metadata_per_uid`` unconditionally.
+                metadata_per_uid={},
             )
 
         context_log(
@@ -2091,11 +3153,45 @@ class Comms(ChainManager):
         )
 
         # ── 2. Retry the misses with reserve peers ─────────────────────
+        # P3 rebalance: a UID is "missing" iff it contributed zero fragments.
+        # With K_quorum cutting the primary gather short at the grace
+        # deadline, ``primary.uids`` can be well below ``len(gather_uids)``
+        # even on a healthy fleet. The reserve's purpose is to backfill to
+        # at least ``K_safety`` peers so the per-peer 1/K_safety cap in
+        # ``_apply_k_safety_cap`` has enough peers to redistribute mass
+        # to. Above that floor the reserve adds no further safety value
+        # (the cap already constrains the dominant peer), so we skip the
+        # reserve call entirely and avoid the second R2 round-trip.
+        #
+        # Below ``K_quorum`` (i.e. ``primary is None``), gather already
+        # aborted up in ``self.gather`` and returned the empty primary
+        # above. Reserve cannot recover from a missed quorum — that's a
+        # hard window skip. So the reserve window of relevance is
+        # ``K_quorum <= successful < K_safety``.
+        k_safety = int(
+            getattr(self.hparams, "gather_safety_cap", 0)
+            if self.hparams is not None
+            else 0
+        )
         missing = set(gather_uids) - set(primary.uids)
-        if missing and reserve_uids:
-            # take as many reserve peers as slots we missed
+        if (
+            missing
+            and reserve_uids
+            and (k_safety <= 0 or len(primary.uids) < k_safety)
+        ):
+            # P3: only promote enough reserve peers to reach K_safety (no
+            # point pulling the whole reserve tier when the cap already
+            # guarantees no single peer exceeds 1/K_safety). When
+            # ``k_safety <= 0`` the cap is disabled and we fall back to
+            # "fill every missing slot" for byte-for-byte parity with
+            # the pre-P3 path.
+            if k_safety > 0:
+                shortfall = max(k_safety - len(primary.uids), 0)
+                reserve_budget = min(len(missing), shortfall)
+            else:
+                reserve_budget = len(missing)
             replacements = [uid for uid in reserve_uids if uid not in primary.uids][
-                : len(missing)
+                :reserve_budget
             ]
 
             if replacements:
@@ -2120,6 +3216,47 @@ class Comms(ChainManager):
                     primary.skip_reasons.update(fallback.skip_reasons)
                     primary.upload_bytes += fallback.upload_bytes
                     primary.download_bytes += fallback.download_bytes
+
+                    # P1: keep the per-UID and per-param dicts consistent
+                    # across primary + reserve so ``check_uid_index_overlap``
+                    # sees the merged contributor map. Order-merge into the
+                    # per-key list so ``uids_per_param[k][i]`` still aligns
+                    # with the i-th tensor in ``state_dict.<k>``.
+                    primary_fspu = getattr(primary, "fragments_seen_per_uid", {})
+                    fallback_fspu = getattr(fallback, "fragments_seen_per_uid", {})
+                    if primary_fspu or fallback_fspu:
+                        merged_fspu = dict(primary_fspu)
+                        for uid, frags in fallback_fspu.items():
+                            merged_fspu.setdefault(uid, set()).update(frags)
+                        primary.fragments_seen_per_uid = merged_fspu
+
+                    primary_upp = getattr(primary, "uids_per_param", {})
+                    fallback_upp = getattr(fallback, "uids_per_param", {})
+                    if primary_upp or fallback_upp:
+                        merged_upp = {k: list(v) for k, v in primary_upp.items()}
+                        for k, v in fallback_upp.items():
+                            merged_upp.setdefault(k, []).extend(v)
+                        primary.uids_per_param = merged_upp
+
+                    primary_fbc = getattr(primary, "fragment_byte_counts", [])
+                    fallback_fbc = getattr(fallback, "fragment_byte_counts", [])
+                    primary.fragment_byte_counts = list(primary_fbc) + list(
+                        fallback_fbc
+                    )
+
+                    # FU4: merge per-UID metadata dicts so the validator
+                    # gets ``c_tokens`` / ``c_steps`` for both primary and
+                    # reserve peers in one place. Reserve UIDs are
+                    # disjoint from primary by construction
+                    # (``replacements = [uid for uid in reserve_uids if
+                    # uid not in primary.uids]`` above), so a plain
+                    # ``update`` is collision-free.
+                    primary_mpu = getattr(primary, "metadata_per_uid", {})
+                    fallback_mpu = getattr(fallback, "metadata_per_uid", {})
+                    if primary_mpu or fallback_mpu:
+                        merged_mpu = dict(primary_mpu)
+                        merged_mpu.update(fallback_mpu)
+                        primary.metadata_per_uid = merged_mpu
 
                     context_log(
                         message=f"[gather_with_reserve] ✅ reserve gather "
@@ -2582,6 +3719,7 @@ class Comms(ChainManager):
         totalk: int,
         allowed_topk: int | None = None,
         vals: torch.Tensor | None = None,
+        qparams: tuple | None = None,
     ) -> None:
         """
         Validates the integrity and format of compressed gradient indices.
@@ -2599,6 +3737,14 @@ class Comms(ChainManager):
                 Defaults to the hparams configuration.
             vals (torch.Tensor | None, optional): The corresponding values tensor,
                 required for validating 12-bit packed indices. Defaults to None.
+            qparams (tuple | None, optional): The quantisation params tuple
+                that travels alongside ``vals``. When the sender opted into
+                PACK_VERSION_2BIT (P0b), qparams is a 7-tuple whose 7th
+                element carries the original (pre-2-bit-pack) last-dim size,
+                which is needed to reconstruct the indices shape. Legacy
+                5-tuple qparams (raw uint8 values) are fully supported with
+                the wire ``vals.shape`` interpreted directly. ``None`` falls
+                back to legacy behaviour.
 
         Raises:
             ValueError: If any validation check fails, such as out-of-bounds
@@ -2634,9 +3780,23 @@ class Comms(ChainManager):
             if idxs.numel() == 0:
                 raise ValueError(f"[{param_name}] Empty packed indices tensor")
 
-            # Unpack using the values shape
+            # Reconstruct the per-row index count. For PACK_VERSION_2BIT,
+            # ``vals.shape[-1]`` is ``ceil(topk/4)`` which is wrong for the
+            # 12-bit unpacker; the original ``topk`` lives in qparams[6].
+            # ``vals.shape[:-1]`` is preserved across both wire formats so
+            # we always trust the leading dims.
+            indices_last_dim = vals.shape[-1]
+            if (
+                isinstance(qparams, tuple)
+                and len(qparams) >= 7
+                and int(qparams[5]) == 1  # PACK_VERSION_2BIT
+            ):
+                indices_last_dim = int(qparams[6])
+            indices_shape = (*vals.shape[:-1], indices_last_dim)
+
+            # Unpack using the reconstructed indices shape
             try:
-                unpacked = unpack_12bit_indices(idxs, vals.shape)
+                unpacked = unpack_12bit_indices(idxs, indices_shape)
                 # Validate that the last dimension matches allowed_topk
                 if unpacked.shape[-1] != allowed_topk:
                     raise ValueError(

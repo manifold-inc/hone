@@ -324,11 +324,19 @@ class Trainer:
         # another ``+momentum * grad`` on top of the regular
         # momentum-corrected step, ~1.5x larger updates than plain SGD
         # momentum. Make it a hparam so we can flip back if needed.
+        # ``foreach=True`` collapses the per-tensor SGD update into a
+        # single ``torch._foreach_*`` kernel pass over the param list,
+        # which on MoE 8B-A1B (~7100 trainable tensors) eliminates
+        # 5-15s of Python-loop overhead per outer step. Works with
+        # DTensor shards in PyTorch >= 2.7 (the foreach ops dispatch
+        # through DTensor's __torch_dispatch__ to per-shard kernels);
+        # ``hone/pyproject.toml`` pins ``torch>=2.7.1``.
         self.outer_optimizer = SGD(
             self.model.parameters(),
             lr=self.lr,
             momentum=self.hparams.outer_momentum,
             nesterov=bool(getattr(self.hparams, "outer_nesterov", True)),
+            foreach=True,
         )
         self.outer_scheduler = self._build_outer_scheduler()
         self.inner_optimizer = self._build_inner_optimizer(validator)
@@ -1117,6 +1125,14 @@ class Trainer:
             "window_entry_loss": window_entry_loss,
             "batch_count": batch_count,
             "batch_tokens": global_tokens,
+            # P2: ``inner_step_count`` is the number of inner optimizer
+            # steps actually taken this window (≤ ``hparams.inner_steps``;
+            # may be lower under headroom early-exit, may be capped by
+            # ``max_inner_steps``). The miner uploads it as ``c_steps`` in
+            # ``UploadMetadata`` so the validator can compute the
+            # token-weighted aggregation weight ``w = c_tokens *
+            # (c_tokens / c_steps)`` per Decoupled DiLoCo Algorithm 2.
+            "inner_step_count": inner_step_count,
             "global_grad_norm": total_grad_sq ** 0.5 if total_grad_sq > 0 else 0.0,
             "global_weight_norm": total_weight_sq ** 0.5 if total_weight_sq > 0 else 0.0,
         }
@@ -1131,7 +1147,12 @@ class Trainer:
         if not hasattr(self, "_outer_auto_clip_state"):
             self._outer_auto_clip_state: dict = {}
         auto_on = bool(getattr(self.hparams, "outer_grad_norm_auto", False))
-        return hone.neurons.outer_step(
+        # ``hone.neurons.outer_step`` returns
+        # ``(fingerprint, outer_step_timings)`` post-P0a. The miner's
+        # main loop only consumes the fingerprint today; if/when the
+        # miner reporter wants the phase-split timings, plumb the
+        # second element through here too.
+        fingerprint, _outer_timings = hone.neurons.outer_step(
             self.model,
             self.outer_optimizer,
             gather_result=gather_result,
@@ -1158,3 +1179,4 @@ class Trainer:
                 getattr(self.hparams, "outer_grad_norm_ema_decay", 0.95)
             ),
         )
+        return fingerprint

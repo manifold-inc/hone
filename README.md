@@ -435,6 +435,74 @@ python -c "import torch; print(torch.cuda.device_count())"
 - Check that `topk_compression` matches the network standard
 - Ensure the miner's model is in sync (checkpoint loaded correctly)
 
+### SIGTERM troubleshooting
+
+**Symptom** (in `pm2 logs vali` or `logs/vali-error.log`):
+
+```
+File "/root/hone/src/hone/__init__.py", line 10, in <module>
+    from .neurons import *
+  ...
+  File "<frozen importlib._bootstrap_external>", line 753, in _compile_bytecode
+EOFError: marshal data too short
+...
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: neurons/validator.py FAILED
+```
+
+followed by sibling ranks exiting with `exitcode: -15 (SIGTERM)` and pm2/systemd restarting in a tight loop.
+
+**Root cause.** `torchrun` spawns N Python ranks simultaneously. Each rank runs `import hone`, which compiles `src/hone/*.py` to `.pyc` files under `src/hone/__pycache__/` on first load. CPython writes atomically via a per-PID tempfile + `os.replace(2)`, but on shared / overlay filesystems (NFS, some cloud block volumes, overlay2) `rename(2)` is **not** fully POSIX-atomic. A sibling rank can read a partially-written `.pyc` and die with `EOFError: marshal data too short`. That aborts the distributed run; pm2 restarts; the corrupt `.pyc` is still on disk; the cycle continues.
+
+**Fix** (shipped in [`ecosystem.config.js`](ecosystem.config.js) and [`ecosystem.validator.config.js`](ecosystem.validator.config.js)):
+
+1. Every pm2 app sets `PYTHONDONTWRITEBYTECODE=1` in its `env:` block. Every Python process in the `pm2 → uv → torchrun → N ranks` tree inherits it and never writes a `.pyc` — there is no file to race on. Cold-start cost is a one-time sub-second import hit, invisible against the minutes-long model load that follows.
+2. Each ecosystem config runs `cleanStalePyCache(CWD)` at config-load time (i.e. every `pm2 start` / `pm2 reload`). That walks `src/hone/` and `neurons/`, removes any `__pycache__` directories it finds, and leaves the venv's `site-packages` alone. This clears already-corrupt `.pyc` files from a previous crash loop.
+
+**Deploy the fix:**
+
+```bash
+cd <hone-checkout>
+git pull
+pm2 delete all                           # stop the crash loop cleanly
+pm2 start ecosystem.validator.config.js  # (or ecosystem.config.js on the miner box)
+pm2 logs vali --lines 100                # confirm healthy startup
+```
+
+The first log line from the ecosystem config will confirm the wipe happened, e.g. `[ecosystem.validator] resolved UV=... (dotenv loaded N keys, purged 2 __pycache__ dir(s); PYTHONDONTWRITEBYTECODE=1 will be set on all ranks)`.
+
+**Verify manually:**
+
+Single-process sanity check first — should print the version, exit 0, and leave no `.pyc` behind:
+
+```bash
+cd <hone-checkout>
+find src/hone neurons -type d -name __pycache__ -exec rm -rf {} +
+PYTHONDONTWRITEBYTECODE=1 uv run python -c "import hone; print(hone.__version__)"
+test -z "$(find src/hone neurons -name '*.pyc' 2>/dev/null)" && echo "OK: no .pyc written"
+```
+
+Then a multi-rank `torchrun` smoke test (4 ranks hitting the import path simultaneously — this is the exact race condition that was looping):
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 uv run torchrun --nproc_per_node=4 --master_port=29599 \
+  -m pytest -q -x -k "test_nothing"  # any no-op entry; goal is to load hone on 4 ranks
+```
+
+If either command triggers `EOFError: marshal data too short`, `PYTHONDONTWRITEBYTECODE=1` isn't propagating — check the shell invocation and that the venv's Python honours env vars (it should; this is stdlib behaviour).
+
+**pm2 supervision guards** (also in both ecosystem configs):
+
+| Field | Value | Guards against |
+|-------|-------|----------------|
+| `autorestart` | `true` | Normal crashes should still bring the process back up. |
+| `min_uptime` | `60s` | Process is "stable" only after 60s of uptime. Faster exits count against `max_restarts`. |
+| `max_restarts` | `5` | After 5 consecutive unstable exits, pm2 stops auto-restarting. Forces operator attention instead of masking a persistent fault. |
+| `restart_delay` | `5000` (ms) | 5s between restarts. Prevents tight crash loops from pinning a CPU. |
+| `exp_backoff_restart_delay` | `100` (ms) | Base for exponential backoff on repeated failures; doubles each consecutive crash. |
+| `kill_timeout` | `30000` (ms) | On stop/restart, gives workers 30s to drain in-flight gather (up to 600s timeout), R2 PUTs, and NCCL handles before pm2 sends `SIGKILL`. Cutting this short strands peer uploads. |
+
+If you see `stopped (max_restarts reached)` in `pm2 list`, the supervision guards did their job — check `pm2 logs vali --lines 500` for the underlying error before running `pm2 start ecosystem.validator.config.js` again.
+
 ---
 
 ## Project Structure

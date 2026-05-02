@@ -58,6 +58,7 @@ from neurons.base_node import CPU_COUNT
 from hone.model import LoopLM
 from hone.compress import QuantParamsT
 from hone.distributed import dist_helper
+from hone.schemas import validate_upload_metadata
 
 # GPU optimizations.
 torch.manual_seed(42)
@@ -90,6 +91,14 @@ def timer(name: str, wandb_obj=None, step=None, metrics_logger=None):
         metrics_logger.log(
             measurement="timing", tags={"window": step}, fields={name: duration}
         )
+
+
+# P4: ``_use_snapshot`` lives in ``hone.distributed`` (alongside the
+# secondary ``_outer_step_stream``) so it's importable from light-weight
+# unit tests without pulling in ``bittensor`` / ``openskill`` etc. We
+# re-bind the public name here so the validator main-loop call site
+# below can stay textually local; same semantics either way.
+from hone.distributed import use_snapshot as _use_snapshot  # noqa: E402
 
 
 class Validator(BaseNode, Trainer):
@@ -412,6 +421,7 @@ class Validator(BaseNode, Trainer):
             use_quantization=True,
             quantization_bins=self.hparams.quantization_bins,
             quantization_range=self.hparams.quantization_range,
+            pack_values_2bit=getattr(self.hparams, "pack_values_2bit", False),
         )
 
         # Init optimizer
@@ -573,6 +583,20 @@ class Validator(BaseNode, Trainer):
         self.param_avg_change: dict[str, torch.Tensor] = {}
         self.prev_param_state: dict[str, torch.Tensor] = {}
         self.param_change_alpha = 0.2
+
+        # P2 token-weighted aggregation: per-UID token + step counters
+        # populated from clamped ``UploadMetadata`` (FU4: now read from
+        # ``gather_result.metadata_per_uid`` IMMEDIATELY AFTER gather and
+        # BEFORE the parallel/serial outer_step dispatch, instead of
+        # during the per-peer eval loop). Reset per window in ``run``
+        # so a stale peer whose gradient was rejected this window
+        # doesn't carry over a phantom weight from a previous window.
+        # Read by the ``token_weighted_aggregation`` branch immediately
+        # before ``hone.neurons.outer_step`` to build the ``peer_weights``
+        # arg. FU4 made ``token_weighted_aggregation`` and
+        # ``parallel_outer_step`` compose for the first time.
+        self._peer_c_tokens: dict[int, int] = {}
+        self._peer_c_steps: dict[int, int] = {}
 
         self.outer_steps_per_shard = getattr(self.hparams, "outer_steps_per_shard")
         self.shard_reset_outer_step = getattr(
@@ -1571,6 +1595,69 @@ class Validator(BaseNode, Trainer):
                     current_window=self.current_window,
                 )
 
+            # ─────────────────────────────────────────────────────────────
+            # P5a: chain-bound eval seed. Fetched on master and broadcast
+            # to all ranks BEFORE gather starts so that ``L(base_model)``
+            # (the Step-A eval in the plan) can run concurrently with
+            # gather. The seed is derived from the block hash at the first
+            # block of ``sync_window + 1`` — the first block the chain
+            # mints AFTER upload close — so miners physically cannot see
+            # or overfit to the eval distribution.
+            #
+            # Fallback to ``random.randint`` is critical for offline dev
+            # runs (no chain); in production we emit an ERROR log line
+            # (not WARN) if the RPC fails after 3 retries. See
+            # ``hone.get_chain_bound_seed`` for retry details.
+            gather_close_block = (
+                self.sync_window * self.hparams.blocks_per_window
+                + self.hparams.blocks_per_window
+            )
+            if self.is_master:
+                production = getattr(self.config, "netuid", None) is not None
+                random_seed = hone.chain_bound_seed_or_fallback(
+                    self.comms.subtensor.substrate,
+                    gather_close_block,
+                    retries=3,
+                    production=production,
+                )
+            else:
+                random_seed = 0
+            seed_tensor = torch.tensor(
+                [int(random_seed)], dtype=torch.int64, device=self.device
+            )
+            dist_helper.broadcast(seed_tensor, src=0)
+            random_seed = int(seed_tensor.item())
+
+            # P5 async pre-compute: kick off ``L(base_model)`` on the
+            # chain-bound eval batch concurrently with gather. Both run
+            # on the asyncio event loop; ``evaluate_model`` yields at
+            # the end of each batch (``await asyncio.sleep(0)``), so
+            # gather's network I/O naturally interleaves with the eval
+            # forwards. On a validator with no other CPU/GPU pressure
+            # this is mostly free; when bandwidth-bound it saves roughly
+            # one ``evaluate_model`` wall-clock per window.
+            #
+            # NOTE: This is deliberately NOT using a second CUDA stream.
+            # P4 (parallel ``outer_step`` on a 2nd stream) is a separate
+            # wave; keeping the base_loss on the default stream here
+            # avoids pre-empting P4's stream budget. The interleaving is
+            # purely at the asyncio layer: gather awaits network I/O,
+            # base_loss awaits after each batch.
+            self.sampler.set_window_uid(random_seed, self.sync_window)
+            base_loss_task: asyncio.Task | None = None
+            try:
+                base_loss_task = asyncio.create_task(
+                    self.evaluate_model(self.model, self.loader)
+                )
+            except Exception as e:
+                hone.log_with_context(
+                    level="warning",
+                    message=f"[P5] failed to start async base_loss task: {e}; falling back to sync",
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
+                base_loss_task = None
+
             gather_start = hone.T()
             skipped_uids: list[int] = []
             skip_reasons: dict[int, str] = {}
@@ -1583,6 +1670,21 @@ class Validator(BaseNode, Trainer):
                 try:
                     hone.logger.info(
                         f"Rank {dist_helper.rank} starting gather_with_reserve for window {self.sync_window}"
+                    )
+                    # P1: when ``fragmented_uploads`` is on, fan gather out
+                    # to ``num_fragments`` per-fragment GETs per peer instead
+                    # of a single blob. Hparam-gated so a half-upgraded fleet
+                    # keeps working: legacy miners upload one blob (key
+                    # "gradient"), legacy validators issue one GET per peer.
+                    # Operator MUST flip ``fragmented_uploads: true`` on every
+                    # node before any node sees the speedup.
+                    _fragmented = bool(
+                        getattr(self.hparams, "fragmented_uploads", False)
+                    )
+                    _num_fragments = (
+                        int(getattr(self.hparams, "num_fragments", 24))
+                        if _fragmented
+                        else None
                     )
                     gather_result = await self.comms.gather_with_reserve(
                         my_uid=self.uid,
@@ -1599,6 +1701,7 @@ class Validator(BaseNode, Trainer):
                         time_min=time_min,
                         time_max=time_max,
                         expected_compressed_params=self.expected_compressed_params,
+                        num_fragments=_num_fragments,
                     )
                     hone.logger.info(
                         f"Rank {dist_helper.rank} completed gather_with_reserve for window {self.sync_window}"
@@ -1619,6 +1722,16 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                     )
                     skip_window = True
+                else:
+                    # P1: surface per-fragment download sizes for the
+                    # ``upload_bytes_per_fragment_p50/_max`` dashboard tile.
+                    # Legacy single-blob gather returns ``[]`` here, in
+                    # which case the percentile block downstream emits
+                    # ``None`` for both fields (preserving the pre-P1
+                    # contract).
+                    fragment_byte_counts = list(
+                        getattr(gather_result, "fragment_byte_counts", [])
+                    )
 
             # Broadcast decision to skip window from master to all ranks
             skip_tensor = torch.tensor(
@@ -1640,6 +1753,16 @@ class Validator(BaseNode, Trainer):
                 raise
 
             if skip_window:
+                # Keep the asyncio / NCCL / sampler state clean even
+                # when we bail on the window. The base_loss task is
+                # speculative work; awaiting it unconditionally is the
+                # cheapest way to keep NCCL op ordering consistent on
+                # rerun.
+                if base_loss_task is not None:
+                    try:
+                        await base_loss_task
+                    except Exception:
+                        pass
                 continue
 
             # --------------------------------------------------------------+
@@ -1857,669 +1980,1431 @@ class Validator(BaseNode, Trainer):
             )
             dist_helper.safe_barrier("pre_evaluation", self.local_rank)
 
-            # 5. Save original model state for evaluation
-            eval_start = hone.T()
-            eval_window = self.current_window  # Store window at evaluation start
 
-            # 6. Select peers to evaluate using bin rotation (master selects and broadcasts)
-            if self.is_master:
-                hone.log_with_context(
-                    level="info",
-                    message="Creating performance bins for peer evaluation",
-                    sync_window=self.sync_window,
-                    current_window=self.current_window,
-                )
-
-                # Create performance bins
-                performance_bins = self.bin_evaluation_peers(
-                    num_bins=self.hparams.num_evaluation_bins
-                )
-
-                # Select which bin to evaluate in this window
-                current_bin = self.select_next_bin_for_evaluation(
-                    num_bins=self.hparams.num_evaluation_bins
-                )
-
-                # Select peers from the chosen bin using weighted sampling
-                evaluation_uids = self.select_evaluation_uids_from_bin(
-                    performance_bins,
-                    current_bin,
-                )
-
-                hone.log_with_context(
-                    level="info",
-                    message=f"Evaluating peers from bin {current_bin}: {evaluation_uids}",
-                    sync_window=self.sync_window,
-                    current_window=self.current_window,
-                )
-
-                # Calculate norms from gather result
-                clip_norm_dict = {}
-                if gather_result is not None:
-                    clip_norm_dict = self.compute_peer_val_norms(gather_result)
-            else:
-                # Non-master ranks prepare empty structures
-                evaluation_uids = []
-                clip_norm_dict = {}
-
-            # Broadcast only evaluation UIDs from master to all ranks
-            # Prepare tensors for broadcasting
-            if self.is_master:
-                # Convert evaluation UIDs to tensor (pad with -1 if needed)
-                eval_uids_tensor = torch.tensor(
-                    evaluation_uids + [-1] * (256 - len(evaluation_uids)),
-                    dtype=torch.int32,
-                    device=self.device,
-                )
-            else:
-                eval_uids_tensor = torch.zeros(
-                    256, dtype=torch.int32, device=self.device
-                )
-
-            # Broadcast from master to all ranks
-            dist_helper.broadcast(eval_uids_tensor, src=0)
-
-            # Reconstruct values on non-master ranks
-            if not self.is_master:
-                evaluation_uids = [
-                    int(uid.item()) for uid in eval_uids_tensor if uid >= 0
-                ]
-
-            # Each rank generates its own random seed for dataloader
-            random_seed = random.randint(1000, 10000000)
-
-            # ── Help pyright: predeclare locals used in arithmetic/logging
-            loss_before_random: float
-            n_batches: int
-
-            # Loss before random data
-            self.sampler.set_window_uid(random_seed, self.sync_window)
-            loss_before_random, n_batches = await self.evaluate_model(
-                self.model, self.loader
+            # ─────────────────────────────────────────────────────
+            # P4: parallel outer_step on a secondary CUDA stream.
+            #
+            # When ``parallel_outer_step`` is on:
+            #   1. Snapshot live weights (= eval-side fixed copy).
+            #   2. Dispatch ``outer_step`` on the dedicated
+            #      ``_outer_step_stream`` BEFORE eval starts.
+            #      Kernels capture LIVE param data_ptrs at
+            #      dispatch time; subsequent ``p.data`` swaps on
+            #      the eval side don't affect the in-flight
+            #      kernels (they target memory, not pointers).
+            #   3. Eval reads from the snapshot (via
+            #      ``with _use_snapshot``); concurrent with
+            #      outer_step writing the merged update onto
+            #      live weights.
+            #   4. After eval, sync the outer_step CUDA event
+            #      (below, post pre_model_update barrier) and
+            #      free the snapshot.
+            #
+            # FU4: ``peer_weights`` is now built BEFORE dispatch from
+            # ``gather_result.metadata_per_uid`` (populated by
+            # ``comms.gather`` / ``_gather_fragmented``), so
+            # ``token_weighted_aggregation`` and ``parallel_outer_step``
+            # finally compose. Pre-FU4, the per-UID metadata read
+            # happened DURING eval and raced with the parallel kernels;
+            # parallel mode therefore had to fall back to
+            # ``peer_weights=None`` and warn.
+            parallel_outer_on = bool(
+                getattr(self.hparams, "parallel_outer_step", False)
             )
-            self.loss_before_per_batch_random = (
-                loss_before_random / n_batches if n_batches > 0 else 0
+            outer_stream = (
+                hone.distributed.get_outer_step_stream()
+                if parallel_outer_on
+                else None
+            )
+            # Auto-clip EMA state lazily allocated; persists across
+            # outer steps. Initialised here (instead of the legacy
+            # site below) so the parallel dispatch can pass it.
+            if not hasattr(self, "_outer_auto_clip_state"):
+                self._outer_auto_clip_state: dict = {}
+            auto_on = bool(
+                getattr(self.hparams, "outer_grad_norm_auto", False)
             )
 
-            # Track UIDs that were attempted to be evaluated this window
-            uids_attempted_this_window: set[int] = set()
-
-            avg_loss_before_per_batch_own = 0.0
-            avg_loss_after_per_batch_own = 0.0
-            avg_loss_before_per_batch_random = 0.0
-            avg_loss_after_per_batch_random = 0.0
-            evaluated_peers = 0
-
-            # Synchronize all ranks before starting evaluation loop
-            dist_helper.safe_barrier("pre_eval_loop", self.local_rank)
-
-            # ── Help pyright in the UID loop
-            gradient_apply_time: float = 0.0
-            restore_time: float = 0.0
-            offload_time: float = 0.0
-            evaluation_time: float = 0.0
-            loss_before_own: float = 0.0
-            loss_after_own: float = 0.0
-            loss_after_random: float = 0.0
-            # Use CPU offloading instead of deepcopy to save memory
-            offload_start = hone.T()
-            save_ok_local = True
-            try:
-                saved_state = self._save_model_state()
-            except Exception as e:
-                save_ok_local = False
-                hone.log_with_context(
-                    level="error",
-                    message=f"Model state save failed: {e}",
-                    sync_window=self.sync_window,
-                    current_window=self.current_window,
-                )
-                saved_state = None
-            save_ok_global = dist_helper.all_ok(
-                save_ok_local, self.device, tag="save_model_state"
-            )
-            if not save_ok_global:
-                # keep all ranks aligned and skip this whole evaluation window
-                dist_helper.safe_barrier("bail_after_save_fail", self.local_rank)
-                evaluation_time = hone.T() - eval_start
-                dist_helper.safe_barrier("post_eval", self.local_rank)
-                continue
-            offload_time = hone.T() - offload_start
-
+            # ── FU4: post-gather metadata populate ───────────────
+            # Read every gathered peer's ``UploadMetadata.to_wire()``
+            # from ``gather_result.metadata_per_uid`` and stage the
+            # clamped ``c_tokens`` / ``c_steps`` into
+            # ``self._peer_c_tokens`` / ``self._peer_c_steps``
+            # BEFORE the parallel outer_step dispatch. This replaces
+            # the eval-loop population that races with parallel
+            # kernels. The legacy P2 clamp + WARN from the eval-loop
+            # path is preserved verbatim — a peer that overclaims
+            # ``c_tokens`` still gets silently capped at
+            # ``sample_count * seq_len`` and surfaces a WARN.
             if self.is_master:
-                hone.log_with_context(
-                    level="debug",
-                    message=f"Model state offloading took {offload_time:.3f}s",
-                    sync_window=self.sync_window,
-                    current_window=self.current_window,
+                self._peer_c_tokens.clear()
+                self._peer_c_steps.clear()
+                if (
+                    gather_result is not None
+                    and hasattr(gather_result, "metadata_per_uid")
+                ):
+                    clamp_on = bool(
+                        getattr(
+                            self.hparams, "c_tokens_clamp_enabled", True
+                        )
+                    )
+                    seq_len = int(self.hparams.sequence_length)
+                    for uid, meta in gather_result.metadata_per_uid.items():
+                        if not isinstance(meta, dict):
+                            continue
+                        try:
+                            if clamp_on:
+                                _, clamped_c_tokens, clamp_reason = (
+                                    validate_upload_metadata(
+                                        meta, seq_len=seq_len
+                                    )
+                                )
+                                if clamp_reason != "ok":
+                                    hone.log_with_context(
+                                        level="warning",
+                                        message=(
+                                            f"[FU4] UID {uid} "
+                                            f"{clamp_reason}"
+                                        ),
+                                        sync_window=self.sync_window,
+                                        current_window=self.current_window,
+                                        eval_uid=int(uid),
+                                    )
+                            else:
+                                clamped_c_tokens = int(
+                                    meta.get("c_tokens", 0)
+                                )
+                            self._peer_c_tokens[int(uid)] = (
+                                clamped_c_tokens
+                            )
+                            self._peer_c_steps[int(uid)] = int(
+                                meta.get("c_steps", 0)
+                            )
+                        except Exception as e:
+                            hone.log_with_context(
+                                level="warning",
+                                message=(
+                                    f"[FU4] UID {uid} metadata "
+                                    f"validation failed: {e}"
+                                ),
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=int(uid),
+                            )
+
+            # ── FU4: build peer_weights BEFORE outer_step dispatch ──
+            # The same ``peer_weights`` variable is consumed by both
+            # the parallel-stream dispatch below AND the serial
+            # post-eval dispatch site further down. Building it once
+            # here removes the duplicate construction that used to
+            # live at the serial site and keeps both paths
+            # token-weighting-equivalent. Default-OFF gate
+            # (``token_weighted_aggregation=false`` in hparams.json)
+            # so the block returns ``None`` and the outer_step runs
+            # unweighted.
+            peer_weights: dict[int, float] | None = None
+            if (
+                self.is_master
+                and bool(
+                    getattr(self.hparams, "token_weighted_aggregation", False)
+                )
+                and self._peer_c_tokens
+            ):
+                peer_weights = {}
+                for _uid, _ct in self._peer_c_tokens.items():
+                    _cs = max(int(self._peer_c_steps.get(_uid, 1)), 1)
+                    if _ct <= 0:
+                        # Legacy / pre-P2 peer: leave them out so they
+                        # fall back to uniform inside ``outer_step``.
+                        continue
+                    peer_weights[int(_uid)] = float(_ct) * (
+                        float(_ct) / float(_cs)
+                    )
+                if not peer_weights:
+                    peer_weights = None
+
+            # P4 snapshot. ``p.detach().clone()`` works for both
+            # plain tensors and DTensors (DTensor.clone() preserves
+            # placements/sharding metadata and allocates new local
+            # storage; verified against
+            # ``hone.distributed.DistributedHelper._force_reshard``
+            # which relies on the same ``isinstance(p, DT)`` +
+            # ``.to_local()`` semantics). Lives on GPU until we
+            # sync the outer-step event below.
+            eval_snapshot: dict[str, torch.Tensor] | None = None
+            if outer_stream is not None:
+                snapshot_full = bool(
+                    getattr(
+                        self.hparams, "parallel_outer_snapshot_full", True
+                    )
+                )
+                eval_snapshot = {}
+                _skipped_embed = 0
+                for _n, _p in self.model.named_parameters():
+                    if not snapshot_full and hone.neurons._is_embedding_param(_n):
+                        _skipped_embed += 1
+                        continue
+                    eval_snapshot[_n] = _p.detach().clone()
+                if self.is_master:
+                    hone.logger.info(
+                        f"[P4] snapshotted {len(eval_snapshot)} params for "
+                        f"parallel outer_step (skipped {_skipped_embed} "
+                        f"embedding-class params; snapshot_full="
+                        f"{snapshot_full})"
+                    )
+
+            # P4 parallel dispatch. Captured outer_step_event +
+            # return values are consumed below the eval block at
+            # the legacy outer_step call site.
+            outer_step_event: torch.cuda.Event | None = None
+            parallel_grad_fp: dict | None = None
+            parallel_outer_timings: dict[str, float] | None = None
+            if outer_stream is not None:
+                # ``wait_stream``: ensure any in-flight default-stream
+                # ops (the snapshot clones we just dispatched, plus
+                # whatever gather-side post-processing left pending)
+                # complete on the secondary stream's view BEFORE
+                # outer_step's reads. Without this, outer_step could
+                # race against the snapshot clone for the same
+                # tensor's storage on rare GPUs that allow it.
+                if torch.cuda.is_available():
+                    outer_stream.wait_stream(
+                        torch.cuda.current_stream()
+                    )
+                outer_step_event = torch.cuda.Event(enable_timing=False)
+                with torch.cuda.stream(outer_stream):
+                    parallel_grad_fp, parallel_outer_timings = (
+                        hone.neurons.outer_step(
+                            self.model,
+                            self.outer_optimizer,
+                            gather_result=gather_result,
+                            transformer=self.transformer,
+                            compressor=self.compressor,
+                            xshapes=self.xshapes,
+                            totalks=self.totalks,
+                            device=cast(str, self.device),
+                            is_master=self.is_master,
+                            world_size=self.world_size,
+                            use_dct=self.hparams.use_dct,
+                            wandb_run=(
+                                self.wandb if self.is_master else None
+                            ),
+                            global_step=self.global_step,
+                            max_grad_norm=getattr(
+                                self.hparams,
+                                "outer_max_grad_norm",
+                                None,
+                            ),
+                            auto_clip_state=(
+                                self._outer_auto_clip_state
+                                if auto_on
+                                else None
+                            ),
+                            auto_clip_factor=float(
+                                getattr(
+                                    self.hparams,
+                                    "outer_grad_norm_auto_factor",
+                                    1.5,
+                                )
+                            ),
+                            auto_clip_ema_decay=float(
+                                getattr(
+                                    self.hparams,
+                                    "outer_grad_norm_ema_decay",
+                                    0.95,
+                                )
+                            ),
+                            # FU4: pass real ``peer_weights`` (built above
+                            # from gather metadata) instead of the legacy
+                            # ``None`` so token_weighted_aggregation now
+                            # composes with parallel_outer_step.
+                            peer_weights=peer_weights,
+                            rda_merge=bool(
+                                getattr(
+                                    self.hparams, "rda_merge", False
+                                )
+                            ),
+                            rda_composes_with_clip_norm=bool(
+                                getattr(
+                                    self.hparams,
+                                    "rda_composes_with_clip_norm",
+                                    False,
+                                )
+                            ),
+                            k_safety=int(
+                                getattr(
+                                    self.hparams,
+                                    "gather_safety_cap",
+                                    0,
+                                )
+                            ),
+                            stream=outer_stream,
+                        )
+                    )
+                outer_step_event.record(stream=outer_stream)
+
+            with _use_snapshot(self.model, eval_snapshot):
+                # 5. Save original model state for evaluation
+                eval_start = hone.T()
+                eval_window = self.current_window  # Store window at evaluation start
+
+                # 6. Select peers to evaluate using bin rotation (master selects and broadcasts)
+                if self.is_master:
+                    hone.log_with_context(
+                        level="info",
+                        message="Creating performance bins for peer evaluation",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+
+                    # Create performance bins
+                    performance_bins = self.bin_evaluation_peers(
+                        num_bins=self.hparams.num_evaluation_bins
+                    )
+
+                    # Select which bin to evaluate in this window
+                    current_bin = self.select_next_bin_for_evaluation(
+                        num_bins=self.hparams.num_evaluation_bins
+                    )
+
+                    # Select peers from the chosen bin using weighted sampling
+                    evaluation_uids = self.select_evaluation_uids_from_bin(
+                        performance_bins,
+                        current_bin,
+                    )
+
+                    hone.log_with_context(
+                        level="info",
+                        message=f"Evaluating peers from bin {current_bin}: {evaluation_uids}",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+
+                    # Calculate norms from gather result
+                    clip_norm_dict = {}
+                    if gather_result is not None:
+                        clip_norm_dict = self.compute_peer_val_norms(gather_result)
+                else:
+                    # Non-master ranks prepare empty structures
+                    evaluation_uids = []
+                    clip_norm_dict = {}
+
+                # Broadcast only evaluation UIDs from master to all ranks
+                # Prepare tensors for broadcasting
+                if self.is_master:
+                    # Convert evaluation UIDs to tensor (pad with -1 if needed)
+                    eval_uids_tensor = torch.tensor(
+                        evaluation_uids + [-1] * (256 - len(evaluation_uids)),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                else:
+                    eval_uids_tensor = torch.zeros(
+                        256, dtype=torch.int32, device=self.device
+                    )
+
+                # Broadcast from master to all ranks
+                dist_helper.broadcast(eval_uids_tensor, src=0)
+
+                # Reconstruct values on non-master ranks
+                if not self.is_master:
+                    evaluation_uids = [
+                        int(uid.item()) for uid in eval_uids_tensor if uid >= 0
+                    ]
+
+                # ── Help pyright: predeclare locals used in arithmetic/logging
+                loss_before_random: float
+                n_batches: int
+
+                # P5: collect the base_loss that was started concurrently
+                # with gather. If the task failed for any reason, fall back
+                # to a synchronous compute on the chain-bound seed so the
+                # per-peer eval pipeline still gets a valid ``L(base_model)``.
+                base_loss_fallback = True
+                if base_loss_task is not None:
+                    try:
+                        loss_before_random, n_batches = await base_loss_task
+                        base_loss_fallback = False
+                    except Exception as e:
+                        hone.log_with_context(
+                            level="warning",
+                            message=f"[P5] async base_loss task failed: {e}; recomputing synchronously",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+                if base_loss_fallback:
+                    self.sampler.set_window_uid(random_seed, self.sync_window)
+                    loss_before_random, n_batches = await self.evaluate_model(
+                        self.model, self.loader
+                    )
+                self.loss_before_per_batch_random = (
+                    loss_before_random / n_batches if n_batches > 0 else 0
                 )
 
-            # Per-UID evaluation details for dashboard reporting
-            uid_eval_details: dict[int, dict] = {}
+                # Track UIDs that were attempted to be evaluated this window
+                uids_attempted_this_window: set[int] = set()
 
-            # Process each UID with sliding window loading
-            for eval_uid in evaluation_uids:
-                uid_eval_start = time.time()
-                # Check if window has changed before starting evaluation
-                if self.current_window != eval_window:
+                # FU4: ``self._peer_c_tokens`` / ``self._peer_c_steps`` were
+                # already reset and populated from gather metadata BEFORE
+                # the (parallel or serial) outer_step dispatch. The
+                # eval-loop populate that used to live here was a duplicate
+                # — and the source of the parallel/token-weighted
+                # incompatibility — so it's been removed. ``log_digest_match``
+                # below remains; it logs but doesn't populate.
+
+                avg_loss_before_per_batch_own = 0.0
+                avg_loss_after_per_batch_own = 0.0
+                avg_loss_before_per_batch_random = 0.0
+                avg_loss_after_per_batch_random = 0.0
+                evaluated_peers = 0
+
+                # Synchronize all ranks before starting evaluation loop
+                dist_helper.safe_barrier("pre_eval_loop", self.local_rank)
+
+                # ── Help pyright in the UID loop
+                gradient_apply_time: float = 0.0
+                restore_time: float = 0.0
+                offload_time: float = 0.0
+                evaluation_time: float = 0.0
+                loss_before_own: float = 0.0
+                loss_after_own: float = 0.0
+                loss_after_random: float = 0.0
+                # P-1b telemetry: per-UID wall-clock for the eval loop, used
+                # downstream to compute p50/p95/max and surface slow peers on
+                # the /network dashboard. Collected on every rank so the list
+                # stays consistent with ``evaluated_peers``; only master reads
+                # the percentiles when calling ``report_window``.
+                uid_eval_times: list[float] = []
+                # P1: per-fragment upload byte counts surfaced by the streaming
+                # gather path. Empty when ``fragmented_uploads=false`` (legacy
+                # path returns ``[]``); the percentile block below tolerates
+                # that and emits ``None`` for both fields. Populated below from
+                # ``gather_result.fragment_byte_counts`` once gather completes.
+                fragment_byte_counts: list[int] = []
+                # Use CPU offloading instead of deepcopy to save memory
+                offload_start = hone.T()
+                save_ok_local = True
+                try:
+                    saved_state = self._save_model_state()
+                except Exception as e:
+                    save_ok_local = False
+                    hone.log_with_context(
+                        level="error",
+                        message=f"Model state save failed: {e}",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+                    saved_state = None
+                save_ok_global = dist_helper.all_ok(
+                    save_ok_local, self.device, tag="save_model_state"
+                )
+                if not save_ok_global:
+                    # keep all ranks aligned and skip this whole evaluation window
+                    dist_helper.safe_barrier("bail_after_save_fail", self.local_rank)
+                    evaluation_time = hone.T() - eval_start
+                    dist_helper.safe_barrier("post_eval", self.local_rank)
+                    continue
+                offload_time = hone.T() - offload_start
+
+                if self.is_master:
+                    hone.log_with_context(
+                        level="debug",
+                        message=f"Model state offloading took {offload_time:.3f}s",
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                    )
+
+                # Per-UID evaluation details for dashboard reporting
+                uid_eval_details: dict[int, dict] = {}
+
+                # ── P5b single-forward eval gate ─────────────────────────────
+                # Operator switch (default OFF): when ``eval_single_forward=true``
+                # each peer is scored by a single delta-loss forward on the
+                # chain-bound eval batch instead of the 4-forward own/random x
+                # before/after matrix. The 4-forward path stays intact as a
+                # fallback until the P5 Spearman soak test (>=0.85 correlation
+                # at 1.4B over 200 outer steps) certifies single-forward.
+                #
+                # Count-Sketch soft pre-filter (Weinberger & Dasgupta 2009)
+                # lives behind the same gate: per-peer O(d->b) fingerprint of
+                # the dense decompressed gradient, seeded with the same
+                # chain-bound ``random_seed`` so miners cannot predict which
+                # bucket their coords land in. The resulting cosine vs the
+                # mean sketch produces a soft weight ``max(min_w, cos)`` that
+                # multiplies the raw score — honest minority gradient
+                # directions still pass through at ``min_w`` (default 0.5).
+                use_single_forward = bool(
+                    getattr(self.hparams, "eval_single_forward", False)
+                )
+                sketch_buckets = int(
+                    getattr(self.hparams, "count_sketch_buckets", 1024)
+                )
+                sketch_min_weight = float(
+                    getattr(self.hparams, "count_sketch_min_weight", 0.5)
+                )
+
+                # Master-only sketch machinery. Non-master ranks never see
+                # the dense gradient (on_src=False) so they have nothing to
+                # sketch; scoring is already master-only downstream.
+                count_sketch = None
+                peer_sketches: dict[int, torch.Tensor] = {}
+                pending_raw_scores: dict[int, float] = {}
+                if use_single_forward and self.is_master:
+                    # ``d`` is the global flat gradient dim. ``p.numel()``
+                    # on DTensor returns the GLOBAL count (not the local
+                    # shard), so this is FSDP-safe.
+                    flat_dim = sum(p.numel() for p in self.model.parameters())
+                    if flat_dim > 0 and sketch_buckets > 0 and sketch_buckets <= flat_dim:
+                        try:
+                            count_sketch = hone.CountSketch(
+                                d=flat_dim,
+                                b=sketch_buckets,
+                                seed=int(random_seed) & 0xFFFF_FFFF,
+                                device="cpu",
+                            )
+                        except Exception as e:
+                            hone.log_with_context(
+                                level="error",
+                                message=(
+                                    f"[P5] CountSketch init failed (d={flat_dim}, "
+                                    f"b={sketch_buckets}): {e}. Falling back to "
+                                    f"unweighted single-forward eval."
+                                ),
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                            )
+                            count_sketch = None
+                    else:
+                        count_sketch = None
+
+                # Process each UID with sliding window loading
+                for eval_uid in evaluation_uids:
+                    uid_eval_start = time.time()
+                    # Check if window has changed before starting evaluation
+                    if self.current_window != eval_window:
+                        if self.is_master:
+                            hone.log_with_context(
+                                level="info",
+                                message=f"Window changed during evaluation (was {eval_window},"
+                                f" now {self.current_window}), exiting evaluation loop early."
+                                f" Evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs.",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                            )
+                        break
+
+                    # Mark this UID as attempted (for counter management)
+                    uids_attempted_this_window.add(eval_uid)
+                    self.peers_last_eval_window[eval_uid] = self.sync_window
+
                     if self.is_master:
                         hone.log_with_context(
                             level="info",
-                            message=f"Window changed during evaluation (was {eval_window},"
-                            f" now {self.current_window}), exiting evaluation loop early."
-                            f" Evaluated {len(uids_attempted_this_window)}/{len(evaluation_uids)} UIDs.",
+                            message=f"Evaluating UID: {eval_uid}",
                             sync_window=self.sync_window,
                             current_window=self.current_window,
-                        )
-                    break
-
-                # Mark this UID as attempted (for counter management)
-                uids_attempted_this_window.add(eval_uid)
-                self.peers_last_eval_window[eval_uid] = self.sync_window
-
-                if self.is_master:
-                    hone.log_with_context(
-                        level="info",
-                        message=f"Evaluating UID: {eval_uid}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                # Only master fetches gradient data for evaluation
-                eval_result = {}, 0
-                state_dict = {}
-                gradient_valid = True  # Track if gradient is valid
-
-                if self.is_master:
-                    try:
-                        eval_result = await self._fetch_peer_gradient(
                             eval_uid=eval_uid,
-                            window=self.sync_window,
-                            time_min=time_min,
-                            time_max=time_max,
                         )
-                    except Exception as e:
-                        # Transient infrastructure error (network/IO/deser) - don't slash
-                        hone.logger.warning(
-                            f"[validator] fetch gradient failed for {eval_uid}: {e} — marking invalid"
-                        )
-                        gradient_valid = False
-                    else:
-                        if (
-                            not eval_result.success
-                            or not isinstance(eval_result.data, dict)
-                            or eval_result.data.get("__status")
-                            in ["TOO_LATE", "TOO_EARLY"]
-                        ):
-                            # Slash the peer for missing gradient
-                            self.slash_for_missing_gradient(eval_uid)
-                            gradient_valid = False
 
+                    # Only master fetches gradient data for evaluation
+                    eval_result = {}, 0
+                    state_dict = {}
+                    gradient_valid = True  # Track if gradient is valid
+
+                    if self.is_master:
+                        try:
+                            eval_result = await self._fetch_peer_gradient(
+                                eval_uid=eval_uid,
+                                window=self.sync_window,
+                                time_min=time_min,
+                                time_max=time_max,
+                            )
+                        except Exception as e:
+                            # Transient infrastructure error (network/IO/deser) - don't slash
+                            hone.logger.warning(
+                                f"[validator] fetch gradient failed for {eval_uid}: {e} — marking invalid"
+                            )
+                            gradient_valid = False
                         else:
-                            state_dict = eval_result.data
-                            try:
-                                self.validate_gradient_data(
-                                    self.model, eval_uid, state_dict
-                                )
-                                meta = state_dict.get("metadata", {})
-                                self.log_digest_match(eval_uid, meta)
-                                _, total_samples = self._training_pool_digest(
-                                    eval_uid, self.sync_window
-                                )
-                                total_batches = (
-                                    total_samples // self.hparams.micro_batch_size
-                                )
-                                gradient_valid = True
-                            except Exception as e:
-                                self.slash_for_invalid_gradient(eval_uid, e)
+                            if (
+                                not eval_result.success
+                                or not isinstance(eval_result.data, dict)
+                                or eval_result.data.get("__status")
+                                in ["TOO_LATE", "TOO_EARLY"]
+                            ):
+                                # Slash the peer for missing gradient
+                                self.slash_for_missing_gradient(eval_uid)
                                 gradient_valid = False
 
-                # Broadcast gradient validity to all ranks
-                gradient_valid_tensor = torch.tensor(
-                    [bool(gradient_valid)], dtype=torch.bool, device=self.device
-                )
-                dist_helper.broadcast(gradient_valid_tensor, src=0)
-                gradient_valid = bool(gradient_valid_tensor.item())
+                            else:
+                                state_dict = eval_result.data
+                                try:
+                                    self.validate_gradient_data(
+                                        self.model, eval_uid, state_dict
+                                    )
+                                    # FU4: ``self._peer_c_tokens`` /
+                                    # ``self._peer_c_steps`` are now
+                                    # populated from gather metadata
+                                    # BEFORE outer_step dispatch (see the
+                                    # FU4 block above the parallel
+                                    # snapshot). The eval-time clamp +
+                                    # populate that used to live here was
+                                    # the source of the
+                                    # parallel_outer_step + token-weighted
+                                    # incompatibility — both flags can
+                                    # now coexist. ``log_digest_match``
+                                    # stays: it's a digest-mirror
+                                    # diagnostic that does NOT populate
+                                    # the per-UID counters.
+                                    meta = state_dict.get("metadata", {})
+                                    self.log_digest_match(eval_uid, meta)
+                                    _, total_samples = self._training_pool_digest(
+                                        eval_uid, self.sync_window
+                                    )
+                                    total_batches = (
+                                        total_samples // self.hparams.micro_batch_size
+                                    )
+                                    gradient_valid = True
+                                except Exception as e:
+                                    self.slash_for_invalid_gradient(eval_uid, e)
+                                    gradient_valid = False
 
-                # All ranks skip if gradient is invalid
-                if not gradient_valid:
+                    # Broadcast gradient validity to all ranks
+                    gradient_valid_tensor = torch.tensor(
+                        [bool(gradient_valid)], dtype=torch.bool, device=self.device
+                    )
+                    dist_helper.broadcast(gradient_valid_tensor, src=0)
+                    gradient_valid = bool(gradient_valid_tensor.item())
+
+                    # All ranks skip if gradient is invalid
+                    if not gradient_valid:
+                        if self.is_master:
+                            uid_eval_details[eval_uid] = {
+                                "evalStatus": "invalid",
+                                "evalSkipReason": "gradient fetch failed or invalid",
+                            }
+                        continue
+
+                    # Synchronize all ranks after gradient validation
+                    dist_helper.safe_barrier("post_grad_validate", self.local_rank)
+
+                    # ─────────────────────────────────────────────────────────
+                    # P5b single-forward delta-loss path (gated by
+                    # ``eval_single_forward``). When off, fall through to the
+                    # legacy 4-forward implementation below.
+                    #
+                    # Score math:
+                    #     s(uid) = (L(base) − L(base + α·g_peer)) / L(base)
+                    # with ``L(base) == loss_before_random`` (already computed
+                    # once this window on the chain-bound eval batch) and
+                    # ``α == self.lr * eval_lr_factor`` to match the exact
+                    # scaling ``update_model_with_gradient`` uses. The revert
+                    # uses the cached dense ``grad_cache`` so the apply + revert
+                    # pair is numerically exact (no ``_save_model_state`` copy).
+                    # Count-Sketch fingerprint is accumulated inside the apply
+                    # via ``on_decompressed``; the soft weight (``max(min_w,
+                    # cos(peer, avg))``) is applied to ``gradient_scores``
+                    # AFTER the per-UID loop, once we have the window mean.
+                    # ─────────────────────────────────────────────────────────
+                    if use_single_forward:
+                        grad_cache: dict[str, torch.Tensor] = {}
+                        sketch_offset = [0]
+                        sketch_buf: torch.Tensor | None = None
+                        if self.is_master and count_sketch is not None:
+                            sketch_buf = torch.zeros(
+                                count_sketch.b, dtype=torch.float32, device="cpu"
+                            )
+
+                        def _sketch_hook(
+                            _cname: str, dense_grad: torch.Tensor
+                        ) -> None:
+                            # Master-only accumulator keyed by the global offset
+                            # in flat-param order (must match the iteration
+                            # order of ``model.named_parameters()``, which
+                            # ``update_model_with_gradient`` already walks).
+                            if sketch_buf is None or count_sketch is None:
+                                return
+                            try:
+                                flat = (
+                                    dense_grad.detach()
+                                    .flatten()
+                                    .to("cpu", dtype=torch.float32, non_blocking=False)
+                                )
+                                d_i = flat.numel()
+                                off = sketch_offset[0]
+                                if off + d_i > count_sketch.d:
+                                    # Defensive: model shape changed mid-run
+                                    # (should not happen); skip sketch.
+                                    return
+                                idx_slice = count_sketch.idx[off : off + d_i]
+                                sign_slice = count_sketch.sign[
+                                    off : off + d_i
+                                ].to(torch.float32)
+                                sketch_buf.scatter_add_(
+                                    0, idx_slice, flat * sign_slice
+                                )
+                                sketch_offset[0] = off + d_i
+                            except Exception as hook_err:  # pragma: no cover
+                                hone.log_with_context(
+                                    level="warning",
+                                    message=f"[P5] sketch hook failed for {_cname}: {hook_err}",
+                                    sync_window=self.sync_window,
+                                    current_window=self.current_window,
+                                    eval_uid=eval_uid,
+                                )
+
+                        apply_ok_local = True
+                        try:
+                            gradient_apply_start = hone.T()
+                            self.update_model_with_gradient(
+                                self.model,
+                                eval_uid,
+                                state_dict,
+                                clip_norm_dict,
+                                direction=-1,
+                                grad_cache=grad_cache,
+                                on_decompressed=_sketch_hook,
+                            )
+                            gradient_apply_time = hone.T() - gradient_apply_start
+                        except Exception as e:
+                            apply_ok_local = False
+                            if self.is_master:
+                                self.slash_for_invalid_gradient(eval_uid, e)
+
+                        apply_ok_global = dist_helper.all_ok(
+                            apply_ok_local,
+                            self.device,
+                            tag=f"sf_apply_grad_uid_{eval_uid}",
+                        )
+                        if not apply_ok_global:
+                            # A partial apply may already have mutated some
+                            # params; restore from saved_state is the safe
+                            # best-effort revert here (grad_cache may be
+                            # incomplete).
+                            self._restore_model_state(saved_state)
+                            dist_helper.safe_barrier(
+                                tag=f"sf_skip_uid_{eval_uid}",
+                                local_rank=self.local_rank,
+                            )
+                            if self.is_master:
+                                uid_eval_details[eval_uid] = {
+                                    "evalStatus": "invalid",
+                                    "evalSkipReason": "gradient application failed (single-forward)",
+                                }
+                            dist_helper.safe_barrier(
+                                "end_eval_iter", self.local_rank
+                            )
+                            continue
+
+                        dist_helper.safe_barrier(
+                            "sf_post_apply_grad_uid", self.local_rank
+                        )
+
+                        # Step 2: single forward on the chain-bound eval batch
+                        self.sampler.set_window_uid(
+                            random_seed, self.sync_window
+                        )
+                        eval_ok_local = True
+                        try:
+                            loss_after_random, n_batches = (
+                                await self.evaluate_model(
+                                    self.model, self.loader
+                                )
+                            )
+                        except Exception as e:
+                            eval_ok_local = False
+                            hone.log_with_context(
+                                level="error",
+                                message=f"evaluate_model (single-forward) failed for UID {eval_uid}: {e}",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+                        eval_ok_global = dist_helper.all_ok(
+                            eval_ok_local,
+                            self.device,
+                            tag=f"sf_eval_uid_{eval_uid}",
+                        )
+                        if not eval_ok_global:
+                            # Revert best-effort via cache; fall back to
+                            # restore on failure.
+                            try:
+                                self.update_model_with_gradient(
+                                    self.model,
+                                    eval_uid,
+                                    state_dict,
+                                    clip_norm_dict,
+                                    direction=+1,
+                                    grad_cache=grad_cache,
+                                )
+                            except Exception:
+                                self._restore_model_state(saved_state)
+                            del grad_cache
+                            torch.cuda.empty_cache()
+                            dist_helper.safe_barrier(
+                                tag=f"sf_skip_uid_eval_{eval_uid}",
+                                local_rank=self.local_rank,
+                            )
+                            if self.is_master:
+                                uid_eval_details[eval_uid] = {
+                                    "evalStatus": "skipped",
+                                    "evalSkipReason": "eval model failed (single-forward)",
+                                }
+                            dist_helper.safe_barrier(
+                                "end_eval_iter", self.local_rank
+                            )
+                            continue
+
+                        # Step 3: revert peer gradient using the SAME cached
+                        # decompressed tensors (numerically exact; see
+                        # ``update_model_with_gradient`` grad_cache docs).
+                        try:
+                            self.update_model_with_gradient(
+                                self.model,
+                                eval_uid,
+                                state_dict,
+                                clip_norm_dict,
+                                direction=+1,
+                                grad_cache=grad_cache,
+                            )
+                        except Exception as e:
+                            hone.log_with_context(
+                                level="error",
+                                message=f"[P5] revert failed for UID {eval_uid}: {e}; falling back to restore",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+                            self._restore_model_state(saved_state)
+
+                        del grad_cache
+                        torch.cuda.empty_cache()
+
+                        # Step 4: scoring (raw; sketch weight applied
+                        # post-loop once the window mean sketch is known).
+                        self.loss_after_per_batch_random = (
+                            loss_after_random / n_batches if n_batches > 0 else 0
+                        )
+                        avg_loss_before_per_batch_random += (
+                            self.loss_before_per_batch_random
+                        )
+                        avg_loss_after_per_batch_random += (
+                            self.loss_after_per_batch_random
+                        )
+
+                        raw_score = (
+                            (loss_before_random - loss_after_random)
+                            / loss_before_random
+                            if loss_before_random > 0
+                            else 0.0
+                        )
+
+                        if self.is_master:
+                            # Persist the raw score on-object so downstream
+                            # consumers (OpenSkill, weight computation) see
+                            # a value even before the sketch weight lands.
+                            # ``pending_raw_scores`` is the source of truth
+                            # for the post-loop reweight.
+                            pending_raw_scores[eval_uid] = float(raw_score)
+                            self.gradient_scores[eval_uid] = raw_score
+
+                            if (
+                                sketch_buf is not None
+                                and sketch_offset[0] > 0
+                            ):
+                                peer_sketches[eval_uid] = sketch_buf
+
+                            # Single-forward has no own-data signal; fall
+                            # back to the sign of the raw score as the
+                            # binary indicator.
+                            self.binary_indicator_scores[eval_uid] = (
+                                1 if raw_score > 0 else -1
+                            )
+
+                            self.loss_improvement_random = (
+                                self.loss_before_per_batch_random
+                                - self.loss_after_per_batch_random
+                            )
+                            self.relative_improvement_random = (
+                                self.loss_improvement_random
+                                / self.loss_before_per_batch_random
+                                if self.loss_before_per_batch_random > 0
+                                else 0.0
+                            )
+
+                            hone.log_with_context(
+                                level="info",
+                                message=(
+                                    f"[P5] single-forward UID {eval_uid}: "
+                                    f"L_base={self.loss_before_per_batch_random:.4f} "
+                                    f"L_after={self.loss_after_per_batch_random:.4f} "
+                                    f"raw_score={raw_score:.4f} "
+                                    f"apply={gradient_apply_time:.3f}s"
+                                ),
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+
+                            self.track_negative_evaluation(eval_uid)
+
+                            uid_eval_details[eval_uid] = {
+                                "evalStatus": "evaluated",
+                                "lossOwnBefore": 0.0,
+                                "lossOwnAfter": 0.0,
+                                "lossRandomBefore": float(
+                                    self.loss_before_per_batch_random
+                                ),
+                                "lossRandomAfter": float(
+                                    self.loss_after_per_batch_random
+                                ),
+                                "improvementOwn": 0.0,
+                                "improvementRandom": float(
+                                    self.relative_improvement_random
+                                ),
+                                "evalMode": "single_forward",
+                            }
+
+                            if eval_uid not in self.openskill_ratings:
+                                self.openskill_ratings[eval_uid] = (
+                                    self.openskill_model.rating(name=str(eval_uid))
+                                )
+
+                            if not hasattr(self, "current_window_scores"):
+                                self.current_window_scores = {}
+                            self.current_window_scores[eval_uid] = (
+                                self.gradient_scores[eval_uid].item()
+                            )
+
+                            self.binary_moving_averages[eval_uid] = (
+                                (1 - self.hparams.binary_score_ma_alpha)
+                                * self.binary_moving_averages[eval_uid]
+                                + self.hparams.binary_score_ma_alpha
+                                * self.binary_indicator_scores[eval_uid]
+                            )
+
+                            sync_result = await self.evaluate_miner_sync(
+                                eval_uid
+                            )
+                            sync_score = cast(
+                                float,
+                                sync_result.get("sync_score", 0.0),
+                            )
+                            self.log_sync_score(eval_uid, sync_result)
+                            self.sync_scores[eval_uid] = sync_score
+
+                        self.evaluated_uids.add(eval_uid)
+                        evaluated_peers += 1
+                        uid_eval_time = time.time() - uid_eval_start
+                        uid_eval_times.append(uid_eval_time)
+                        if self.is_master:
+                            hone.log_with_context(
+                                level="info",
+                                message=(
+                                    f"{hone.P(self.sync_window, hone.T() - eval_start)} "
+                                    f"Completed evaluation (single-forward) | "
+                                    f"UID eval time: {uid_eval_time:.3f}s"
+                                ),
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+
+                        dist_helper.safe_barrier(
+                            "end_eval_iter", self.local_rank
+                        )
+                        continue
+
+                    # ─────────────────────────────────────────────────────────
+                    # Legacy 4-forward path (default until P5 soak gate passes)
+                    # ─────────────────────────────────────────────────────────
+
+                    # Loss before own data
+                    eval_ok_local = True
+                    try:
+                        self.sampler.set_window_uid(eval_uid, self.sync_window)
+                        loss_before_own, n_batches = await self.evaluate_model(
+                            self.model, self.loader
+                        )
+                    except Exception as e:
+                        eval_ok_local = False
+                        hone.log_with_context(
+                            level="error",
+                            message=f"evaluate_model (own/before) failed for UID {eval_uid}: {e}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+                    eval_ok_global = dist_helper.all_ok(
+                        eval_ok_local, self.device, tag=f"own_before_uid_{eval_uid}"
+                    )
+                    if not eval_ok_global:
+                        # Align and skip this UID
+                        dist_helper.safe_barrier(
+                            tag=f"skip_uid_own_before_{eval_uid}",
+                            local_rank=self.local_rank,
+                        )
+                        if self.is_master:
+                            uid_eval_details[eval_uid] = {
+                                "evalStatus": "skipped",
+                                "evalSkipReason": "eval model failed (own/before)",
+                            }
+                        continue
+                    # (if ok, loss_before_own/n_batches exist)
+
+                    # evaluate_model now handles averaging across ranks
+                    self.loss_before_per_batch_own = (
+                        loss_before_own / n_batches if n_batches > 0 else 0
+                    )
                     if self.is_master:
-                        uid_eval_details[eval_uid] = {
-                            "evalStatus": "invalid",
-                            "evalSkipReason": "gradient fetch failed or invalid",
-                        }
-                    continue
+                        hone.log_with_context(
+                            level="info",
+                            message=f"Evaluating {n_batches}/{total_batches} batches ({n_batches / total_batches:.1%})",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
 
-                # Synchronize all ranks after gradient validation
-                dist_helper.safe_barrier("post_grad_validate", self.local_rank)
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Loss before (own data): {self.loss_before_per_batch_own}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
 
-                # Loss before own data
-                eval_ok_local = True
-                try:
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Loss before (random data): {self.loss_before_per_batch_random}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                    # 9. Apply gradient and compute loss after
+                    apply_ok_local = True
+                    try:
+                        gradient_apply_start = hone.T()
+                        self.update_model_with_gradient(
+                            self.model,
+                            eval_uid,
+                            state_dict,
+                            clip_norm_dict,
+                        )
+                        gradient_apply_time = hone.T() - gradient_apply_start
+                        if self.is_master:
+                            hone.log_with_context(
+                                level="debug",
+                                message=f"Gradient application took {gradient_apply_time:.3f}s",
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+                    except Exception as e:
+                        apply_ok_local = False
+                        if self.is_master:
+                            self.slash_for_invalid_gradient(eval_uid, e)
+
+                    # Reach group consensus before any barrier
+                    apply_ok_global = dist_helper.all_ok(
+                        apply_ok_local, self.device, tag=f"apply_grad_uid_{eval_uid}"
+                    )
+                    if not apply_ok_global:
+                        # Restore and skip in lockstep
+                        self._restore_model_state(saved_state)
+                        dist_helper.safe_barrier(
+                            tag=f"skip_uid_{eval_uid}", local_rank=self.local_rank
+                        )
+                        if self.is_master:
+                            uid_eval_details[eval_uid] = {
+                                "evalStatus": "invalid",
+                                "evalSkipReason": "gradient application failed",
+                            }
+                        continue
+
+                    # Synchronize all ranks after gradient application
+                    dist_helper.safe_barrier("post_apply_grad_uid", self.local_rank)
+
+                    # 10. Compute loss after gradient application on own data
+                    self.outer_optimizer.zero_grad()
+                    self.model.zero_grad()
                     self.sampler.set_window_uid(eval_uid, self.sync_window)
-                    loss_before_own, n_batches = await self.evaluate_model(
-                        self.model, self.loader
+                    eval_ok_local = True
+                    try:
+                        loss_after_own, n_batches = await self.evaluate_model(
+                            self.model, self.loader
+                        )
+                    except Exception as e:
+                        eval_ok_local = False
+                        hone.log_with_context(
+                            level="error",
+                            message=f"evaluate_model (own/after) failed for UID {eval_uid}: {e}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+                    eval_ok_global = dist_helper.all_ok(
+                        eval_ok_local, self.device, tag=f"own_after_uid_{eval_uid}"
                     )
-                except Exception as e:
-                    eval_ok_local = False
-                    hone.log_with_context(
-                        level="error",
-                        message=f"evaluate_model (own/before) failed for UID {eval_uid}: {e}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-                eval_ok_global = dist_helper.all_ok(
-                    eval_ok_local, self.device, tag=f"own_before_uid_{eval_uid}"
-                )
-                if not eval_ok_global:
-                    # Align and skip this UID
-                    dist_helper.safe_barrier(
-                        tag=f"skip_uid_own_before_{eval_uid}",
-                        local_rank=self.local_rank,
-                    )
-                    if self.is_master:
-                        uid_eval_details[eval_uid] = {
-                            "evalStatus": "skipped",
-                            "evalSkipReason": "eval model failed (own/before)",
-                        }
-                    continue
-                # (if ok, loss_before_own/n_batches exist)
+                    if not eval_ok_global:
+                        # We already applied the peer's gradient; restore before skipping.
+                        self._restore_model_state(saved_state)
+                        dist_helper.safe_barrier(
+                            tag=f"skip_uid_own_after_{eval_uid}", local_rank=self.local_rank
+                        )
+                        if self.is_master:
+                            uid_eval_details[eval_uid] = {
+                                "evalStatus": "skipped",
+                                "evalSkipReason": "eval model failed (own/after)",
+                            }
+                        continue
 
-                # evaluate_model now handles averaging across ranks
-                self.loss_before_per_batch_own = (
-                    loss_before_own / n_batches if n_batches > 0 else 0
-                )
-                if self.is_master:
-                    hone.log_with_context(
-                        level="info",
-                        message=f"Evaluating {n_batches}/{total_batches} batches ({n_batches / total_batches:.1%})",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
+                    # evaluate_model now handles averaging across ranks
+                    # Clean up stored batches
+                    torch.cuda.empty_cache()
 
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Loss before (own data): {self.loss_before_per_batch_own}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
+                    self.loss_after_per_batch_own = (
+                        loss_after_own / n_batches if n_batches > 0 else 0
                     )
-
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Loss before (random data): {self.loss_before_per_batch_random}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                # 9. Apply gradient and compute loss after
-                apply_ok_local = True
-                try:
-                    gradient_apply_start = hone.T()
-                    self.update_model_with_gradient(
-                        self.model,
-                        eval_uid,
-                        state_dict,
-                        clip_norm_dict,
-                    )
-                    gradient_apply_time = hone.T() - gradient_apply_start
+                    avg_loss_before_per_batch_own += self.loss_before_per_batch_own
+                    avg_loss_after_per_batch_own += self.loss_after_per_batch_own
                     if self.is_master:
                         hone.log_with_context(
                             level="debug",
-                            message=f"Gradient application took {gradient_apply_time:.3f}s",
+                            message=f"Loss after (own data): {self.loss_after_per_batch_own}",
                             sync_window=self.sync_window,
                             current_window=self.current_window,
                             eval_uid=eval_uid,
                         )
-                except Exception as e:
-                    apply_ok_local = False
-                    if self.is_master:
-                        self.slash_for_invalid_gradient(eval_uid, e)
 
-                # Reach group consensus before any barrier
-                apply_ok_global = dist_helper.all_ok(
-                    apply_ok_local, self.device, tag=f"apply_grad_uid_{eval_uid}"
-                )
-                if not apply_ok_global:
-                    # Restore and skip in lockstep
+                    # 11. Calculate improvements and update scores
+                    # Compute and assign the loss improvement to self
+                    self.loss_improvement_own = (
+                        self.loss_before_per_batch_own - self.loss_after_per_batch_own
+                    )
+                    if self.is_master:
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Loss improvement (own data): {self.loss_improvement_own}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                    self.relative_improvement_own = (
+                        self.loss_improvement_own / self.loss_before_per_batch_own
+                        if self.loss_before_per_batch_own > 0
+                        else 0.0
+                    )
+                    if self.is_master:
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Relative improvement (own data): {self.relative_improvement_own:.4f}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                    # 10. Compute loss after gradient application for random data
+                    self.outer_optimizer.zero_grad()
+                    self.model.zero_grad()
+
+                    self.sampler.set_window_uid(random_seed, self.sync_window)
+                    eval_ok_local = True
+                    try:
+                        loss_after_random, n_batches = await self.evaluate_model(
+                            self.model,
+                            self.loader,
+                        )
+                    except Exception as e:
+                        eval_ok_local = False
+                        hone.log_with_context(
+                            level="error",
+                            message=f"evaluate_model (random/after) failed for UID {eval_uid}: {e}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+                    eval_ok_global = dist_helper.all_ok(
+                        eval_ok_local, self.device, tag=f"random_after_uid_{eval_uid}"
+                    )
+                    if not eval_ok_global:
+                        self._restore_model_state(saved_state)
+                        dist_helper.safe_barrier(
+                            tag=f"skip_uid_random_after_{eval_uid}",
+                            local_rank=self.local_rank,
+                        )
+                        if self.is_master:
+                            uid_eval_details[eval_uid] = {
+                                "evalStatus": "skipped",
+                                "evalSkipReason": "eval model failed (random/after)",
+                            }
+                        continue
+                    # evaluate_model now handles averaging across ranks
+
+                    # Restore original model parameters from CPU
+                    restore_start: float = hone.T()
                     self._restore_model_state(saved_state)
-                    dist_helper.safe_barrier(
-                        tag=f"skip_uid_{eval_uid}", local_rank=self.local_rank
+                    restore_time = hone.T() - restore_start
+                    # restore_time is now always a float, never Unbound
+
+                    if self.is_master:
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Model state restoration took {restore_time:.3f}s",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                    # Clean up saved state
+                    torch.cuda.empty_cache()
+
+                    self.loss_after_per_batch_random = (
+                        loss_after_random / n_batches if n_batches > 0 else 0
+                    )
+
+                    avg_loss_before_per_batch_random += self.loss_before_per_batch_random
+                    avg_loss_after_per_batch_random += self.loss_after_per_batch_random
+
+                    if self.is_master:
+                        hone.log_with_context(
+                            level="info",
+                            message=f"Loss after (random data): {self.loss_after_per_batch_random}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                    # 11. Calculate improvements and update scores
+                    # Compute and assign the loss improvement to self
+                    self.loss_improvement_random = (
+                        self.loss_before_per_batch_random - self.loss_after_per_batch_random
                     )
                     if self.is_master:
-                        uid_eval_details[eval_uid] = {
-                            "evalStatus": "invalid",
-                            "evalSkipReason": "gradient application failed",
-                        }
-                    continue
+                        hone.log_with_context(
+                            level="info",
+                            message=f"Loss improvement (random data): {self.loss_improvement_random}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
 
-                # Synchronize all ranks after gradient application
-                dist_helper.safe_barrier("post_apply_grad_uid", self.local_rank)
-
-                # 10. Compute loss after gradient application on own data
-                self.outer_optimizer.zero_grad()
-                self.model.zero_grad()
-                self.sampler.set_window_uid(eval_uid, self.sync_window)
-                eval_ok_local = True
-                try:
-                    loss_after_own, n_batches = await self.evaluate_model(
-                        self.model, self.loader
-                    )
-                except Exception as e:
-                    eval_ok_local = False
-                    hone.log_with_context(
-                        level="error",
-                        message=f"evaluate_model (own/after) failed for UID {eval_uid}: {e}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-                eval_ok_global = dist_helper.all_ok(
-                    eval_ok_local, self.device, tag=f"own_after_uid_{eval_uid}"
-                )
-                if not eval_ok_global:
-                    # We already applied the peer's gradient; restore before skipping.
-                    self._restore_model_state(saved_state)
-                    dist_helper.safe_barrier(
-                        tag=f"skip_uid_own_after_{eval_uid}", local_rank=self.local_rank
+                    self.relative_improvement_random = (
+                        self.loss_improvement_random / self.loss_before_per_batch_random
+                        if self.loss_before_per_batch_random > 0
+                        else 0.0
                     )
                     if self.is_master:
-                        uid_eval_details[eval_uid] = {
-                            "evalStatus": "skipped",
-                            "evalSkipReason": "eval model failed (own/after)",
-                        }
-                    continue
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Relative improvement (random data): {self.relative_improvement_random}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
 
-                # evaluate_model now handles averaging across ranks
-                # Clean up stored batches
+                    # Calculate original performance score (gradient quality)
+                    self.gradient_scores[eval_uid] = (
+                        loss_before_random - loss_after_random
+                    ) / loss_before_random
+
+                    if self.is_master:
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Gradient Score: {self.gradient_scores[eval_uid]}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                        # Track negative evaluation history
+                        self.track_negative_evaluation(eval_uid)
+
+                    # Initialize or update OpenSkill rating for this peer
+                    if eval_uid not in self.openskill_ratings and self.is_master:
+                        self.openskill_ratings[eval_uid] = self.openskill_model.rating(
+                            name=str(eval_uid)
+                        )
+
+                    # Record the gradient score for later OpenSkill updates
+                    if not hasattr(self, "current_window_scores"):
+                        self.current_window_scores = {}
+                    self.current_window_scores[eval_uid] = self.gradient_scores[
+                        eval_uid
+                    ].item()
+
+                    # Calculate binary indicator for overfitting detection
+                    improvement_own = (
+                        (loss_before_own - loss_after_own) / loss_before_own
+                        if loss_before_own > 0
+                        else 0
+                    )
+                    improvement_random = (
+                        (loss_before_random - loss_after_random) / loss_before_random
+                        if loss_before_random > 0
+                        else 0
+                    )
+                    if self.is_master:
+                        self.binary_indicator_scores[eval_uid] = (
+                            1 if improvement_own > improvement_random else -1
+                        )
+                        hone.log_with_context(
+                            level="info",
+                            message=f"Binary Indicator Score: {self.binary_indicator_scores[eval_uid]}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                        uid_eval_details[eval_uid] = {
+                            "evalStatus": "evaluated",
+                            "lossOwnBefore": float(self.loss_before_per_batch_own),
+                            "lossOwnAfter": float(self.loss_after_per_batch_own),
+                            "lossRandomBefore": float(self.loss_before_per_batch_random),
+                            "lossRandomAfter": float(self.loss_after_per_batch_random),
+                            "improvementOwn": float(improvement_own),
+                            "improvementRandom": float(improvement_random),
+                        }
+
+                        # Update binary moving average using exponential moving average formula:
+                        # new_avg = (1-alpha) * old_avg + alpha * new_value
+                        # where alpha is binary_score_ma_alpha hyperparameter
+                        self.binary_moving_averages[eval_uid] = (
+                            (1 - self.hparams.binary_score_ma_alpha)
+                            * self.binary_moving_averages[eval_uid]
+                            + self.hparams.binary_score_ma_alpha
+                            * self.binary_indicator_scores[eval_uid]
+                        )
+                        hone.log_with_context(
+                            level="debug",
+                            message=f"Binary Moving Average Score: {self.binary_moving_averages[eval_uid]}",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                        sync_result = await self.evaluate_miner_sync(eval_uid)
+                        sync_score = cast(
+                            float,
+                            sync_result.get("sync_score", 0.0),
+                        )
+                        self.log_sync_score(eval_uid, sync_result)
+
+                        # Store the sync score for this miner
+                        self.sync_scores[eval_uid] = sync_score
+
+                    self.evaluated_uids.add(eval_uid)
+
+                    evaluated_peers += 1
+                    uid_eval_time = time.time() - uid_eval_start
+                    uid_eval_times.append(uid_eval_time)
+                    if self.is_master:
+                        hone.log_with_context(
+                            level="info",
+                            message=f"{hone.P(self.sync_window, hone.T() - eval_start)} "
+                            f"Completed evaluation | UID eval time: {uid_eval_time:.3f}s",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                            eval_uid=eval_uid,
+                        )
+
+                    # Synchronize all ranks at the end of each evaluation iteration
+                    dist_helper.safe_barrier("end_eval_iter", self.local_rank)
+
+                del saved_state
                 torch.cuda.empty_cache()
+                self.sampler._cached_indices.clear()
 
-                self.loss_after_per_batch_own = (
-                    loss_after_own / n_batches if n_batches > 0 else 0
-                )
-                avg_loss_before_per_batch_own += self.loss_before_per_batch_own
-                avg_loss_after_per_batch_own += self.loss_after_per_batch_own
+                # ── P5b Count-Sketch soft re-weighting ───────────────────────
+                # Runs on master only: compute the mean peer sketch for this
+                # window, score each peer by cosine similarity to the mean,
+                # and multiply their raw delta-loss score by
+                # ``max(min_weight, cos)``. A peer whose sketch aligns with
+                # the consensus direction keeps their score (~1.0x). A peer
+                # with an adversarial / sign-flipped gradient gets clipped to
+                # ``min_weight`` (default 0.5) -- visibly down-weighted but
+                # not rejected, preserving honest minority-direction peers
+                # per the incentive critic's requirement.
+                if (
+                    use_single_forward
+                    and self.is_master
+                    and count_sketch is not None
+                    and len(peer_sketches) > 0
+                ):
+                    try:
+                        stacked = torch.stack(
+                            list(peer_sketches.values()), dim=0
+                        )
+                        avg_sketch = stacked.mean(dim=0)
+                        weight_log: list[tuple[int, float, float]] = []
+                        for uid, sk in peer_sketches.items():
+                            cos_t = torch.nn.functional.cosine_similarity(
+                                sk.flatten().unsqueeze(0),
+                                avg_sketch.flatten().unsqueeze(0),
+                                dim=1,
+                            )
+                            cos_val = float(cos_t.item())
+                            weight = hone.soft_weight_from_cosine(
+                                cos_val, min_weight=sketch_min_weight
+                            )
+                            raw = pending_raw_scores.get(uid, 0.0)
+                            weighted = raw * weight
+                            self.gradient_scores[uid] = weighted
+                            if hasattr(self, "current_window_scores"):
+                                self.current_window_scores[uid] = weighted
+                            weight_log.append((uid, cos_val, weight))
+                        weight_summary = ", ".join(
+                            f"uid={u} cos={c:.3f} w={w:.3f}"
+                            for u, c, w in weight_log
+                        )
+                        hone.log_with_context(
+                            level="info",
+                            message=(
+                                f"[P5] Count-Sketch re-weight applied to "
+                                f"{len(weight_log)} peer(s): {weight_summary}"
+                            ),
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+                    except Exception as e:  # pragma: no cover
+                        hone.log_with_context(
+                            level="error",
+                            message=f"[P5] Count-Sketch re-weight failed: {e}; raw scores retained",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
+
+                # Update eval_peers counters based on actual evaluation attempts
+                # Reset counters for UIDs that were attempted (whether successful or not)
                 if self.is_master:
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Loss after (own data): {self.loss_after_per_batch_own}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
+                    for uid in uids_attempted_this_window:
+                        self.eval_peers[uid] = 1
 
-                # 11. Calculate improvements and update scores
-                # Compute and assign the loss improvement to self
-                self.loss_improvement_own = (
-                    self.loss_before_per_batch_own - self.loss_after_per_batch_own
-                )
-                if self.is_master:
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Loss improvement (own data): {self.loss_improvement_own}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
+                    # Increment counters for peers that weren't attempted due to window change
+                    for uid in self.eval_peers.keys():
+                        if uid not in uids_attempted_this_window:
+                            self.eval_peers[uid] += 1
 
-                self.relative_improvement_own = (
-                    self.loss_improvement_own / self.loss_before_per_batch_own
-                    if self.loss_before_per_batch_own > 0
-                    else 0.0
-                )
-                if self.is_master:
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Relative improvement (own data): {self.relative_improvement_own:.4f}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
+                    self.comms.eval_peers = self.eval_peers
 
-                # 10. Compute loss after gradient application for random data
-                self.outer_optimizer.zero_grad()
-                self.model.zero_grad()
+                    # Log if some evaluations were skipped due to window exhaustion
+                    if len(uids_attempted_this_window) < len(evaluation_uids):
+                        skipped_uids = list(
+                            set(evaluation_uids) - uids_attempted_this_window
+                        )
+                        hone.log_with_context(
+                            level="info",
+                            message=f"Window exhaustion: Skipped evaluation for UIDs {sorted(skipped_uids)}. Completed {len(uids_attempted_this_window)}/{len(evaluation_uids)} evaluations.",
+                            sync_window=self.sync_window,
+                            current_window=self.current_window,
+                        )
 
-                self.sampler.set_window_uid(random_seed, self.sync_window)
-                eval_ok_local = True
-                try:
-                    loss_after_random, n_batches = await self.evaluate_model(
-                        self.model,
-                        self.loader,
-                    )
-                except Exception as e:
-                    eval_ok_local = False
-                    hone.log_with_context(
-                        level="error",
-                        message=f"evaluate_model (random/after) failed for UID {eval_uid}: {e}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-                eval_ok_global = dist_helper.all_ok(
-                    eval_ok_local, self.device, tag=f"random_after_uid_{eval_uid}"
-                )
-                if not eval_ok_global:
-                    self._restore_model_state(saved_state)
-                    dist_helper.safe_barrier(
-                        tag=f"skip_uid_random_after_{eval_uid}",
-                        local_rank=self.local_rank,
-                    )
-                    if self.is_master:
-                        uid_eval_details[eval_uid] = {
-                            "evalStatus": "skipped",
-                            "evalSkipReason": "eval model failed (random/after)",
-                        }
-                    continue
-                # evaluate_model now handles averaging across ranks
+                # elapsed time for full peer-evaluation loop
+                evaluation_time = hone.T() - eval_start
 
-                # Restore original model parameters from CPU
-                restore_start: float = hone.T()
-                self._restore_model_state(saved_state)
-                restore_time = hone.T() - restore_start
-                # restore_time is now always a float, never Unbound
-
-                if self.is_master:
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Model state restoration took {restore_time:.3f}s",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                # Clean up saved state
-                torch.cuda.empty_cache()
-
-                self.loss_after_per_batch_random = (
-                    loss_after_random / n_batches if n_batches > 0 else 0
-                )
-
-                avg_loss_before_per_batch_random += self.loss_before_per_batch_random
-                avg_loss_after_per_batch_random += self.loss_after_per_batch_random
-
-                if self.is_master:
-                    hone.log_with_context(
-                        level="info",
-                        message=f"Loss after (random data): {self.loss_after_per_batch_random}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                # 11. Calculate improvements and update scores
-                # Compute and assign the loss improvement to self
-                self.loss_improvement_random = (
-                    self.loss_before_per_batch_random - self.loss_after_per_batch_random
-                )
-                if self.is_master:
-                    hone.log_with_context(
-                        level="info",
-                        message=f"Loss improvement (random data): {self.loss_improvement_random}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                self.relative_improvement_random = (
-                    self.loss_improvement_random / self.loss_before_per_batch_random
-                    if self.loss_before_per_batch_random > 0
-                    else 0.0
-                )
-                if self.is_master:
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Relative improvement (random data): {self.relative_improvement_random}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                # Calculate original performance score (gradient quality)
-                self.gradient_scores[eval_uid] = (
-                    loss_before_random - loss_after_random
-                ) / loss_before_random
-
-                if self.is_master:
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Gradient Score: {self.gradient_scores[eval_uid]}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                    # Track negative evaluation history
-                    self.track_negative_evaluation(eval_uid)
-
-                # Initialize or update OpenSkill rating for this peer
-                if eval_uid not in self.openskill_ratings and self.is_master:
-                    self.openskill_ratings[eval_uid] = self.openskill_model.rating(
-                        name=str(eval_uid)
-                    )
-
-                # Record the gradient score for later OpenSkill updates
-                if not hasattr(self, "current_window_scores"):
-                    self.current_window_scores = {}
-                self.current_window_scores[eval_uid] = self.gradient_scores[
-                    eval_uid
-                ].item()
-
-                # Calculate binary indicator for overfitting detection
-                improvement_own = (
-                    (loss_before_own - loss_after_own) / loss_before_own
-                    if loss_before_own > 0
-                    else 0
-                )
-                improvement_random = (
-                    (loss_before_random - loss_after_random) / loss_before_random
-                    if loss_before_random > 0
-                    else 0
-                )
-                if self.is_master:
-                    self.binary_indicator_scores[eval_uid] = (
-                        1 if improvement_own > improvement_random else -1
-                    )
-                    hone.log_with_context(
-                        level="info",
-                        message=f"Binary Indicator Score: {self.binary_indicator_scores[eval_uid]}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                    uid_eval_details[eval_uid] = {
-                        "evalStatus": "evaluated",
-                        "lossOwnBefore": float(self.loss_before_per_batch_own),
-                        "lossOwnAfter": float(self.loss_after_per_batch_own),
-                        "lossRandomBefore": float(self.loss_before_per_batch_random),
-                        "lossRandomAfter": float(self.loss_after_per_batch_random),
-                        "improvementOwn": float(improvement_own),
-                        "improvementRandom": float(improvement_random),
-                    }
-
-                    # Update binary moving average using exponential moving average formula:
-                    # new_avg = (1-alpha) * old_avg + alpha * new_value
-                    # where alpha is binary_score_ma_alpha hyperparameter
-                    self.binary_moving_averages[eval_uid] = (
-                        (1 - self.hparams.binary_score_ma_alpha)
-                        * self.binary_moving_averages[eval_uid]
-                        + self.hparams.binary_score_ma_alpha
-                        * self.binary_indicator_scores[eval_uid]
-                    )
-                    hone.log_with_context(
-                        level="debug",
-                        message=f"Binary Moving Average Score: {self.binary_moving_averages[eval_uid]}",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                    sync_result = await self.evaluate_miner_sync(eval_uid)
-                    sync_score = cast(
-                        float,
-                        sync_result.get("sync_score", 0.0),
-                    )
-                    self.log_sync_score(eval_uid, sync_result)
-
-                    # Store the sync score for this miner
-                    self.sync_scores[eval_uid] = sync_score
-
-                self.evaluated_uids.add(eval_uid)
-
-                evaluated_peers += 1
-                uid_eval_time = time.time() - uid_eval_start
-                if self.is_master:
-                    hone.log_with_context(
-                        level="info",
-                        message=f"{hone.P(self.sync_window, hone.T() - eval_start)} "
-                        f"Completed evaluation | UID eval time: {uid_eval_time:.3f}s",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                        eval_uid=eval_uid,
-                    )
-
-                # Synchronize all ranks at the end of each evaluation iteration
-                dist_helper.safe_barrier("end_eval_iter", self.local_rank)
-
-            del saved_state
-            torch.cuda.empty_cache()
-            self.sampler._cached_indices.clear()
-
-            # Update eval_peers counters based on actual evaluation attempts
-            # Reset counters for UIDs that were attempted (whether successful or not)
-            if self.is_master:
-                for uid in uids_attempted_this_window:
-                    self.eval_peers[uid] = 1
-
-                # Increment counters for peers that weren't attempted due to window change
-                for uid in self.eval_peers.keys():
-                    if uid not in uids_attempted_this_window:
-                        self.eval_peers[uid] += 1
-
-                self.comms.eval_peers = self.eval_peers
-
-                # Log if some evaluations were skipped due to window exhaustion
-                if len(uids_attempted_this_window) < len(evaluation_uids):
-                    skipped_uids = list(
-                        set(evaluation_uids) - uids_attempted_this_window
-                    )
-                    hone.log_with_context(
-                        level="info",
-                        message=f"Window exhaustion: Skipped evaluation for UIDs {sorted(skipped_uids)}. Completed {len(uids_attempted_this_window)}/{len(evaluation_uids)} evaluations.",
-                        sync_window=self.sync_window,
-                        current_window=self.current_window,
-                    )
-
-            # elapsed time for full peer-evaluation loop
-            evaluation_time = hone.T() - eval_start
-
-            # Barrier after evaluation completes
-            dist_helper.safe_barrier("post_eval", self.local_rank)
+                # Barrier after evaluation completes
+                dist_helper.safe_barrier("post_eval", self.local_rank)
 
             # Apply negative evaluation penalties after all evaluations are complete
             # This ensures consistent treatment based on the full window of evaluated UIDs
@@ -2572,45 +3457,88 @@ class Validator(BaseNode, Trainer):
             self.outer_optimizer.zero_grad()
             self.model.zero_grad()
 
-            # Auto-clip EMA state, lazily allocated so it persists
-            # across the validator's outer steps (mirrors the miner's
-            # ``Trainer.outer_step`` wrapper). Catchup-time outer_step
-            # calls in ``catchup_with_aggregation_server`` deliberately
-            # pass ``auto_clip_state=None`` so a fresh restart doesn't
-            # contaminate the live EMA with rapid replay magnitudes.
-            if not hasattr(self, "_outer_auto_clip_state"):
-                self._outer_auto_clip_state: dict = {}
-            auto_on = bool(
-                getattr(self.hparams, "outer_grad_norm_auto", False)
-            )
-            gradient_fingerprint = hone.neurons.outer_step(
-                self.model,
-                self.outer_optimizer,
-                gather_result=gather_result,
-                transformer=self.transformer,
-                compressor=self.compressor,
-                xshapes=self.xshapes,
-                totalks=self.totalks,
-                device=cast(str, self.device),
-                is_master=self.is_master,
-                world_size=self.world_size,
-                use_dct=self.hparams.use_dct,
-                wandb_run=self.wandb if self.is_master else None,
-                global_step=self.global_step,
-                max_grad_norm=getattr(
-                    self.hparams, "outer_max_grad_norm", None
-                ),
-                auto_clip_state=(
-                    self._outer_auto_clip_state if auto_on else None
-                ),
-                auto_clip_factor=float(
-                    getattr(self.hparams, "outer_grad_norm_auto_factor", 1.5)
-                ),
-                auto_clip_ema_decay=float(
-                    getattr(self.hparams, "outer_grad_norm_ema_decay", 0.95)
-                ),
-            )
+            # FU4: ``_outer_auto_clip_state``, ``auto_on``, and
+            # ``peer_weights`` were all initialised BEFORE the parallel
+            # outer_step dispatch (see the FU4 block above the eval
+            # snapshot). Both the parallel-stream and the serial
+            # else-branch dispatches below consume the same
+            # ``peer_weights`` variable now, so the duplicate build that
+            # used to live here has been removed.
+
+            # P4: when parallel mode is on, the outer_step was already
+            # dispatched on the secondary stream BEFORE eval. We just
+            # wait for its event here. Otherwise (legacy serial path),
+            # call ``outer_step`` synchronously on the default stream.
+            if outer_step_event is not None:
+                # Parallel path: outer_step kernels are still in flight
+                # on the secondary ``_outer_step_stream``. Block the
+                # default stream until they finish so subsequent reads
+                # of ``self.model`` (gradient/weight stats below,
+                # checkpoint logic) see the post-step weights.
+                # ``Event.synchronize()`` is a host-side block: returns
+                # only after all preceding work on the recording stream
+                # is done. For an 8B-A1B run on H100 with 30s outer
+                # steps, this is dominated by whatever foreach-SGD
+                # tail remains after eval finished — typically near
+                # zero in steady state.
+                outer_step_event.synchronize()
+                gradient_fingerprint = parallel_grad_fp
+                outer_timings = parallel_outer_timings
+            else:
+                gradient_fingerprint, outer_timings = hone.neurons.outer_step(
+                    self.model,
+                    self.outer_optimizer,
+                    gather_result=gather_result,
+                    transformer=self.transformer,
+                    compressor=self.compressor,
+                    xshapes=self.xshapes,
+                    totalks=self.totalks,
+                    device=cast(str, self.device),
+                    is_master=self.is_master,
+                    world_size=self.world_size,
+                    use_dct=self.hparams.use_dct,
+                    wandb_run=self.wandb if self.is_master else None,
+                    global_step=self.global_step,
+                    max_grad_norm=getattr(
+                        self.hparams, "outer_max_grad_norm", None
+                    ),
+                    auto_clip_state=(
+                        self._outer_auto_clip_state if auto_on else None
+                    ),
+                    auto_clip_factor=float(
+                        getattr(self.hparams, "outer_grad_norm_auto_factor", 1.5)
+                    ),
+                    auto_clip_ema_decay=float(
+                        getattr(self.hparams, "outer_grad_norm_ema_decay", 0.95)
+                    ),
+                    peer_weights=peer_weights,
+                    rda_merge=bool(
+                        getattr(self.hparams, "rda_merge", False)
+                    ),
+                    rda_composes_with_clip_norm=bool(
+                        getattr(
+                            self.hparams,
+                            "rda_composes_with_clip_norm",
+                            False,
+                        )
+                    ),
+                    # P3 K_safety: per-peer weight cap at 1/K of the merged
+                    # update. Default-ON guardrail in hparams.json; when
+                    # ``peer_weights is None`` (token weighting off) this is
+                    # a structural no-op inside outer_step.
+                    k_safety=int(
+                        getattr(self.hparams, "gather_safety_cap", 0)
+                    ),
+                )
             self.global_step += 1  # Increment only when we actually do an outer step
+
+            # P4: free the eval-side snapshot now that outer_step is done.
+            # The live model holds the new weights; the snapshot would
+            # otherwise leak ~16GB (8B-A1B bf16) per window.
+            if eval_snapshot is not None:
+                eval_snapshot = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if gradient_fingerprint is not None and self.is_master:
                 hone.logger.info(
@@ -2988,6 +3916,104 @@ class Validator(BaseNode, Trainer):
 
                         dashboard_uid_scores.append(entry)
 
+                # ── P-1b derived telemetry ───────────────────────────────
+                # Per-UID eval distribution: surfaces slow peers on the
+                # /network dashboard. ``np.percentile`` handles the n=1
+                # case cleanly; ``statistics.quantiles`` would raise.
+                if uid_eval_times:
+                    eval_p50: float | None = float(
+                        np.percentile(uid_eval_times, 50)
+                    )
+                    eval_p95: float | None = float(
+                        np.percentile(uid_eval_times, 95)
+                    )
+                    eval_max: float | None = float(max(uid_eval_times))
+                else:
+                    eval_p50 = eval_p95 = eval_max = None
+
+                # Per-fragment upload sizes — empty until P1 wires
+                # ``prepare_gradient_buckets`` into the gather path. The
+                # stub stays so the reporter call site doesn't change in P1.
+                if fragment_byte_counts:
+                    frag_p50: int | None = int(
+                        np.percentile(fragment_byte_counts, 50)
+                    )
+                    frag_max: int | None = int(max(fragment_byte_counts))
+                else:
+                    frag_p50 = frag_max = None
+
+                # Top-line throughput. ``outer_steps_per_chain_window`` is
+                # a per-chain-window scalar: today exactly one outer step
+                # fires per chain window, so it's 1.0. Once P3b drops
+                # ``blocks_per_window`` below the current floor (30) this
+                # ratio will exceed 1 and the dashboard tile becomes the
+                # operator-visible signal that the lever is paying off.
+                outer_steps_per_chain_window: float = 1.0
+                # Effective tokens/sec across the gather: each peer is
+                # expected to consume ``inner_steps × target_batch_size``
+                # samples per outer step, each sample of length
+                # ``sequence_length``. Guard against the (rare) zero-time
+                # case so we don't ship Inf into the dashboard.
+                gather_peer_count = int(len(actual_gather_uids))
+                sample_count_per_peer = int(
+                    self.hparams.inner_steps * self.hparams.target_batch_size
+                )
+                seq_len = int(self.hparams.sequence_length)
+                if window_total_time > 0:
+                    eff_tps: float | None = (
+                        float(gather_peer_count * sample_count_per_peer * seq_len)
+                        / float(window_total_time)
+                    )
+                else:
+                    eff_tps = None
+
+                # P3: feed back the window wall-clock + post-gather apply
+                # times so ``Comms._compute_grace_window_seconds`` can
+                # adapt to the fleet's actual step cadence. The
+                # ``hasattr`` guard is defensive for rank-0-only dispatch
+                # paths in ci where ``self.comms`` may be a lightweight
+                # mock; real deployments always hit the real methods.
+                if hasattr(self.comms, "record_step_time"):
+                    self.comms.record_step_time(float(window_total_time))
+                if hasattr(self.comms, "record_sync_time") and outer_timings is not None:
+                    _post_gather_sync = float(
+                        outer_timings.get("apply_seconds", 0.0)
+                        + outer_timings.get("merge_seconds", 0.0)
+                    )
+                    self.comms.record_sync_time(_post_gather_sync)
+
+                # P3 gather-quorum + grace telemetry (read off Comms
+                # directly so we don't need to thread it back through
+                # gather_with_reserve's return type). ``None`` whenever
+                # K_quorum=0 (default) or the gather aborted before
+                # hitting quorum.
+                p3_quorum_seconds: float | None = getattr(
+                    self.comms, "_last_gather_quorum_seconds", None
+                )
+                p3_grace_seconds: float | None = getattr(
+                    self.comms, "_last_gather_grace_seconds", None
+                )
+
+                # P4 overlap savings: wall-clock that would have been
+                # serial pre-P4 but was absorbed under eval's wall-clock
+                # once parallelism was on. ``None`` whenever
+                # ``parallel_outer_step=false`` (legacy serial path);
+                # otherwise the min of (eval wall-clock, sum of the
+                # outer_step phase timings). Equality to the second
+                # term means parallelism was 100% effective; equality
+                # to the first means the secondary stream had idle
+                # tail past eval (room to push more work forward).
+                p4_overlap_saved_seconds: float | None = None
+                if outer_step_event is not None and outer_timings is not None:
+                    _outer_total = float(
+                        outer_timings.get("decode_seconds", 0.0)
+                        + outer_timings.get("merge_seconds", 0.0)
+                        + outer_timings.get("apply_seconds", 0.0)
+                    )
+                    p4_overlap_saved_seconds = float(
+                        min(float(evaluation_time), _outer_total)
+                    )
+
                 asyncio.create_task(
                     self.dashboard_reporter.report_window(
                         window=int(self.sync_window),
@@ -3014,6 +4040,41 @@ class Validator(BaseNode, Trainer):
                         timing_gather=float(gather_time),
                         timing_evaluation=float(evaluation_time),
                         timing_model_update=float(model_update_time),
+                        # ── P-1b: outer_step phase split (None until P0a) ─
+                        timing_outer_step_decode=(
+                            float(outer_timings["decode_seconds"])
+                            if outer_timings is not None
+                            else None
+                        ),
+                        timing_outer_step_merge=(
+                            float(outer_timings["merge_seconds"])
+                            if outer_timings is not None
+                            else None
+                        ),
+                        timing_outer_step_apply=(
+                            float(outer_timings["apply_seconds"])
+                            if outer_timings is not None
+                            else None
+                        ),
+                        # ── P-1b: per-UID eval distribution ─────────────
+                        timing_peer_eval_seconds_per_uid_p50=eval_p50,
+                        timing_peer_eval_seconds_per_uid_p95=eval_p95,
+                        timing_peer_eval_seconds_per_uid_max=eval_max,
+                        # ── P-1b: streaming-fragment sizes (None until P1) ─
+                        upload_bytes_per_fragment_p50=frag_p50,
+                        upload_bytes_per_fragment_max=frag_max,
+                        # ── P-1b: top-line throughput tiles ─────────────
+                        outer_steps_per_chain_window=outer_steps_per_chain_window,
+                        effective_tokens_per_second=eff_tps,
+                        # ── P3: K_quorum + adaptive grace telemetry ────
+                        timing_gather_quorum_seconds=p3_quorum_seconds,
+                        timing_gather_grace_seconds=p3_grace_seconds,
+                        # ── P4: parallel outer_step overlap savings ────
+                        timing_outer_step_overlap_saved_seconds=(
+                            p4_overlap_saved_seconds
+                        ),
+                        # ── P3b: chain-window length at this window ────
+                        blocks_per_window=int(self.hparams.blocks_per_window),
                         evaluated_uids=int(len(self.evaluated_uids)),
                         total_negative_evals=int(total_negative_evals),
                         total_excluded=int(total_excluded_peers),
@@ -3906,7 +4967,47 @@ class Validator(BaseNode, Trainer):
         eval_uid: int,
         eval_state_dict: dict,
         clip_norm_dict: dict[str, torch.Tensor],
+        *,
+        direction: int = -1,
+        grad_cache: dict[str, torch.Tensor] | None = None,
+        on_decompressed=None,
     ) -> None:
+        """Decompress + apply (or revert) a peer's gradient in place.
+
+        Args:
+            direction: ``-1`` applies the peer gradient (legacy
+                behavior: ``p.data -= alpha * grad``). ``+1`` reverts a
+                previously applied gradient (``p.data += alpha * grad``).
+                P5b single-forward eval uses an apply/revert pair with
+                ``direction=-1`` then ``direction=+1`` to score a peer
+                without copying / cloning the full model.
+            grad_cache: Optional per-canonical-param cache of the dense
+                decompressed gradient tensor (keyed by ``cname``). When
+                populated, the revert path reads the *same tensor* that
+                was applied, making the revert numerically exact (up to
+                IEEE ``add_`` rounding, which is identity for well-scaled
+                floats). When passed empty + ``direction=-1``, this
+                method populates the cache so a subsequent
+                ``direction=+1`` call can use it. Pass ``None`` to
+                preserve the legacy zero-cache behavior.
+            on_decompressed: Optional ``(cname, full_grad_src)`` hook
+                invoked on the source rank (master for FSDP, rank 0 for
+                single-GPU) right after a fresh decompress and before
+                ``distribute_tensor``. Used by P5b to accumulate a
+                count-sketch of the peer's gradient into a master-local
+                sketch buffer without paying a second decompress pass.
+                Not called when the cached revert path fires.
+
+        Note:
+            ``direction=+1`` with ``grad_cache=None`` is equivalent to
+            decompressing the peer grad a second time and adding it
+            back. Numerically deterministic but wastes one decompress
+            pass per param; prefer passing the same ``grad_cache`` dict
+            through both calls.
+        """
+        if direction not in (-1, 1):
+            raise ValueError(f"direction must be -1 or +1, got {direction}")
+
         model.zero_grad()
 
         clip_norm = True  # Always true in the repo 8/13/2025
@@ -3927,8 +5028,17 @@ class Validator(BaseNode, Trainer):
 
             cname = canon_map.get(n, n)
 
+            # Fast path: revert using the cached dense grad from the
+            # earlier ``direction=-1`` call. Skips decompress entirely
+            # (the P5b numerical-identity contract).
+            use_cached = (
+                direction == 1
+                and grad_cache is not None
+                and cname in grad_cache
+            )
+
             # Build the full dense grad on the source rank only (or always in single GPU)
-            if on_src:
+            if on_src and not use_cached:
                 idxs_key = cname + "idxs"
                 vals_key = cname + "vals"
                 quant_key = cname + "quant_params"
@@ -4017,6 +5127,17 @@ class Validator(BaseNode, Trainer):
                             )
                             del full_grad_src
                             has_valid_gradient = False
+                        elif on_decompressed is not None:
+                            # P5b sketch hook fires only on the source
+                            # rank, only after the full decompressed
+                            # gradient has passed the finiteness check.
+                            # The hook runs before distribute_tensor so
+                            # ``full_grad_src`` is still the complete
+                            # dense tensor; the hook is expected to
+                            # consume a *view* (or copy what it needs)
+                            # and not retain a reference that would
+                            # block the later ``del``.
+                            on_decompressed(cname, full_grad_src)
                     except Exception as e:
                         hone.log_with_context(
                             level="error",
@@ -4042,31 +5163,38 @@ class Validator(BaseNode, Trainer):
 
             # Distribute gradient for DTensor or apply directly for regular tensors
             if isinstance(p, DT):
-                # Ensure full_grad_src has correct dtype on source rank
-                if on_src and full_grad_src.dtype != p.dtype:
-                    full_grad_src = full_grad_src.to(dtype=p.dtype)
+                if use_cached:
+                    # grad_cache holds the distributed DTensor from the
+                    # earlier apply call; reuse it directly.
+                    new_grad = grad_cache[cname]  # type: ignore[index]
+                else:
+                    # Ensure full_grad_src has correct dtype on source rank
+                    if on_src and full_grad_src.dtype != p.dtype:
+                        full_grad_src = full_grad_src.to(dtype=p.dtype)
 
-                src_tensor = (
-                    full_grad_src
-                    if on_src
-                    else torch.empty(p.shape, device=p.device, dtype=p.dtype)
-                )
+                    src_tensor = (
+                        full_grad_src
+                        if on_src
+                        else torch.empty(p.shape, device=p.device, dtype=p.dtype)
+                    )
 
-                new_grad = distribute_tensor(
-                    src_tensor,
-                    device_mesh=p.device_mesh,
-                    placements=p.placements,
-                    src_data_rank=src_rank,
-                )
-                # master no longer needs the full dense grad
-                if on_src:
-                    del full_grad_src
-                    full_grad_src = None
+                    new_grad = distribute_tensor(
+                        src_tensor,
+                        device_mesh=p.device_mesh,
+                        placements=p.placements,
+                        src_data_rank=src_rank,
+                    )
+                    # master no longer needs the full dense grad
+                    if on_src:
+                        del full_grad_src
+                        full_grad_src = None
 
                 # quick sanity (view, no extra big alloc)
                 local_view = new_grad.to_local()
                 if not torch.isfinite(local_view).all():
-                    del new_grad, local_view
+                    del local_view
+                    if not use_cached:
+                        del new_grad
                     torch.cuda.empty_cache()
                     # Don't continue here - let the gradient be zero or handle it properly
                     # This prevents rank-specific skipping which causes deadlocks
@@ -4079,20 +5207,43 @@ class Validator(BaseNode, Trainer):
                     )
                     # Skip this parameter update but don't break the loop
                 else:
-                    # Apply update directly to data
-                    p.data.sub_(
+                    # Apply (direction=-1) == legacy ``p.data.sub_(g, α)``:
+                    #   add_(g, alpha = -1 * α) == p.data - α*g
+                    # Revert (direction=+1) undoes the apply exactly:
+                    #   add_(g, alpha = +1 * α) == p.data + α*g
+                    # Using the SAME cached ``new_grad`` on both sides
+                    # makes the two ``add_`` operations numerically
+                    # self-cancelling (IEEE add_ is exact for the tiny
+                    # intermediate magnitudes here).
+                    p.data.add_(
                         new_grad,
-                        alpha=self.lr * self.hparams.eval_lr_factor,
+                        alpha=direction * self.lr * self.hparams.eval_lr_factor,
                     )
-                del new_grad, local_view
+                # Cache on apply so the subsequent revert reuses the
+                # same DTensor reference (numerical identity guarantee).
+                if direction == -1 and grad_cache is not None:
+                    grad_cache[cname] = new_grad
+                elif not use_cached:
+                    del new_grad
+                del local_view
             else:
                 # Single GPU case (non-DTensor)
                 if on_src:
-                    p.data.sub_(
-                        full_grad_src,
-                        alpha=self.lr * self.hparams.eval_lr_factor,
-                    )
-                    del full_grad_src
+                    if use_cached:
+                        cached = grad_cache[cname]  # type: ignore[index]
+                        p.data.add_(
+                            cached,
+                            alpha=direction * self.lr * self.hparams.eval_lr_factor,
+                        )
+                    else:
+                        p.data.add_(
+                            full_grad_src,
+                            alpha=direction * self.lr * self.hparams.eval_lr_factor,
+                        )
+                        if direction == -1 and grad_cache is not None:
+                            grad_cache[cname] = full_grad_src
+                        else:
+                            del full_grad_src
 
     def compute_peer_val_norms(
         self,
@@ -4409,6 +5560,13 @@ class Validator(BaseNode, Trainer):
         4-step slice (inner_steps) while the miner hashes a
         max_inner_steps slice and every comparison logs ``MISMATCH for
         UID N: expected ... (4096) got ... (40960)``.
+
+        Returns the legacy ``hash(sorted(sample_ids))`` 128-bit digest
+        (for back-compat with pre-P2 miners that uploaded the
+        sample-ids-only digest). The P2 binding-aware digest including
+        ``c_tokens`` / ``c_steps`` is recomputed inside
+        ``log_digest_match`` because it depends on the *claimed* metadata
+        the validator just received from this peer.
         """
         max_inner = (
             getattr(self.hparams, "max_inner_steps", None)
@@ -4431,6 +5589,31 @@ class Validator(BaseNode, Trainer):
         h.update(np.asarray(sorted(ids), dtype=np.uint64).tobytes())
         return h.hexdigest(), len(ids)
 
+    def _training_pool_sample_ids(self, uid: int, window: int) -> tuple[int, ...]:
+        """Validator-side mirror of the miner's deterministic sample_ids
+        tuple for (uid, window). Used by ``log_digest_match`` to
+        recompute the P2 ``UploadMetadata`` digest binding without
+        trusting the miner's claimed ``sample_ids``.
+        """
+        max_inner = (
+            getattr(self.hparams, "max_inner_steps", None)
+            or self.hparams.inner_steps
+        )
+        miner_sampler = hone.MinerSampler(
+            dataset=self.dataset,
+            uid=uid,
+            window=window,
+            steps_per_window=max_inner,
+            micro_bs=self.hparams.micro_batch_size,
+            batch_size=self.hparams.batch_size,
+            target_batch_size=self.hparams.target_batch_size,
+            rank=0,
+            world_size=1,
+        )
+        idxs = miner_sampler._global_indices()
+        ids = miner_sampler.ids_for_indices(idxs.tolist())
+        return tuple(sorted(ids))
+
     # ────────────────────────────────────────────────────────────────────
     # new helper: quick check & log
     # ────────────────────────────────────────────────────────────────────
@@ -4438,20 +5621,57 @@ class Validator(BaseNode, Trainer):
         """
         Compare miner-supplied metadata with our own expectation.
         Returns True on match, False on mismatch (and logs both cases).
+
+        Accepts BOTH wire formats during the P2 rollout window:
+
+        * Legacy: ``sample_digest = hash(sorted(sample_ids))`` (pre-P2
+          miners).
+        * P2 binding: ``sample_digest = hash(sample_ids || c_tokens ||
+          c_steps)`` per ``UploadMetadata.digest_hex``. A match against
+          this layout pins the peer's ``c_tokens`` / ``c_steps`` claim
+          to the validator-known deterministic ``sample_ids`` — the
+          miner cannot post-hoc re-claim a different (c_tokens,
+          c_steps) without re-computing the digest, which the validator
+          would then re-derive and reject.
         """
-        mine, n_expected = self._training_pool_digest(uid, self.sync_window)
+        legacy_mine, n_expected = self._training_pool_digest(uid, self.sync_window)
 
         his = meta.get("sample_digest")
         n_his = meta.get("sample_count")
 
-        ok = (his == mine) and (n_his == n_expected)
-        msg = (
-            f"✅ sample_digest MATCH for UID {uid} (count {n_his}/{n_expected})"
-            if ok
-            else f"❌ sample_digest MISMATCH for UID {uid}\n"
-            f"     expected {mine} ({n_expected})\n"
-            f"     got      {his} ({n_his})"
-        )
+        # Try the P2 binding-aware digest first (preferred). Falls back
+        # to legacy on any reconstruction error so a malformed P2 peer
+        # gets exactly the same MISMATCH path as a legacy peer.
+        bound_mine: str | None = None
+        try:
+            sample_ids = self._training_pool_sample_ids(uid, self.sync_window)
+            bound_meta = hone.schemas.UploadMetadata(
+                window=int(self.sync_window),
+                sample_ids=sample_ids,
+                c_tokens=int(meta.get("c_tokens", 0)),
+                c_steps=int(meta.get("c_steps", 0)),
+            )
+            bound_mine = bound_meta.digest_hex()
+        except Exception:
+            bound_mine = None
+
+        bound_match = bound_mine is not None and his == bound_mine
+        legacy_match = his == legacy_mine
+        ok = (bound_match or legacy_match) and (n_his == n_expected)
+
+        if ok:
+            tag = "P2-bound" if bound_match else "legacy"
+            msg = (
+                f"✅ sample_digest MATCH ({tag}) for UID {uid} "
+                f"(count {n_his}/{n_expected})"
+            )
+        else:
+            msg = (
+                f"❌ sample_digest MISMATCH for UID {uid}\n"
+                f"     expected (legacy)   {legacy_mine} ({n_expected})\n"
+                f"     expected (P2-bound) {bound_mine} ({n_expected})\n"
+                f"     got                 {his} ({n_his})"
+            )
         level = "info" if ok else "warning"
         hone.log_with_context(
             level=level,
@@ -4489,6 +5709,16 @@ class Validator(BaseNode, Trainer):
                     "success_rate": gather_result.success_rate,
                 }
 
+                # FU2 (resolved): in fragmented mode
+                # ``gather_result.state_dict`` is already the disjoint-key
+                # union assembled by ``Comms._gather_fragmented`` from the
+                # per-fragment uploads (each fragment carries a disjoint
+                # subset of param names per ``prepare_gradient_buckets``),
+                # so this single ``put(key="aggregator")`` publishes the
+                # composed payload as-is and catchup's primary
+                # ``get(key="aggregator")`` ingests it unchanged. No
+                # separate server-side composer / aggregator role is
+                # needed — the gather IS the composition.
                 await self.comms.put(
                     state_dict=payload,
                     window=self.sync_window,

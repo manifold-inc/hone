@@ -1,0 +1,6 @@
+# Beta-Lloyd-Max centroid cache for hone.turboquant.
+# Contents are deterministic and re-derivable on demand from
+# scipy.stats.beta(d/2, d/2); regenerating costs ~30ms per (d, b).
+# Skipping git keeps the repo clean and avoids LFS bloat as more
+# (d, b) pairs get probed in production.
+*.pt

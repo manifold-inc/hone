@@ -39,7 +39,29 @@ TotK: TypeAlias = int  # size of the last dim
 # 12‑bit packed representation - just the uint8 buffer, no tuple
 IdxT: TypeAlias = torch.Tensor  # 12-bit packed indices (stored as uint8 tensor)
 
-QuantParamsT: TypeAlias = tuple[torch.Tensor, float, int, torch.Tensor, torch.dtype]
+# Quantisation params travel alongside every quantised values blob so the
+# receiver can reconstruct floats. Two wire variants exist for backward-
+# compatible rollout of 2-bit value packing (P0b):
+#
+#   * Legacy / version 0 (5-tuple): ``(shift, scale, offset, lookup, dtype)``.
+#     ``vals`` is a raw uint8 tensor of shape ``(..., topk)`` with one byte
+#     per quantised value.
+#   * Packed / version 1 (7-tuple):
+#     ``(shift, scale, offset, lookup, dtype, pack_version=1, original_last_dim)``.
+#     ``vals`` is a 2-bit-packed uint8 tensor of shape ``(..., ceil(topk/4))``.
+#     The receiver detects v1 via tuple length, restores the original last
+#     dim using ``original_last_dim``, then dequantises through ``lookup``.
+#
+# Both variants are accepted by every decode path. New senders only emit v1
+# when the operator opts in via the ``pack_values_2bit`` hparam (default
+# ``False``); see ``TopKCompressor.__init__``.
+LegacyQuantParamsT: TypeAlias = tuple[
+    torch.Tensor, float, int, torch.Tensor, torch.dtype
+]
+PackedQuantParamsT: TypeAlias = tuple[
+    torch.Tensor, float, int, torch.Tensor, torch.dtype, int, int
+]
+QuantParamsT: TypeAlias = LegacyQuantParamsT | PackedQuantParamsT
 
 # For historical names kept elsewhere in the code
 ValT: TypeAlias = torch.Tensor
@@ -140,6 +162,131 @@ def unpack_12bit_indices(packed: torch.Tensor, values_shape: ShapeT) -> torch.Te
     indices = indices.reshape(values_shape)
 
     return indices
+
+
+def pack_2bit_values(values: torch.Tensor) -> torch.Tensor:
+    """
+    Pack uint8 values in [0, 3] into a 2-bit representation.
+
+    Every 4 consecutive values along the LAST dim are packed into 1 byte:
+
+        byte = v0 | (v1 << 2) | (v2 << 4) | (v3 << 6)
+
+    i.e. v0 occupies bits 0-1, v1 bits 2-3, v2 bits 4-5, v3 bits 6-7
+    (little-endian within each byte). This mirrors the bit ordering of
+    ``pack_12bit_indices`` (lower-order bits of each value go in the
+    lower-order bits of each byte) so the two packers feel consistent
+    on the wire.
+
+    The packing is row-wise so the leading dims of ``values`` are
+    preserved in the output. When the last dim is not a multiple of 4
+    it is right-padded with zeros; the receiver must know the original
+    last-dim size to drop the padding (carried in the qparams as the
+    7th element ``original_last_dim``; see ``QuantParamsT``).
+
+    Args:
+        values: uint8 tensor with all entries in [0, 3]. Arbitrary
+            leading dims; the LAST dim is what gets packed.
+
+    Returns:
+        uint8 tensor with the same leading dims and last dim of
+        ``ceil(N / 4)`` where ``N`` is the original last dim. For an
+        empty input the tensor is returned unchanged.
+    """
+    if values.dtype != torch.uint8:
+        raise ValueError(f"Expected uint8 input, got {values.dtype}")
+    if values.numel() == 0:
+        return values
+
+    # Bound check (cheap fail-fast: would silently corrupt other lanes
+    # otherwise since 0x03 mask just truncates the upper bits).
+    max_val = int(values.max().item())
+    if max_val >= 4:
+        raise ValueError(f"Value {max_val} exceeds 2-bit limit (3)")
+
+    n = values.shape[-1]
+    pad = (-n) % 4  # number of zero-padding entries to append along last dim
+    if pad:
+        pad_shape = (*values.shape[:-1], pad)
+        values = torch.cat(
+            [
+                values,
+                torch.zeros(pad_shape, dtype=torch.uint8, device=values.device),
+            ],
+            dim=-1,
+        )
+
+    # Reshape last dim into groups of 4: shape (..., n_packed, 4).
+    n_packed = values.shape[-1] // 4
+    quartets = values.reshape(*values.shape[:-1], n_packed, 4)
+
+    # Vectorized OR-shift pack. uint8 left-shift of a [0,3] value by up
+    # to 6 bits stays inside the byte (max is 3<<6 = 192) so the OR-
+    # combine fits in uint8 without overflow.
+    packed = (
+        quartets[..., 0]
+        | (quartets[..., 1] << 2)
+        | (quartets[..., 2] << 4)
+        | (quartets[..., 3] << 6)
+    )
+    return packed.contiguous()
+
+
+def unpack_2bit_values(packed: torch.Tensor, original_last_dim: int) -> torch.Tensor:
+    """
+    Inverse of ``pack_2bit_values``.
+
+    Unpacks 4 uint8 values per byte along the last dim using the same
+    little-endian-within-byte layout as the packer:
+
+        v0 = packed & 0x03
+        v1 = (packed >> 2) & 0x03
+        v2 = (packed >> 4) & 0x03
+        v3 = (packed >> 6) & 0x03
+
+    Then truncates the last dim to ``original_last_dim`` to drop any
+    zero-padding the packer added.
+
+    Args:
+        packed: uint8 tensor produced by ``pack_2bit_values``. The last
+            dim is expected to be ``ceil(original_last_dim / 4)``.
+        original_last_dim: value of the last dim BEFORE packing/padding.
+            Stored in the 7-tuple ``QuantParamsT`` and propagated end-to-end.
+
+    Returns:
+        uint8 tensor with the same leading dims as ``packed`` and last
+        dim of ``original_last_dim``. All entries are in [0, 3].
+    """
+    if packed.dtype != torch.uint8:
+        raise ValueError(f"Expected uint8 packed input, got {packed.dtype}")
+
+    expected_packed_len = (original_last_dim + 3) // 4
+    if packed.shape[-1] != expected_packed_len:
+        raise ValueError(
+            f"Packed last dim {packed.shape[-1]} does not match expected "
+            f"{expected_packed_len} for original_last_dim={original_last_dim}"
+        )
+
+    if original_last_dim == 0 or packed.numel() == 0:
+        out_shape = (*packed.shape[:-1], original_last_dim)
+        return torch.empty(out_shape, dtype=torch.uint8, device=packed.device)
+
+    # Vectorized unpack. Layout matches the packer (v0 in low bits).
+    v0 = packed & 0x03
+    v1 = (packed >> 2) & 0x03
+    v2 = (packed >> 4) & 0x03
+    v3 = (packed >> 6) & 0x03
+
+    # Stack along a new trailing dim and flatten so the recovered order
+    # is (v0, v1, v2, v3, v0, v1, v2, v3, ...) — exactly the order the
+    # packer consumed.
+    quartets = torch.stack([v0, v1, v2, v3], dim=-1)
+    unpacked = quartets.reshape(*packed.shape[:-1], -1)
+
+    if unpacked.shape[-1] != original_last_dim:
+        unpacked = unpacked[..., :original_last_dim]
+
+    return unpacked.contiguous()
 
 
 class ChunkingTransformer:
@@ -302,6 +449,14 @@ class ChunkingTransformer:
         return x
 
 
+# ``pack_version`` constants stored at index 5 of the 7-tuple QuantParamsT.
+# v0 is implicit (legacy 5-tuple, raw uint8 values). v1 is the new 2-bit
+# packed format introduced in P0b. Bumping this past 1 requires adding a
+# matching branch in ``_dequantize_values``.
+PACK_VERSION_LEGACY: int = 0
+PACK_VERSION_2BIT: int = 1
+
+
 class TopKCompressor(Generic[Q]):
     """
     A gradient sparsifier/compressor that uses Top-K selection and optional quantization.
@@ -314,6 +469,7 @@ class TopKCompressor(Generic[Q]):
     use_quantization: Q
     n_bins: int
     range_in_sigmas: int
+    pack_values_2bit: bool
 
     # ------------------------------------------------------------------ #
     # Constructor – two overloads so each instance "remembers" its mode
@@ -325,6 +481,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: Literal[True] = True,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        pack_values_2bit: bool = False,
     ) -> None: ...
 
     @overload
@@ -334,6 +491,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: Literal[False] = False,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        pack_values_2bit: bool = False,
     ) -> None: ...
 
     @torch.no_grad()
@@ -343,6 +501,7 @@ class TopKCompressor(Generic[Q]):
         use_quantization: bool = False,
         quantization_bins: int = 256,
         quantization_range: int = 6,
+        pack_values_2bit: bool = False,
     ) -> None:
         """
         Initialise the TopKCompressor.
@@ -351,6 +510,16 @@ class TopKCompressor(Generic[Q]):
             use_quantization (bool): Whether to use 8-bit quantization.
             quantization_bins (int): The number of bins for quantization.
             quantization_range (int): The quantization range in standard deviations.
+            pack_values_2bit (bool): Opt-in switch that bit-packs 4-bin
+                quantised values from 8-bit-per-value (uint8) down to true
+                2-bit-per-value on the wire (4 values per byte). Only honoured
+                when ``use_quantization=True`` and ``quantization_bins == 4``;
+                ignored otherwise. Decoders unconditionally accept BOTH wire
+                formats (signalled per-blob via the qparams tuple length), so
+                flipping this at the sender side is safe as long as
+                receivers run a version of the codec that recognises the
+                7-tuple qparams. Default ``False`` to keep the wire format
+                bit-for-bit identical for staged rollouts.
         """
         self.use_quantization = cast(Q, use_quantization)
         if self.use_quantization:
@@ -358,6 +527,10 @@ class TopKCompressor(Generic[Q]):
             self.range_in_sigmas = (
                 quantization_range  # Quantization range in standard deviations
             )
+        # Stored regardless of ``use_quantization`` so toggling the flag
+        # later is observable, but only consulted inside ``_quantize_values``
+        # which is itself gated on ``use_quantization``.
+        self.pack_values_2bit = bool(pack_values_2bit) and quantization_bins == 4
 
     def _clamp_topk(self, x, topk) -> int:
         """
@@ -454,6 +627,8 @@ class TopKCompressor(Generic[Q]):
         xshape: ShapeT,
         totalk: int,
         quantize_params: QuantParamsT | None = None,
+        *,
+        reduce: Literal["mean", "sum"] = "mean",
     ) -> torch.Tensor:
         """
         Decompress a tensor from its sparse representation.
@@ -465,6 +640,14 @@ class TopKCompressor(Generic[Q]):
             xshape (ShapeT): The original shape of the tensor.
             totalk (int): The total number of elements in the original tensor's last dim.
             quantize_params (QuantParamsT, optional): Quantization parameters. Defaults to None.
+            reduce (Literal["mean", "sum"]): scatter_reduce mode applied
+                across overlapping concatenated indices. Defaults to
+                ``"mean"`` (legacy behaviour: position-wise average over
+                whichever peers landed on each cell). ``batch_decompress``
+                switches to ``"sum"`` only when caller supplied
+                ``peer_weights`` (after normalisation, sum recovers the
+                global weighted average; see ``batch_decompress``).
+                Single-peer call sites should leave at the default.
 
         Returns:
             torch.Tensor: The decompressed tensor.
@@ -493,7 +676,7 @@ class TopKCompressor(Generic[Q]):
             val = val.to(dtype=x.dtype)
 
         x.scatter_reduce_(
-            dim=-1, index=idx_int64, src=val, reduce="mean", include_self=False
+            dim=-1, index=idx_int64, src=val, reduce=reduce, include_self=False
         ).reshape(xshape)
 
         if len(x.shape) > 2:  # 2D weights
@@ -516,6 +699,7 @@ class TopKCompressor(Generic[Q]):
         block_norms: torch.Tensor | None = None,
         normalise: bool = False,
         clip_norm: bool = True,
+        peer_weights: Sequence[float] | None = None,
     ) -> torch.Tensor:
         """
         Decompress a batch of sparse tensors and combine them.
@@ -530,6 +714,19 @@ class TopKCompressor(Generic[Q]):
             block_norms (torch.Tensor, optional): Pre-computed norms for each block. Defaults to None.
             normalise (bool): Whether to normalise the values. Defaults to False.
             clip_norm (bool): Whether to clip the norms of the values. Defaults to True.
+            peer_weights (Sequence[float], optional): P2 token-weighted
+                aggregation weights, one per peer in the same order as
+                ``val``. When provided, weights are normalised to sum to
+                1 and each peer's dequantised values are pre-multiplied
+                by the normalised weight before the cross-peer
+                ``scatter_reduce_``; the reduce mode is switched from
+                ``"mean"`` to ``"sum"`` so that, for the dense
+                ``vec_p[k] = vals_p[k] if k in idxs_p else 0`` view of
+                each peer, the output equals
+                ``sum_p w_p * vec_p[k]`` — the standard global weighted
+                average where missing-peer cells contribute 0. ``None``
+                preserves the legacy uniform ``"mean"`` reduce behaviour
+                bit-for-bit. Length MUST equal ``len(val)``.
 
         Returns:
             torch.Tensor: The combined, decompressed tensor.
@@ -558,6 +755,32 @@ class TopKCompressor(Generic[Q]):
             clip_norm_val = torch.median(norms)
 
         vals = dequant_vals if dequant_vals is not None else val
+
+        # P2 token-weighted aggregation pre-multiply. Normalised so
+        # ``sum_p w_p == 1``; combined with the ``reduce="sum"`` swap
+        # downstream, this turns ``scatter_reduce_`` into the canonical
+        # global weighted-average over the dense per-peer view of each
+        # gradient. Length must match the cross-peer ``vals`` list; we
+        # validate up front so a miswired caller fails loudly rather
+        # than silently mis-weighting.
+        normalised_weights: list[float] | None = None
+        if peer_weights is not None:
+            peer_weights_list = list(peer_weights)
+            if len(peer_weights_list) != len(vals):
+                raise ValueError(
+                    f"peer_weights length {len(peer_weights_list)} does not "
+                    f"match number of peer val tensors {len(vals)}"
+                )
+            weight_sum = float(sum(peer_weights_list))
+            if weight_sum <= 0.0:
+                # Degenerate input: every peer reported zero. Fall back
+                # to uniform mean so the merge still completes.
+                normalised_weights = None
+            else:
+                normalised_weights = [
+                    float(w) / weight_sum for w in peer_weights_list
+                ]
+
         for i, v in enumerate(vals):
             v = v.to(p.device)
 
@@ -577,29 +800,58 @@ class TopKCompressor(Generic[Q]):
                 current_norm = norms[i]
                 clip_factor = torch.clamp(clip_norm_val / (current_norm + 1e-8), max=1)
                 v = v * clip_factor
+
+            if normalised_weights is not None:
+                # Pre-multiply this peer's vals by their normalised
+                # weight. Cast through ``v.dtype`` so the downstream
+                # ``cat -> scatter_reduce`` path sees a uniform dtype
+                # (the legacy mean-reduce path does the same implicit
+                # broadcast through ``clip_factor``).
+                v = v * v.new_tensor(normalised_weights[i])
+
             processed_vals.append(v)
 
         # Unpack and concatenate indices
         unpacked_indices = []
-        val_list = val if isinstance(val, Sequence) else [val]
         idx_list = idx if isinstance(idx, Sequence) else [idx]
 
+        # ``unpack_12bit_indices`` needs the ORIGINAL (pre-quantisation)
+        # values shape to know how many indices to recover. ``processed_vals``
+        # always carries that shape: it is the dequantised tensor when
+        # quantisation ran (so 2-bit packing has been undone), or the
+        # caller-supplied tensor otherwise. Reading the wire ``val`` shape
+        # directly would be wrong under PACK_VERSION_2BIT, where the last
+        # dim has been compressed 4×.
         for i, i_data in enumerate(idx_list):
             if i_data.dtype != torch.uint8:
                 raise ValueError(
                     f"Expected uint8 for 12-bit packed indices, got {i_data.dtype}"
                 )
-            # Unpack 12-bit format using corresponding values shape
-            v_data = val_list[i]
+            v_data = processed_vals[i]
             idx_unpacked = unpack_12bit_indices(i_data.to(p.device), v_data.shape)
             unpacked_indices.append(idx_unpacked)
 
         idx_concat = torch.cat(unpacked_indices, dim=-1)
         val_concat = torch.cat(processed_vals, dim=-1).to(p.dtype)
 
+        # Reduce mode: when peer_weights normalised cleanly, sum gives
+        # the canonical weighted average over the dense per-peer view
+        # (see the kwarg docstring). Else fall back to the legacy mean
+        # behaviour so call sites that don't pass ``peer_weights`` get
+        # bit-for-bit identical results.
+        reduce_mode: Literal["mean", "sum"] = (
+            "sum" if normalised_weights is not None else "mean"
+        )
+
         # Use decompress without quantization (since we already dequantized)
         return self.decompress(
-            p, idx_concat, val_concat, xshape, totalk, quantize_params=None
+            p,
+            idx_concat,
+            val_concat,
+            xshape,
+            totalk,
+            quantize_params=None,
+            reduce=reduce_mode,
         )
 
     @torch.no_grad()
@@ -611,7 +863,14 @@ class TopKCompressor(Generic[Q]):
             val (torch.Tensor): The tensor values to quantize.
 
         Returns:
-            A tuple containing the quantized values (uint8) and the quantization parameters.
+            A tuple containing the quantized values (uint8) and the
+            quantization parameters. When ``self.pack_values_2bit`` is on
+            (only valid for ``n_bins == 4``) the returned values are
+            additionally bit-packed 4-per-byte along the last dim, and
+            the qparams tuple is extended from 5 to 7 elements with
+            ``(pack_version=1, original_last_dim)`` so the receiver can
+            invert the packing. The quantisation math itself is
+            unchanged in either path.
         """
         offset = self.n_bins // 2  # 128 for 8-bit
         shift = val.mean()
@@ -640,7 +899,26 @@ class TopKCompressor(Generic[Q]):
         )
 
         lookup = torch.where(counts > 0, sums / counts, torch.zeros_like(sums))
-        qparams: QuantParamsT = (shift, float(scale), offset, lookup, val.dtype)
+
+        # P0b: optionally bit-pack the qval tensor down to true 2-bit
+        # storage. Only valid for n_bins=4 (every quantised entry is in
+        # [0, 3]); the constructor already ANDs with ``n_bins == 4`` so
+        # ``self.pack_values_2bit`` can never be True otherwise.
+        if self.pack_values_2bit:
+            original_last_dim = int(qval.shape[-1])
+            qval = pack_2bit_values(qval)
+            qparams_packed: PackedQuantParamsT = (
+                shift,
+                float(scale),
+                offset,
+                lookup,
+                val.dtype,
+                PACK_VERSION_2BIT,
+                original_last_dim,
+            )
+            return qval, qparams_packed
+
+        qparams: LegacyQuantParamsT = (shift, float(scale), offset, lookup, val.dtype)
         return qval, qparams
 
     @torch.no_grad()
@@ -650,15 +928,49 @@ class TopKCompressor(Generic[Q]):
         """
         Dequantize tensor values from 8-bit integers back to their original dtype.
 
+        Accepts both wire variants of ``QuantParamsT``:
+
+        * Legacy 5-tuple ``(shift, scale, offset, lookup, dtype)`` -- ``val``
+          is interpreted as raw uint8 quantised entries with the same shape
+          as the original quantised tensor.
+        * Packed 7-tuple ``(shift, scale, offset, lookup, dtype, pack_version,
+          original_last_dim)`` -- when ``pack_version == PACK_VERSION_2BIT``,
+          ``val`` is first 2-bit-unpacked along the last dim using
+          ``original_last_dim`` to recover the pre-pack uint8 shape, then
+          dequantised through ``lookup`` like the legacy path.
+
+        The same compressor instance can mix both formats peer-by-peer
+        during the rollout window. The output shape always matches the
+        shape the caller would have seen pre-quantisation.
+
         Args:
-            val (torch.Tensor): The quantized values (uint8).
+            val (torch.Tensor): The quantized values (uint8) -- raw or
+                2-bit-packed depending on ``qparams`` length.
             qparams (QuantParamsT): The quantization parameters.
 
         Returns:
             torch.Tensor: The dequantized values.
         """
         if val.dtype == torch.uint8:
-            shift, _, _, lookup, orig_dtype = qparams
+            # Tolerant destructure: works for both 5-tuple (legacy) and
+            # 7-tuple (PACK_VERSION_2BIT). ``extras`` empty => v0 by
+            # construction; otherwise ``extras = (pack_version, original_last_dim)``.
+            shift, _scale, _offset, lookup, orig_dtype, *extras = qparams
+
+            if extras:
+                pack_version = int(extras[0])
+                if pack_version == PACK_VERSION_2BIT:
+                    original_last_dim = int(extras[1])
+                    val = unpack_2bit_values(val, original_last_dim)
+                elif pack_version != PACK_VERSION_LEGACY:
+                    # Future-proofing: a sender from a newer codec sent an
+                    # unknown pack_version. Fail loudly rather than silently
+                    # corrupting weights via a wrong lookup.
+                    raise ValueError(
+                        f"Unknown pack_version {pack_version} in qparams; "
+                        f"upgrade hone to decode this gradient."
+                    )
+
             lookup = (
                 lookup.to(val.device) if isinstance(lookup, torch.Tensor) else lookup
             )
@@ -690,11 +1002,12 @@ class TopKCompressor(Generic[Q]):
         if qparams is None or not needs_dequantized:
             return vals
 
-        if (
-            isinstance(qparams, tuple)
-            and len(qparams) == 5  # potentially single or already 5 elements
-            and not all([len(q) == 5 for q in qparams])  # already correctly formatted
-        ):
+        # A single QuantParamsT is itself a tuple whose first element is a
+        # tensor (``shift``); a list-of-qparams is a list whose elements
+        # are themselves tuples. Detect-by-element-type so we work for
+        # both 5-tuple (legacy) and 7-tuple (PACK_VERSION_2BIT) shapes
+        # without hard-coding the length here.
+        if isinstance(qparams, tuple) and qparams and isinstance(qparams[0], torch.Tensor):
             qparams = [qparams]
 
         if not isinstance(qparams, list):
@@ -893,3 +1206,143 @@ def _get_smaller_split(n: int, close_to: int) -> int:
                 return val
             return all_divisors[ix - 1]
     return n
+
+
+# ─────────── self-test entrypoint ────────────────────────────────────────
+# `hone` has no stand-alone test suite under ``hone/tests/``; the existing
+# test coverage for the compressor lives in the sibling ``templar`` repo.
+# Until that infrastructure lands here, expose the round-trip checks as a
+# `python -m hone.compress` runnable so the P0b 2-bit packing is verified
+# locally and in CI without pulling in pytest.
+def _run_self_tests() -> None:  # pragma: no cover - exercised via __main__
+    """Round-trip checks for the P0b 2-bit value packer.
+
+    Validates:
+    1. ``pack_2bit_values`` / ``unpack_2bit_values`` are exact inverses
+       across edge-case sizes (powers of 4, +/-1 from a power of 4, etc).
+    2. The packer preserves leading dims so the comms.py
+       ``vals.shape[:-1] == xshape[:-1]`` invariant survives.
+    3. The end-to-end ``TopKCompressor`` decompress path accepts BOTH the
+       legacy 5-tuple (raw uint8 vals) and the new 7-tuple
+       (``PACK_VERSION_2BIT``) qparams from the same instance — i.e. the
+       backward-compat contract holds for mixed-format gather batches.
+    """
+    torch.manual_seed(0)
+
+    # --- (1) raw pack/unpack round-trip --------------------------------
+    # Sizes intentionally bracket every multiple-of-4 boundary the
+    # padder might encounter (1..5, 63..65, 1000..1003 covers all
+    # pad-by-{0,1,2,3} cases).
+    for n in [1, 2, 3, 4, 5, 63, 64, 65, 1000, 1001, 1002, 1003]:
+        vals_1d = torch.randint(0, 4, (n,), dtype=torch.uint8)
+        packed = pack_2bit_values(vals_1d)
+        unpacked = unpack_2bit_values(packed, n)
+        assert torch.equal(vals_1d, unpacked), (
+            f"1D round-trip failed at n={n}: vals={vals_1d.tolist()} "
+            f"unpacked={unpacked.tolist()}"
+        )
+        # 4-values-per-byte invariant after padding
+        assert packed.numel() == (n + 3) // 4, (
+            f"unexpected packed size {packed.numel()} for n={n}"
+        )
+
+    # --- (2) leading-dim preservation (the comms.py shape contract) ----
+    for shape in [(7, 32), (3, 1, 30), (5, 17), (2, 2, 2, 6)]:
+        vals_nd = torch.randint(0, 4, shape, dtype=torch.uint8)
+        packed = pack_2bit_values(vals_nd)
+        assert packed.shape[:-1] == vals_nd.shape[:-1], (
+            f"leading dims mutated: {packed.shape} vs {vals_nd.shape}"
+        )
+        assert packed.shape[-1] == (vals_nd.shape[-1] + 3) // 4
+        unpacked = unpack_2bit_values(packed, vals_nd.shape[-1])
+        assert torch.equal(vals_nd, unpacked), f"ND round-trip failed for {shape}"
+
+    # --- (3) end-to-end compressor cross-format compat -----------------
+    # Drive a small synthetic gradient through both code paths and check
+    # the decompressor emits the SAME dense output. This is what gather
+    # actually depends on during the rollout window: a single decompressor
+    # consuming both wire variants from different peers.
+    x = torch.randn(8, 64)
+    topk = 32
+    legacy = TopKCompressor(
+        use_quantization=True, quantization_bins=4, quantization_range=6,
+    )
+    packed_compressor = TopKCompressor(
+        use_quantization=True, quantization_bins=4, quantization_range=6,
+        pack_values_2bit=True,
+    )
+
+    idx_l, val_l, xshape_l, totalk_l, qp_l = legacy.compress(x, topk)
+    idx_p, val_p, xshape_p, totalk_p, qp_p = packed_compressor.compress(x, topk)
+
+    # Wire-format invariants
+    assert len(qp_l) == 5, f"legacy qparams should be 5-tuple, got len={len(qp_l)}"
+    assert len(qp_p) == 7, f"packed qparams should be 7-tuple, got len={len(qp_p)}"
+    assert qp_p[5] == PACK_VERSION_2BIT
+    assert qp_p[6] == val_l.shape[-1], "original_last_dim mismatch"
+    assert val_l.dtype == torch.uint8 and val_p.dtype == torch.uint8
+    # Last-dim compression: packed should be 4× smaller (with possible
+    # +1 for padding that pushes into the next byte).
+    assert val_p.shape[-1] == (val_l.shape[-1] + 3) // 4, (
+        f"expected packed last-dim {(val_l.shape[-1] + 3) // 4}, "
+        f"got {val_p.shape[-1]}"
+    )
+    # Leading dims preserved
+    assert val_p.shape[:-1] == val_l.shape[:-1]
+
+    # Either decompressor instance must accept either format.
+    p_ref = torch.zeros_like(x)
+    out_legacy_via_packed = packed_compressor.decompress(
+        p_ref, idx_l, val_l, xshape_l, totalk_l, qp_l
+    )
+    out_packed_via_legacy = legacy.decompress(
+        p_ref, idx_p, val_p, xshape_p, totalk_p, qp_p
+    )
+    out_legacy_native = legacy.decompress(
+        p_ref, idx_l, val_l, xshape_l, totalk_l, qp_l
+    )
+    out_packed_native = packed_compressor.decompress(
+        p_ref, idx_p, val_p, xshape_p, totalk_p, qp_p
+    )
+    # Same input → same quantised values regardless of wire packing.
+    assert torch.allclose(out_legacy_via_packed, out_legacy_native), (
+        "decompressor mishandled legacy 5-tuple qparams"
+    )
+    assert torch.allclose(out_packed_via_legacy, out_packed_native), (
+        "decompressor mishandled PACK_VERSION_2BIT 7-tuple qparams"
+    )
+    assert torch.allclose(out_legacy_native, out_packed_native), (
+        "2-bit packing changed the recovered quantised gradient"
+    )
+
+    # --- (4) batch_decompress mixed-format batch -----------------------
+    # Simulate a gather batch with one legacy peer and one packed peer.
+    out_batch = packed_compressor.batch_decompress(
+        p_ref,
+        [idx_l, idx_p],
+        [val_l, val_p],
+        xshape_l,
+        totalk_l,
+        quantize_params=[qp_l, qp_p],
+        clip_norm=False,
+    )
+    assert out_batch.shape == x.shape
+
+    # --- (5) wire-size sanity --------------------------------------- --
+    legacy_bytes = val_l.numel()
+    packed_bytes = val_p.numel()
+    ratio = packed_bytes / max(legacy_bytes, 1)
+    assert ratio <= 0.30, (  # ~0.25 ideal; allow slack for padding.
+        f"expected ~4× values shrinkage, got ratio={ratio:.3f} "
+        f"(legacy={legacy_bytes}B, packed={packed_bytes}B)"
+    )
+
+    print(
+        "[hone.compress] self-tests passed: pack_2bit_values round-trips, "
+        f"end-to-end shrinks values {legacy_bytes}B -> {packed_bytes}B "
+        f"({ratio:.1%} of legacy)"
+    )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    _run_self_tests()

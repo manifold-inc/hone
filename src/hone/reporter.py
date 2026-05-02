@@ -394,6 +394,55 @@ class DashboardReporter:
         timing_gather: float | None = None,
         timing_evaluation: float | None = None,
         timing_model_update: float | None = None,
+        # P-1b finer-grain outer-step + throughput telemetry. Field names
+        # below MUST stay in lock-step with the hone-api zod schema and the
+        # hone-dashboard WindowMetrics TS type (see plan P-1). Values are
+        # all optional today: an inflight P0a refactor of ``outer_step`` is
+        # what populates ``timing_outer_step_*``; the ``upload_bytes_per_*``
+        # pair stays empty until P1 wires ``prepare_gradient_buckets``.
+        timing_outer_step_decode: float | None = None,
+        timing_outer_step_merge: float | None = None,
+        timing_outer_step_apply: float | None = None,
+        timing_peer_eval_seconds_per_uid_p50: float | None = None,
+        timing_peer_eval_seconds_per_uid_p95: float | None = None,
+        timing_peer_eval_seconds_per_uid_max: float | None = None,
+        upload_bytes_per_fragment_p50: int | None = None,
+        upload_bytes_per_fragment_max: int | None = None,
+        outer_steps_per_chain_window: float | None = None,
+        effective_tokens_per_second: float | None = None,
+        # P4: overlap savings from running ``outer_step`` on a 2nd CUDA
+        # stream concurrently with peer evaluation. Computed by the
+        # validator as ``min(evaluation_time,
+        # decode_seconds + merge_seconds + apply_seconds)``: that is
+        # the wall-clock that would have been serial pre-P4 but was
+        # absorbed under eval's wall-clock once parallelism was on.
+        # ``None`` when ``parallel_outer_step=false`` (legacy serial
+        # path) or when the validator hasn't computed the value yet
+        # (catchup, skipped windows). hone-api + dashboard plumbing
+        # is intentionally deferred to a follow-up; this kwarg is the
+        # producer-side surface so downstream wiring can land without
+        # another touch to the validator.
+        timing_outer_step_overlap_saved_seconds: float | None = None,
+        # P3: K_quorum throughput trigger + adaptive grace telemetry.
+        # ``timing_gather_quorum_seconds`` = seconds from gather start to
+        # K_quorum (``None`` when K_quorum is disabled or not hit within
+        # the 600s overall timeout). ``timing_gather_grace_seconds`` =
+        # the computed adaptive grace window (Decoupled DiLoCo eq. 3)
+        # that was armed for this gather (``None`` when K_quorum not
+        # hit). Validator reads these off ``Comms._last_gather_*`` after
+        # each ``gather_with_reserve`` call. hone-api + dashboard
+        # plumbing is a separate future PR per P3 deliverable.
+        timing_gather_quorum_seconds: float | None = None,
+        timing_gather_grace_seconds: float | None = None,
+        # P3b: validator's ``hparams.blocks_per_window`` at the time this
+        # window was reported. A passthrough field: the validator always
+        # knows it (``self.hparams.blocks_per_window``) and the
+        # dashboard pairs it with ``outer_steps_per_chain_window`` to
+        # decide whether the "step-down eligible" hint fires. The
+        # standalone CLI tool (``hone/validator/blocks_per_window_stepdown_check.py``)
+        # also reads this from the ingested rows so an operator can run
+        # the check without hitting the validator process directly.
+        blocks_per_window: int | None = None,
         evaluated_uids: int | None = None,
         total_negative_evals: int | None = None,
         total_excluded: int | None = None,
@@ -435,6 +484,27 @@ class DashboardReporter:
             "timing_gather": "timingGather",
             "timing_evaluation": "timingEvaluation",
             "timing_model_update": "timingModelUpdate",
+            # ── P-1b fine-grain outer-step split ─────────────────────────
+            "timing_outer_step_decode": "timingOuterStepDecode",
+            "timing_outer_step_merge": "timingOuterStepMerge",
+            "timing_outer_step_apply": "timingOuterStepApply",
+            # ── P-1b per-UID eval distribution ───────────────────────────
+            "timing_peer_eval_seconds_per_uid_p50": "timingPeerEvalSecondsPerUidP50",
+            "timing_peer_eval_seconds_per_uid_p95": "timingPeerEvalSecondsPerUidP95",
+            "timing_peer_eval_seconds_per_uid_max": "timingPeerEvalSecondsPerUidMax",
+            # ── P-1b streaming-fragment upload sizes (populated by P1) ──
+            "upload_bytes_per_fragment_p50": "uploadBytesPerFragmentP50",
+            "upload_bytes_per_fragment_max": "uploadBytesPerFragmentMax",
+            # ── P-1b top-line throughput tiles ───────────────────────────
+            "outer_steps_per_chain_window": "outerStepsPerChainWindow",
+            "effective_tokens_per_second": "effectiveTokensPerSecond",
+            # ── P3 K_quorum + adaptive grace telemetry (schema-forward) ──
+            "timing_gather_quorum_seconds": "timingGatherQuorumSeconds",
+            "timing_gather_grace_seconds": "timingGatherGraceSeconds",
+            # ── P4 parallel outer_step overlap savings (schema-forward) ──
+            "timing_outer_step_overlap_saved_seconds": "timingOuterStepOverlapSavedSeconds",
+            # ── P3b chain-window-length passthrough ─────────────────────
+            "blocks_per_window": "blocksPerWindow",
             "evaluated_uids": "evaluatedUids",
             "total_negative_evals": "totalNegativeEvals",
             "total_excluded": "totalExcluded",

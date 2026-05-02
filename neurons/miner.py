@@ -21,11 +21,11 @@ import argparse
 import asyncio
 import concurrent.futures
 import gc
-import hashlib
 import json
 import logging
 import os
 import random
+import signal
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -53,6 +53,19 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+
+def _estimate_bucket_bytes(bucket: dict) -> int:
+    """Sum ``tensor.numel() * tensor.element_size()`` across every tensor in
+    a fragment bucket. Used by the P1 streaming-upload path to populate
+    ``upload_bytes_per_fragment_p50/_max`` telemetry — see ``Miner.run``
+    near the per-fragment ``comms.put`` calls.
+    """
+    total = 0
+    for v in bucket.values():
+        if isinstance(v, torch.Tensor):
+            total += v.element_size() * v.nelement()
+    return total
 
 
 class NullMetricsLogger:
@@ -270,6 +283,7 @@ class Miner(BaseNode, Trainer):
             use_quantization=True,
             quantization_bins=self.hparams.quantization_bins,
             quantization_range=self.hparams.quantization_range,
+            pack_values_2bit=getattr(self.hparams, "pack_values_2bit", False),
         )
         hone.logger.info("[Init] compression pipeline ready")
 
@@ -367,6 +381,18 @@ class Miner(BaseNode, Trainer):
         self.uid = self.comms.metagraph.hotkeys.index(self.wallet.hotkey.ss58_address)
         self.comms.uid = self.uid
 
+        # P6a TurboQuant audit hook: register a SIGUSR2 handler that
+        # dumps the current ``self.error_feedback`` dict to
+        # ``/tmp/ef_snapshot_uid<U>_w<W>.pt``. The handler is registered
+        # unconditionally because Python's ``signal.signal`` is O(1) and
+        # the handler does NOTHING until the signal actually fires
+        # (kill -USR2 <pid>); zero footprint on normal runs.
+        # Only the master rank installs the handler — duplicate dumps
+        # from every rank would bloat /tmp and races on the same path.
+        # See ``hone/docs/turboquant.md`` for the full audit workflow.
+        if self.is_master:
+            self._install_ef_snapshot_handler()
+
         self.ckpt = hone.DCPCheckpointer(
             self.comms, uid=self.uid, version=hone.__version__, repo_root="."
         )
@@ -445,6 +471,100 @@ class Miner(BaseNode, Trainer):
         )
 
         hone.logger.info("[Init] ✔ fully done – entering run()")
+
+    def _install_ef_snapshot_handler(self) -> None:
+        """Wire SIGUSR2 to dump ``self.error_feedback`` to ``/tmp``.
+
+        P6a operator workflow: ``kill -USR2 <miner_pid>`` writes the
+        miner's current EF dict to a timestamped path under ``/tmp``;
+        the operator then runs
+        ``hone/validator/turboquant_audit_cli.py <path>`` to KS-test
+        every EF tensor against the Beta(d/2, d/2) prescription and
+        decide whether to enable ``hparams.turboquant_enabled``.
+
+        Implementation notes:
+
+        * Signal handlers must be best-effort: any exception is swallowed
+          (logged, never raised) because letting an exception escape a
+          signal handler crashes the running miner — the audit must never
+          be load-bearing on uptime.
+        * ``signal.signal`` is registered ONCE at init; the closure
+          captures ``self`` so the handler reads the *current* EF state
+          when fired. ``self.error_feedback`` may not exist yet when
+          init is mid-flight, so the handler guards on ``hasattr``.
+        * ``torch.save`` from a signal handler can race with the main
+          training loop mutating EF tensors. We accept the race — the
+          snapshot is for distribution-shape analysis (KS test on
+          coordinates), and a tensor that is mid-write only smears
+          a few coords; the per-class pass rate is robust to that.
+        * On non-Unix platforms ``signal.SIGUSR2`` is not defined and
+          ``getattr`` returns None; the handler is silently not
+          installed, which is the right behaviour for a Linux/macOS-
+          specific debug hook.
+        """
+
+        sigusr2 = getattr(signal, "SIGUSR2", None)
+        if sigusr2 is None:
+            return
+
+        def _handler(_signum, _frame):
+            try:
+                ef = getattr(self, "error_feedback", None)
+                if ef is None:
+                    hone.logger.warning(
+                        "[P6a] SIGUSR2 received but error_feedback is "
+                        "not yet initialised; skipping snapshot."
+                    )
+                    return
+                window = getattr(self, "current_window", -1)
+                uid = getattr(self, "uid", -1)
+                path = f"/tmp/ef_snapshot_uid{uid}_w{window}.pt"
+                # Materialise to plain CPU tensors so the dump is
+                # consumable by the audit CLI from any host (no DTensor /
+                # CUDA dependencies on the analysis box).
+                snapshot = {}
+                for name, t in ef.items():
+                    if t is None:
+                        snapshot[name] = None
+                        continue
+                    try:
+                        if hasattr(t, "full_tensor"):
+                            t = t.full_tensor()
+                        snapshot[name] = t.detach().to("cpu", copy=True)
+                    except Exception as e:  # noqa: BLE001 — best-effort dump
+                        hone.logger.warning(
+                            f"[P6a] could not snapshot EF[{name}]: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                import torch as _torch  # local to keep startup clean
+
+                _torch.save(snapshot, path)
+                hone.logger.info(
+                    f"[P6a] dumped EF snapshot to {path} "
+                    f"({len(snapshot)} keys)"
+                )
+            except Exception as e:  # noqa: BLE001 — never escape a signal handler
+                hone.logger.warning(
+                    f"[P6a] EF snapshot handler failed: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+        try:
+            signal.signal(sigusr2, _handler)
+            hone.logger.info(
+                "[P6a] SIGUSR2 EF snapshot handler installed; trigger with "
+                f"`kill -USR2 {os.getpid()}`."
+            )
+        except (ValueError, OSError) as e:
+            # ``signal.signal`` raises ValueError when called outside
+            # the main thread; on multi-process miners only the spawn
+            # parent gets the handler. This is fine for the audit
+            # workflow — operators target the process they ran ``pm2
+            # start`` against.
+            hone.logger.warning(
+                f"[P6a] could not install SIGUSR2 handler "
+                f"({type(e).__name__}: {e}); audit snapshots disabled."
+            )
 
     # Main training loop.
     async def run(self):
@@ -670,6 +790,14 @@ class Miner(BaseNode, Trainer):
             window_entry_loss = res["window_entry_loss"]
             n_batches = res["batch_count"]
             window_tokens = res["batch_tokens"]
+            # P2 token-weighted aggregation: number of inner optimizer
+            # steps actually applied this window. Plumbed from
+            # ``Trainer.inner_steps`` via ``res['inner_step_count']``.
+            # Falls back to ``inner_steps`` hparam for legacy callers
+            # whose trainer return dict pre-dates P2.
+            window_inner_steps = int(
+                res.get("inner_step_count", self.hparams.inner_steps)
+            )
             global_grad_norm = res["global_grad_norm"]
             global_weight_norm = res["global_weight_norm"]
             adam_metrics = res.get("adam_metrics", {})
@@ -731,20 +859,27 @@ class Miner(BaseNode, Trainer):
                         gradient.update(shard)
                         gathered[i] = None  # Free memory immediately after using shard
 
-                # dataset metadata
+                # ── P2: canonical UploadMetadata builder. The shared
+                # ``hone.schemas.UploadMetadata`` binds ``c_tokens`` and
+                # ``c_steps`` into the BLAKE2b-128 sample digest so a
+                # miner cannot lie about either field without breaking
+                # the digest the validator independently reconstructs.
+                # ``to_wire()`` is the on-wire dict the validator reads
+                # in ``log_digest_match`` and ``validate_upload_metadata``.
+                # MUST happen BEFORE ``prepare_gradient_buckets`` below
+                # so every fragment bucket carries the same metadata via
+                # the bucket-loop ``{**metadata, "bucket_idx": i, ...}``
+                # propagation in ``prepare_gradient_buckets`` (see
+                # ``hone/src/hone/neurons.py:373-374``).
                 gidx = self.sampler._global_indices()
                 ids = self.sampler.ids_for_indices(gidx.tolist())
-                h = hashlib.blake2b(digest_size=16)
-                h.update(np.asarray(sorted(ids), dtype=np.uint64).tobytes())
-                sample_digest = h.hexdigest()
-                sample_count = len(ids)
-
-                # ── attach window + sample receipt ─────────────────────
-                gradient["metadata"] = {
-                    "window": step_window,
-                    "sample_digest": sample_digest,
-                    "sample_count": sample_count,
-                }
+                upload_meta = hone.schemas.UploadMetadata(
+                    window=step_window,
+                    sample_ids=tuple(sorted(ids)),
+                    c_tokens=int(window_tokens),
+                    c_steps=int(window_inner_steps),
+                )
+                gradient["metadata"] = upload_meta.to_wire()
                 hone.logger.info(
                     f"Attached metadata to gradient: {gradient['metadata']}"
                 )
@@ -777,15 +912,47 @@ class Miner(BaseNode, Trainer):
 
             if self.is_master:
                 put_start = hone.T()
-                await self.comms.put(
-                    state_dict=processed_state_dict,
-                    uid=str(self.uid),
-                    window=step_window,
-                    key="gradient",
-                    global_step=self.global_step,
-                    local=False,
-                    stale_retention=100,
+                # P1: streaming balanced-tensor fragmentation. Default-off
+                # operator gate (``fragmented_uploads``) so legacy peers and
+                # legacy validator gather paths keep working during rollout.
+                # Mirror of the P0b ``pack_values_2bit`` rollout pattern.
+                use_fragments = bool(
+                    getattr(self.hparams, "fragmented_uploads", False)
                 )
+                fragment_byte_counts: list[int] = []
+                if use_fragments:
+                    num_fragments = int(
+                        getattr(self.hparams, "num_fragments", 24)
+                    )
+                    buckets = hone.prepare_gradient_buckets(
+                        processed_state_dict, num_buckets=num_fragments
+                    )
+                    for frag_idx, bucket in enumerate(buckets):
+                        await self.comms.put(
+                            state_dict=bucket,
+                            uid=str(self.uid),
+                            window=step_window,
+                            # Per-fragment key: gather/catchup paths on the
+                            # validator side discriminate via the ``-frag{NN}``
+                            # suffix and fan out 24× more GETs.
+                            key=f"gradient-frag{frag_idx:02d}",
+                            global_step=self.global_step,
+                            local=False,
+                            stale_retention=100,
+                        )
+                        fragment_byte_counts.append(
+                            _estimate_bucket_bytes(bucket)
+                        )
+                else:
+                    await self.comms.put(
+                        state_dict=processed_state_dict,
+                        uid=str(self.uid),
+                        window=step_window,
+                        key="gradient",
+                        global_step=self.global_step,
+                        local=False,
+                        stale_retention=100,
+                    )
 
                 upload_size = sum(
                     t.element_size() * t.nelement()
@@ -793,9 +960,23 @@ class Miner(BaseNode, Trainer):
                     if isinstance(t, torch.Tensor)
                 )
                 put_time = hone.T() - put_start  # ⏱ done
-                hone.logger.info(
-                    f"Uploaded {upload_size / 1e6:.1f} MB shard-merged gradient"
-                )
+                if use_fragments and fragment_byte_counts:
+                    # P-1b stub on the reporter wired ``upload_bytes_per_fragment_p50/_max``;
+                    # populate locally so operators see the per-fragment shape
+                    # in miner logs while the validator-side reporter takes
+                    # the aggregated view (see ``fragment_byte_counts`` flowing
+                    # through gather and into ``report_window``).
+                    p50_bytes = int(np.percentile(fragment_byte_counts, 50))
+                    max_bytes = int(max(fragment_byte_counts))
+                    hone.logger.info(
+                        f"Uploaded {upload_size / 1e6:.1f} MB across "
+                        f"{len(fragment_byte_counts)} fragments "
+                        f"(p50={p50_bytes} bytes, max={max_bytes} bytes)"
+                    )
+                else:
+                    hone.logger.info(
+                        f"Uploaded {upload_size / 1e6:.1f} MB shard-merged gradient"
+                    )
 
                 # Free memory immediately after upload
                 del processed_state_dict
@@ -848,6 +1029,20 @@ class Miner(BaseNode, Trainer):
             if self.is_master:
                 gather_start = hone.T()
                 hone.logger.info("Waiting on gather task...")
+                # P1: hparam-gated per-fragment fan-out (mirror of the
+                # upload-side gate above). Same rollout discipline: the
+                # operator MUST flip ``fragmented_uploads: true`` only
+                # after the entire fleet is upgraded, otherwise legacy
+                # uploaders' single "gradient" blob is invisible to the
+                # 24× ``gradient-frag*`` GETs.
+                _fragmented = bool(
+                    getattr(self.hparams, "fragmented_uploads", False)
+                )
+                _num_fragments = (
+                    int(getattr(self.hparams, "num_fragments", 24))
+                    if _fragmented
+                    else None
+                )
                 gather_result = await self.comms.gather_with_reserve(
                     my_uid=self.uid,
                     gather_uids=self.comms.peers,
@@ -864,6 +1059,7 @@ class Miner(BaseNode, Trainer):
                     time_min=time_min,
                     time_max=time_max,
                     expected_compressed_params=self.expected_compressed_params,
+                    num_fragments=_num_fragments,
                 )
                 hone.logger.info("Gather task completed!")
                 gather_time = hone.T() - gather_start
