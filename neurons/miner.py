@@ -841,10 +841,13 @@ class Miner(BaseNode, Trainer):
             )
 
             # gather the shards → rank-0
-            gathered = dist_helper.gather_object(
-                shard_gradient,
-                object_list=[None] * self.world_size if self.is_master else None,
-                dst=0,
+            # Code-golf (2026-05-03): swap ``gather_object`` (single-
+            # threaded Python pickle, ~360-500 s/window for the 60 MB
+            # per-rank shard dict) for the NCCL byte-tensor path. Same
+            # contract: rank-0 gets ``list[dict]`` of length
+            # ``world_size``, every other rank gets ``None``.
+            gathered = dist_helper.gather_state_dict_via_nccl(
+                shard_gradient, dst=0
             )
 
             # ------------------------------------------------------------
@@ -927,22 +930,38 @@ class Miner(BaseNode, Trainer):
                     buckets = hone.prepare_gradient_buckets(
                         processed_state_dict, num_buckets=num_fragments
                     )
-                    for frag_idx, bucket in enumerate(buckets):
+
+                    # Code-golf (2026-05-03): the serial ``for await`` here
+                    # was 0.0% overlap across all 4 miners and burned
+                    # ~1400s/window. Converting to ``asyncio.gather`` opens
+                    # 24 concurrent TCP streams to R2, so max-tail
+                    # replaces sum-of-tails. Identical per-fragment
+                    # semantics: every PUT still happens, still uses the
+                    # same per-fragment key (gather/catchup paths on the
+                    # validator side discriminate via the ``-frag{NN}``
+                    # suffix and fan out 24× more GETs), still the same
+                    # ``comms.put`` retry+error policy. Only the ordering
+                    # is relaxed.
+                    async def _put_one(frag_idx: int, bucket: dict) -> int:
                         await self.comms.put(
                             state_dict=bucket,
                             uid=str(self.uid),
                             window=step_window,
-                            # Per-fragment key: gather/catchup paths on the
-                            # validator side discriminate via the ``-frag{NN}``
-                            # suffix and fan out 24× more GETs.
                             key=f"gradient-frag{frag_idx:02d}",
                             global_step=self.global_step,
                             local=False,
                             stale_retention=100,
                         )
-                        fragment_byte_counts.append(
-                            _estimate_bucket_bytes(bucket)
+                        return _estimate_bucket_bytes(bucket)
+
+                    fragment_byte_counts.extend(
+                        await asyncio.gather(
+                            *(
+                                _put_one(i, b)
+                                for i, b in enumerate(buckets)
+                            )
                         )
+                    )
                 else:
                     await self.comms.put(
                         state_dict=processed_state_dict,
@@ -1184,9 +1203,24 @@ class Miner(BaseNode, Trainer):
             )
 
             # ─────────────── momentum norms (gathered across ranks) ─────────
-            local_mom_norms: list[float] = [
-                m.norm().item() for m in self.error_feedback.values()
+            # Code-golf (2026-05-03): the ``[m.norm().item() for m in
+            # self.error_feedback.values()]`` comprehension was ~3550
+            # per-tensor CUDA syncs (one ``.item()`` per owned param)
+            # in a tight loop, ~3-5 s/window. ``torch._foreach_norm``
+            # fuses every per-tensor L2 norm into one kernel and the
+            # single ``.tolist()`` is one device→host sync for the
+            # whole stacked vector. Defensive ``is not None`` guard
+            # keeps us robust to any code path that might leave an
+            # owned-param EF buffer un-populated for a window.
+            ef_tensors = [
+                m for m in self.error_feedback.values() if m is not None
             ]
+            if ef_tensors:
+                local_mom_norms: list[float] = torch.stack(
+                    torch._foreach_norm(ef_tensors)
+                ).tolist()
+            else:
+                local_mom_norms = []
             gathered_mom = dist_helper.all_gather_object(local_mom_norms)
 
             momentum_norms = []

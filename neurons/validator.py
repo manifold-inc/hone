@@ -2014,9 +2014,13 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                     )
 
-            # Barrier before evaluation starts
-            if self.world_size > 1 and dist.is_initialized():
-                dist.barrier()
+            # Code-golf (2026-05-03): dropped a redundant
+            # ``dist.barrier()`` here -- the immediately-following
+            # ``dist_helper.broadcast(has_peers_tensor)`` is itself a
+            # collective and ranks cannot reach the next barrier
+            # (``safe_barrier("pre_evaluation")`` below) without
+            # participating in it. Verified by the timing dissector
+            # agent on a fleet at ``blocks_per_window=6``.
 
             # Broadcast the decision to all ranks
             has_peers_tensor = torch.tensor(
@@ -3502,12 +3506,43 @@ class Validator(BaseNode, Trainer):
                     positive_weighted_uids.append(self.burn_uid)
                     positive_weighted_uids.sort()
                 if positive_weighted_uids and self.is_master:
-                    await self._set_weights_with_retry(
-                        wallet=self.wallet,
-                        netuid=cast(int, self.config.netuid),
-                        uids=positive_weighted_uids,
-                        weights=self.weights[positive_weighted_uids],
+                    # Code-golf (2026-05-03): schedule ``set_weights``
+                    # as a fire-and-forget background task so the main
+                    # loop doesn't block on a chain RPC (and so a
+                    # ConcurrencyError retry doesn't inflate
+                    # rank-skew at the next barrier). The publication
+                    # is not consumed by the next window's compute --
+                    # chain inclusion lag is independent of our wall-
+                    # clock cadence. ``self._bg_tasks`` is the same
+                    # drain pool that ``upload_gather_results`` uses
+                    # (see ``validator.py:1839`` and
+                    # ``base_node.py:_graceful_shutdown``), so
+                    # graceful shutdown still delivers pending weights.
+                    _sw_task = asyncio.create_task(
+                        self._set_weights_with_retry(
+                            wallet=self.wallet,
+                            netuid=cast(int, self.config.netuid),
+                            uids=positive_weighted_uids,
+                            weights=self.weights[positive_weighted_uids],
+                        )
                     )
+                    self._bg_tasks.add(_sw_task)
+                    _sw_task.add_done_callback(self._bg_tasks.discard)
+
+                    def _log_set_weights_exc(fut):
+                        exc = fut.exception()
+                        if exc is not None:
+                            hone.log_with_context(
+                                level="error",
+                                message=(
+                                    f"[set_weights] background task "
+                                    f"failed: {exc!r}"
+                                ),
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                            )
+
+                    _sw_task.add_done_callback(_log_set_weights_exc)
 
             # Add barrier before model update to ensure all ranks are ready
             hone.log_with_context(
@@ -5280,10 +5315,40 @@ class Validator(BaseNode, Trainer):
         # ``named_parameters()`` key would always miss when the model
         # is wrapped (FSDP + checkpoint_wrapper + torch.compile).
         canon_map = hone.canonical_param_names(model)
-        for n, p in model.named_parameters():
-            src_rank = 0
-            on_src = self.is_master or not dist_helper.is_distributed()
+        # P2C (2026-05-03): Two-pass restructure to batch the per-param
+        # validity broadcast into a single tensor. Pre-P2C the loop
+        # below issued one ``dist_helper.broadcast(valid_tensor)`` per
+        # ``model.named_parameters()`` entry (~500 broadcasts) on EVERY
+        # apply/revert call. With ~12 peers per window scored via the
+        # P5b apply+revert pair, that was ~12,000 NCCL launches per
+        # eval phase -- empirically 15-25s of pure dispatch overhead.
+        #
+        # Pass 1: master decodes, all ranks call ``distribute_tensor``
+        #         per-param (still required for DT shard scatter), and
+        #         the per-param ``new_grad`` (or ``full_grad_src`` for
+        #         single-GPU) is stashed in ``deferred``. p.data.add_
+        #         is NOT called here.
+        # Single batched broadcast: the n-bool ``per_param_valid``
+        #         tensor is shipped in one collective; every rank
+        #         decodes it identically.
+        # Pass 2: apply each ``(p, new_grad)`` -- this is where the
+        #         model is finally mutated.
+        #
+        # Semantic note: the prior code raised mid-loop after applying
+        # earlier params (partial mutation); the caller relied on
+        # ``_restore_model_state(saved_state)`` to repair. The new code
+        # raises BEFORE any mutation, so the restore path is a no-op
+        # for invalid peers -- strictly cleaner. The non-error path
+        # (all params valid) is byte-for-byte identical to pre-P2C.
+        named_params = list(model.named_parameters())
+        n_params = len(named_params)
+        on_src = self.is_master or not dist_helper.is_distributed()
+        src_rank = 0
 
+        per_param_valid: list[bool] = [True] * n_params
+        deferred: list[dict] = []
+
+        for i, (n, p) in enumerate(named_params):
             full_grad_src = torch.empty(1, dtype=p.dtype, device=p.device)
             has_valid_gradient = True
             is_tq_payload = False
@@ -5495,26 +5560,30 @@ class Validator(BaseNode, Trainer):
                         )
                         has_valid_gradient = False
 
-            # Broadcast gradient validity to all ranks immediately
-            valid_tensor = torch.tensor(
-                [has_valid_gradient], dtype=torch.bool, device=self.device
-            )
-            dist_helper.broadcast(valid_tensor, src=0)
-            has_valid_gradient = bool(valid_tensor.item())
+            per_param_valid[i] = has_valid_gradient
 
-            # If gradient is invalid, all ranks raise exception together
-            if not has_valid_gradient:
-                raise ValueError(
-                    f"Invalid gradient from peer {eval_uid}: Missing or invalid gradient data for {n}"
-                )
-
-            # Distribute gradient for DTensor or apply directly for regular tensors
+            # Distribute (DT) or stash (single-GPU) -- ``p.data.add_`` is
+            # deferred to Pass 2 so an invalid peer raises before
+            # mutating ``p.data``. distribute_tensor still happens
+            # per-param because it IS the data-scatter collective; only
+            # the validity broadcast was hoisted out.
             if isinstance(p, DT):
                 if use_cached:
                     # grad_cache holds the distributed DTensor from the
                     # earlier apply call; reuse it directly.
                     new_grad = grad_cache[cname]  # type: ignore[index]
                 else:
+                    # When master's decode failed, ``full_grad_src`` is
+                    # still the placeholder ``torch.empty(1, ...)`` --
+                    # substitute a properly-shaped zero tensor so
+                    # distribute_tensor sees the right shape. The data
+                    # is irrelevant: the post-loop validity broadcast
+                    # below catches the failure and raises before Pass
+                    # 2 ever applies the placeholder.
+                    if on_src and not has_valid_gradient:
+                        full_grad_src = torch.zeros(
+                            p.shape, device=p.device, dtype=p.dtype
+                        )
                     # Ensure full_grad_src has correct dtype on source rank
                     if on_src and full_grad_src.dtype != p.dtype:
                         full_grad_src = full_grad_src.to(dtype=p.dtype)
@@ -5536,7 +5605,71 @@ class Validator(BaseNode, Trainer):
                         del full_grad_src
                         full_grad_src = None
 
-                # quick sanity (view, no extra big alloc)
+                deferred.append(
+                    {
+                        "kind": "DT",
+                        "p": p,
+                        "n": n,
+                        "cname": cname,
+                        "new_grad": new_grad,
+                        "use_cached": use_cached,
+                    }
+                )
+            else:
+                # Single GPU case (non-DTensor) -- no collective to
+                # align; decode + apply both happen on the source rank
+                # only. Stash the local ``full_grad_src``; Pass 2
+                # applies (or reads cache).
+                deferred.append(
+                    {
+                        "kind": "single",
+                        "p": p,
+                        "n": n,
+                        "cname": cname,
+                        "use_cached": use_cached,
+                        "full_grad_src": (
+                            full_grad_src
+                            if (on_src and not use_cached)
+                            else None
+                        ),
+                    }
+                )
+
+        # ---- Single batched validity broadcast (was 1 per param) ----
+        if dist_helper.is_distributed():
+            valid_tensor = torch.tensor(
+                per_param_valid, dtype=torch.bool, device=self.device
+            )
+            dist_helper.broadcast(valid_tensor, src=0)
+            per_param_valid = valid_tensor.cpu().tolist()
+
+        # If ANY param was invalid, raise on every rank uniformly. No
+        # ``p.data.add_`` has fired yet, so the caller's
+        # ``_restore_model_state(saved_state)`` fallback becomes a no-op
+        # for this peer -- strictly cleaner than the prior partial-
+        # apply-then-raise flow.
+        if not all(per_param_valid):
+            bad_idx = per_param_valid.index(False)
+            bad_n = named_params[bad_idx][0]
+            raise ValueError(
+                f"Invalid gradient from peer {eval_uid}: "
+                f"Missing or invalid gradient data for {bad_n}"
+            )
+
+        # ---- Pass 2: apply each (p, new_grad) -- model mutates here ----
+        for entry in deferred:
+            p = entry["p"]
+            n = entry["n"]
+            cname = entry["cname"]
+            use_cached = entry["use_cached"]
+
+            if entry["kind"] == "DT":
+                new_grad = entry["new_grad"]
+
+                # quick sanity (view, no extra big alloc) -- per-param
+                # soft skip on non-finite is preserved as a per-param
+                # decision (NOT a peer-wide raise), matching pre-P2C
+                # semantics.
                 local_view = new_grad.to_local()
                 if not torch.isfinite(local_view).all():
                     del local_view
@@ -5583,6 +5716,7 @@ class Validator(BaseNode, Trainer):
                             alpha=direction * self.lr * self.hparams.eval_lr_factor,
                         )
                     else:
+                        full_grad_src = entry["full_grad_src"]
                         p.data.add_(
                             full_grad_src,
                             alpha=direction * self.lr * self.hparams.eval_lr_factor,

@@ -130,6 +130,75 @@ class DistributedHelper:
         dist.gather_object(obj, object_list, dst=dst)
         return object_list if self.rank == dst else None
 
+    def gather_state_dict_via_nccl(
+        self,
+        shard: dict,
+        dst: int = 0,
+    ) -> list[dict] | None:
+        """Gather per-rank state dicts via a single NCCL byte-tensor
+        gather instead of ``dist.gather_object``'s Python pickle path.
+
+        The default ``gather_object`` pickles the *whole* Python dict
+        graph on every rank and re-builds it on ``dst`` — single-
+        threaded, ~30 MB/s, and grows superlinearly with the number
+        of nested tensors. For the Hone miner's per-rank shard dict
+        (~60 MB of tensors + metadata) this was ~360-500 s per
+        window. Serialising to ONE ``bytes`` blob per rank (via
+        ``torch.save`` to a ``BytesIO``) then gathering padded CUDA
+        ``uint8`` tensors lets NCCL move the bytes on-device over
+        NVLink in <1 s, and the final single-blob ``torch.load`` on
+        ``dst`` is a handful of seconds at most.
+
+        Contract matches ``gather_object``: on rank == ``dst`` returns
+        a list of length ``world_size`` where entry ``i`` is rank
+        ``i``'s shard; on other ranks returns ``None``.
+        """
+        import io
+
+        if not self.is_distributed():
+            return [shard] if self.rank == dst else None
+
+        device = self.device if self.device is not None else torch.device("cuda")
+
+        # Serialise THIS rank's shard once
+        buf = io.BytesIO()
+        torch.save(shard, buf)
+        payload = buf.getvalue()
+        local_size = torch.tensor(
+            [len(payload)], dtype=torch.int64, device=device
+        )
+
+        # Exchange payload sizes so every rank knows the pad length
+        sizes = [torch.zeros_like(local_size) for _ in range(self.world_size)]
+        dist.all_gather(sizes, local_size)
+        max_size = int(max(int(s.item()) for s in sizes))
+
+        # Pad this rank's payload into a fixed-size CUDA tensor
+        pad = torch.zeros(max_size, dtype=torch.uint8, device=device)
+        pad[: len(payload)] = torch.frombuffer(
+            payload, dtype=torch.uint8
+        ).to(device)
+
+        gather_list = None
+        if self.rank == dst:
+            gather_list = [
+                torch.empty(max_size, dtype=torch.uint8, device=device)
+                for _ in range(self.world_size)
+            ]
+
+        dist.gather(pad, gather_list=gather_list, dst=dst)
+
+        if self.rank != dst:
+            return None
+
+        assert gather_list is not None
+        out: list[dict] = []
+        for i, t in enumerate(gather_list):
+            n = int(sizes[i].item())
+            payload_bytes = bytes(t[:n].cpu().numpy().tobytes())
+            out.append(torch.load(io.BytesIO(payload_bytes), weights_only=False))
+        return out
+
     def all_gather_object(self, obj: Any, object_list: list | None = None) -> list:
         if not self.is_distributed():
             return [obj]

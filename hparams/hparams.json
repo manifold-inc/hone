@@ -50,7 +50,7 @@
     "gather_peers_slash_threshold": 0.4,
     "uids_per_window": 20,
     "time_window_delta_seconds": 70,
-    "window_flush_headroom_seconds": 50,
+    "window_flush_headroom_seconds": 15,
     "reset_inactivity_windows": 3,
     "sync_max_steps_behind": 2,
     "binary_score_ma_alpha": 0.05,

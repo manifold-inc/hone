@@ -1259,89 +1259,138 @@ def outer_step(
         # delta is one full-model gradient slice per rank (1/world_size
         # under FSDP2); the win is 5-15s of Python-loop overhead removed
         # per outer step.
-        for name, p in model.named_parameters():
+
+        # P3A (2026-05-03): batched per-param ``has_update`` broadcast.
+        # Pre-P3A the inline ``_bcast_flag(has_update)`` issued one
+        # ``dist.broadcast(int32)`` per param for the ~7100 trainable
+        # tensors of MoE 8B-A1B every outer step -- ~7100 NCCL launches
+        # per step at ~100us launch + serialization stalls = 1-1.5s of
+        # pure dispatch overhead. We hoist the master lookup into a
+        # pre-pass that populates per-param ``has_update`` + payload
+        # references, then ship every flag in a single int32 tensor
+        # broadcast. The main loop below then dispatches on the
+        # pre-computed flag (no inline NCCL) and uses the cached
+        # payload tuple instead of re-reading from ``src_sd``.
+        #
+        # Memory cost is essentially zero: ``per_param_payload`` stores
+        # tuples of references into ``src_sd`` (already allocated) plus
+        # the dequantised ``vals_f32`` list (which previously also
+        # lived in ``vals_f32_cache`` for the clipping pre-pass --
+        # we're just holding it slightly longer). The full dense
+        # ``full_grad_src`` is still built one-at-a-time and freed
+        # after distribute_tensor / dist.broadcast, just like pre-P3A.
+        named_params = list(model.named_parameters())
+        n_params = len(named_params)
+
+        per_param_has_update: list[int] = [0] * n_params
+        per_param_payload: list[tuple | None] = [None] * n_params
+        per_param_is_tq: list[bool] = [False] * n_params
+
+        # Pass 1 (master only): per-param payload lookup. Non-master
+        # ranks idle here -- they get the flags via the single
+        # broadcast below. Folded into ``decode_seconds`` because pre-
+        # P3A the equivalent lookup also lived inside the
+        # decode-timed span of each per-param iteration.
+        _p3a_lookup_t0 = time.perf_counter()
+        if on_src and src_sd is not None:
+            for _i, (_name, _p_unused) in enumerate(named_params):
+                _cname = canon_map.get(_name, _name)
+                if _cname is None:
+                    continue
+
+                # FU1 TurboQuant check FIRST -- mirrors pre-P3A inline
+                # logic at the same call site. A TurboQuant-encoded
+                # param has no idxs/vals/quant_params entries so the
+                # legacy branch would silently drop the param
+                # regardless; explicit dispatch is clearer and keeps
+                # the ``has_update`` flag correct.
+                _tq_idxs = src_sd.get(_cname + "tq_idxs")
+                if _tq_idxs is not None:
+                    _tq_codes = src_sd.get(_cname + "tq_codes")
+                    _tq_metas = src_sd.get(_cname + "tq_meta")
+                    if _tq_codes is not None and _tq_metas is not None:
+                        if not isinstance(_tq_idxs, (list, tuple)):
+                            _tq_idxs = [_tq_idxs]
+                        if not isinstance(_tq_codes, (list, tuple)):
+                            _tq_codes = [_tq_codes]
+                        if not isinstance(_tq_metas, (list, tuple)):
+                            _tq_metas = [_tq_metas]
+                        if (
+                            len(_tq_idxs) == len(_tq_codes) == len(_tq_metas)
+                            and len(_tq_idxs) > 0
+                        ):
+                            per_param_payload[_i] = (
+                                _tq_idxs,
+                                _tq_codes,
+                                _tq_metas,
+                            )
+                            per_param_is_tq[_i] = True
+                            per_param_has_update[_i] = 1
+                            continue
+
+                # Legacy top-K branch
+                _idxs = src_sd.get(_cname + "idxs")
+                _vals = src_sd.get(_cname + "vals")
+                _qps = src_sd.get(_cname + "quant_params")
+                if _idxs is not None and _vals is not None:
+                    if not isinstance(_idxs, (list, tuple)):
+                        _idxs = [_idxs]
+                    if not isinstance(_vals, (list, tuple)):
+                        _vals = [_vals]
+                    # Reuse the dequantised list from the clipping
+                    # pre-pass if it ran; otherwise dequantise here.
+                    # Saves one dequant per param when clipping is on.
+                    _vals_f32 = vals_f32_cache.pop(_cname, None)
+                    if _vals_f32 is None:
+                        _vals_f32 = compressor.maybe_dequantize_values(
+                            _vals, _qps, device
+                        )
+                    if _vals_f32:
+                        _idxs_dev = _idx_to_device(_idxs, device)
+                        per_param_payload[_i] = (_idxs_dev, _vals_f32)
+                        per_param_has_update[_i] = 1
+        outer_step_timings["decode_seconds"] += (
+            time.perf_counter() - _p3a_lookup_t0
+        )
+
+        # Single batched broadcast of every per-param ``has_update``
+        # flag in one int32 tensor. Mirrors the pre-P3A
+        # ``_bcast_flag(has_update)`` semantics (no-op on single GPU,
+        # one ``dist.broadcast`` in DDP mode) but pays the launch cost
+        # exactly once instead of n_params times.
+        _p3a_bcast_t0 = time.perf_counter()
+        if ddp:
+            _flags_tensor = torch.tensor(
+                per_param_has_update, device=device, dtype=torch.int32
+            )
+            dist.broadcast(_flags_tensor, src_rank)
+            per_param_has_update = _flags_tensor.cpu().tolist()
+        outer_step_timings["decode_seconds"] += (
+            time.perf_counter() - _p3a_bcast_t0
+        )
+
+        for _i, (name, p) in enumerate(named_params):
             cname = canon_map.get(name, name)
 
-            # ---- master decides if this param has an update; others receive a flag ----
-            # Decode phase: master idxs/vals lookup + dequant + sparse->dense
-            # decompress + IDCT + clip_scale + per-param fingerprint stats.
-            # The ``_bcast_flag`` cross-rank sync is folded in here because
-            # it's a tiny int broadcast and lives between lookup and decode.
+            # ---- has_update + payload come from the P3A pre-pass above ----
+            # The inline ``_bcast_flag(has_update)`` cross-rank sync
+            # was hoisted out of this loop; we just read the
+            # pre-computed flag here. ``payload`` and ``is_tq_payload``
+            # are populated only on master (the rank that ran the
+            # pre-pass lookup); non-master ranks receive the flag and
+            # then participate in the per-param ``distribute_tensor``
+            # / ``dist.broadcast`` collective in the merge phase.
             _decode_t0 = time.perf_counter()
 
-            has_update = 0
-            payload = None
-            # FU1 (P6b): flag set when the payload originated from the
-            # TurboQuant miner branch. Selects the
-            # ``batch_decompress_turboquant`` decode below instead of the
-            # legacy ``transformer.decode ∘ compressor.batch_decompress``
-            # chain. Mutually exclusive with the legacy idxs/vals path
-            # per ``prepare_gradient_dict``'s TurboQuant branch (the
-            # miner either populates tq_* OR idxs/vals/quant_params for
-            # a given cname, never both).
-            is_tq_payload = False
-
-            if on_src and src_sd is not None and cname is not None:
-                # FU1 TurboQuant check FIRST — when the hparam is flipped
-                # on and a miner ships tq_* keys, skip the legacy lookup
-                # entirely. A TurboQuant-encoded param has no
-                # idxs/vals/quant_params entries so the legacy branch
-                # would silently drop the param regardless; explicit
-                # dispatch is clearer and keeps the has_update flag
-                # correct for the cross-rank broadcast sync.
-                tq_idxs = src_sd.get(cname + "tq_idxs")
-                if tq_idxs is not None:
-                    tq_codes = src_sd.get(cname + "tq_codes")
-                    tq_metas = src_sd.get(cname + "tq_meta")
-                    if tq_codes is not None and tq_metas is not None:
-                        if not isinstance(tq_idxs, (list, tuple)):
-                            tq_idxs = [tq_idxs]
-                        if not isinstance(tq_codes, (list, tuple)):
-                            tq_codes = [tq_codes]
-                        if not isinstance(tq_metas, (list, tuple)):
-                            tq_metas = [tq_metas]
-                        if (
-                            len(tq_idxs) == len(tq_codes) == len(tq_metas)
-                            and len(tq_idxs) > 0
-                        ):
-                            payload = (tq_idxs, tq_codes, tq_metas)
-                            is_tq_payload = True
-                            has_update = 1
-
-                if not is_tq_payload:
-                    idxs = src_sd.get(cname + "idxs")
-                    vals = src_sd.get(cname + "vals")
-                    qps = src_sd.get(cname + "quant_params")
-
-                    if idxs is not None and vals is not None:
-                        if not isinstance(idxs, (list, tuple)):
-                            idxs = [idxs]
-                        if not isinstance(vals, (list, tuple)):
-                            vals = [vals]
-                        # Reuse the dequantised list from the clipping pre-pass
-                        # if it ran; otherwise dequantise here. This keeps the
-                        # work identical when ``max_grad_norm`` is None (the
-                        # cache is empty) and saves one dequant per param when
-                        # clipping is on.
-                        vals_f32 = vals_f32_cache.pop(cname, None)
-                        if vals_f32 is None:
-                            vals_f32 = compressor.maybe_dequantize_values(
-                                vals, qps, device
-                            )
-                        if vals_f32:
-                            # Ensure indices (or packed tuples) live on the same device as 'ref'
-                            idxs_dev = _idx_to_device(idxs, device)
-                            payload = (idxs_dev, vals_f32)
-                            has_update = 1
-
-            flag_result = _bcast_flag(has_update)
-            if flag_result == 0:
-                # Nothing to apply for this param; the bcast_flag is the
-                # only work this iter contributed to decode.
-                outer_step_timings["decode_seconds"] += (
-                    time.perf_counter() - _decode_t0
-                )
+            has_update = per_param_has_update[_i]
+            if has_update == 0:
+                # Nothing to apply for this param; nothing more to
+                # accumulate into decode_seconds either (the lookup +
+                # broadcast time was already folded in pre-loop).
                 continue
+
+            payload = per_param_payload[_i] if on_src else None
+            is_tq_payload = per_param_is_tq[_i] if on_src else False
 
             full_grad_src = torch.empty(1)
             decompressed = None
