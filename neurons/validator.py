@@ -36,6 +36,7 @@ from typing import Deque, cast
 
 import bittensor as bt
 import numpy as np
+import websockets.exceptions
 
 # Third party
 import torch
@@ -1273,6 +1274,74 @@ class Validator(BaseNode, Trainer):
                 self.weights[self.burn_uid] = burn_rate
         elif self.burn_uid is not None and burn_rate > 0:
             self.weights[self.burn_uid] = 1.0
+
+    async def _set_weights_with_retry(
+        self,
+        *,
+        wallet: bt.Wallet,
+        netuid: int,
+        uids: list[int],
+        weights,
+        max_attempts: int = 3,
+    ):
+        """Wrap ``subtensor.set_weights`` with bounded retry on transient
+        websocket recv races.
+
+        The bittensor sync substrate (``self.comms.subtensor.substrate``)
+        is shared between this main-loop call and the worker-thread
+        ``metagraph.sync`` inside
+        ``ChainManager._fetch_commitments_periodically``
+        (``hone/src/hone/chain.py:269``, dispatched via
+        ``asyncio.to_thread``). When both threads call ``ws.recv``
+        concurrently, ``websockets.sync`` raises ``ConcurrencyError``.
+        Pre-fix (2026-05-03 04:39 UTC incident) this crashed rank 0 →
+        30-min NCCL ALLREDUCE stall on ranks 1-3 → SIGABRT → pm2
+        restart. The race resolves in milliseconds, so a 1s/2s/4s
+        backoff typically lands on a free slot.
+
+        Returns the bittensor ``ExtrinsicResponse`` on success, or
+        ``None`` if every attempt raced. ``None`` is intentional: the
+        caller does not capture it, and missing one weight-set window
+        is far cheaper than crashing rank 0.
+        """
+        last_error: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                return self.comms.subtensor.set_weights(
+                    wallet=wallet,
+                    netuid=netuid,
+                    uids=uids,
+                    weights=weights,
+                    wait_for_inclusion=False,
+                    wait_for_finalization=False,
+                )
+            except websockets.exceptions.ConcurrencyError as e:
+                last_error = e
+                wait_s = 2**attempt
+                hone.log_with_context(
+                    level="warning",
+                    message=(
+                        f"[set_weights] ConcurrencyError "
+                        f"(attempt {attempt + 1}/{max_attempts}), "
+                        f"retrying in {wait_s}s: {e!r}"
+                    ),
+                    sync_window=self.sync_window,
+                    current_window=self.current_window,
+                )
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(wait_s)
+
+        hone.log_with_context(
+            level="error",
+            message=(
+                f"[set_weights] ConcurrencyError persisted after "
+                f"{max_attempts} attempts; skipping this window's "
+                f"weight update: {last_error!r}"
+            ),
+            sync_window=self.sync_window,
+            current_window=self.current_window,
+        )
+        return None
 
     async def run(self):
         # Start background block listener
@@ -3431,13 +3500,11 @@ class Validator(BaseNode, Trainer):
                     positive_weighted_uids.append(self.burn_uid)
                     positive_weighted_uids.sort()
                 if positive_weighted_uids and self.is_master:
-                    self.comms.subtensor.set_weights(
+                    await self._set_weights_with_retry(
                         wallet=self.wallet,
                         netuid=cast(int, self.config.netuid),
                         uids=positive_weighted_uids,
                         weights=self.weights[positive_weighted_uids],
-                        wait_for_inclusion=False,
-                        wait_for_finalization=False,
                     )
 
             # Add barrier before model update to ensure all ranks are ready
