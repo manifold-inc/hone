@@ -3328,26 +3328,44 @@ class Comms(ChainManager):
             # ``gradient-{w}-{uid}-stage{N}-vX.pt`` uploads in one call,
             # so PP miners (which never write the legacy filename) are
             # correctly counted as active.
+            #
+            # Rollout 3 hotfix (2026-05-03): under ``fragmented_uploads:
+            # true`` miners write ``gradient-frag{NN}-{w}-{uid}-vX.pt``
+            # instead of ``gradient-{w}-{uid}-vX.pt``. The legacy prefix
+            # above cannot match fragmented keys — once the legacy
+            # pre-flip blobs age out of the ``recent_windows`` lookback
+            # the activity check returns False for every peer on the new
+            # code, ``active_peers`` empties, ``eval_peers`` empties,
+            # and outer-steps freeze silently. Probing BOTH prefixes per
+            # window makes the check tolerant of mixed fleets: legacy
+            # miners match ``gradient-{w}-{uid}-``; fragmented miners
+            # match ``gradient-frag00-{w}-{uid}-`` (fragment 00 is
+            # always written when ``num_fragments >= 1``). Any match in
+            # any window returns True, so a single successful upload in
+            # the lookback keeps the peer counted active.
             for window in range(current_window - recent_windows, current_window + 1):
-                prefix = f"gradient-{window}-{uid}-"
-                hone.logger.debug(
-                    f"Listing {prefix}* in {peer_bucket.name}"
-                )
-                try:
-                    resp = await s3_client.list_objects_v2(
-                        Bucket=peer_bucket.name, Prefix=prefix, MaxKeys=1
+                for prefix in (
+                    f"gradient-{window}-{uid}-",
+                    f"gradient-frag00-{window}-{uid}-",
+                ):
+                    hone.logger.debug(
+                        f"Listing {prefix}* in {peer_bucket.name}"
                     )
-                    if resp.get("KeyCount", 0) > 0:
-                        hone.logger.debug(
-                            f"Found {resp['Contents'][0]['Key']} for UID {uid}"
+                    try:
+                        resp = await s3_client.list_objects_v2(
+                            Bucket=peer_bucket.name, Prefix=prefix, MaxKeys=1
                         )
-                        return True
-                    hone.logger.debug(f"No {prefix}* in {peer_bucket.name}")
-                except botocore.exceptions.ClientError as e:
-                    if e.response["Error"]["Code"] not in ["404", "403", "401"]:
-                        hone.logger.error(f"Error checking activity for {uid}: {e}")
-                        return False
-                    hone.logger.debug(f"{prefix}* list error for UID {uid}")
+                        if resp.get("KeyCount", 0) > 0:
+                            hone.logger.debug(
+                                f"Found {resp['Contents'][0]['Key']} for UID {uid}"
+                            )
+                            return True
+                        hone.logger.debug(f"No {prefix}* in {peer_bucket.name}")
+                    except botocore.exceptions.ClientError as e:
+                        if e.response["Error"]["Code"] not in ["404", "403", "401"]:
+                            hone.logger.error(f"Error checking activity for {uid}: {e}")
+                            return False
+                        hone.logger.debug(f"{prefix}* list error for UID {uid}")
 
         except (ConnectionClosedError, ClientError):
             await self._purge_s3_client(peer_bucket)
