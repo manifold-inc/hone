@@ -931,37 +931,29 @@ class Miner(BaseNode, Trainer):
                         processed_state_dict, num_buckets=num_fragments
                     )
 
-                    # Code-golf (2026-05-03): the serial ``for await`` here
-                    # was 0.0% overlap across all 4 miners and burned
-                    # ~1400s/window. Converting to ``asyncio.gather`` opens
-                    # 24 concurrent TCP streams to R2, so max-tail
-                    # replaces sum-of-tails. Identical per-fragment
-                    # semantics: every PUT still happens, still uses the
-                    # same per-fragment key (gather/catchup paths on the
-                    # validator side discriminate via the ``-frag{NN}``
-                    # suffix and fan out 24× more GETs), still the same
-                    # ``comms.put`` retry+error policy. Only the ordering
-                    # is relaxed.
-                    async def _put_one(frag_idx: int, bucket: dict) -> int:
+                    # Revert (2026-05-03): the asyncio.gather variant
+                    # opened 24 concurrent TCP streams to R2 expecting
+                    # max-of-tails wins, but the actual bottleneck is
+                    # per-miner upload bandwidth, not connection
+                    # parallelism. Bandwidth-shared across 24 streams
+                    # made each fragment 5-10x slower (30-80s -> 250-500s)
+                    # and total upload 50-100% slower (~20min -> ~30+min),
+                    # blowing through the validator's 70s gather window
+                    # on every peer. Restoring serial PUTs here. A
+                    # bounded-concurrency variant (Semaphore(N) for small
+                    # N) can be re-attempted once R2 per-connection
+                    # throughput is properly measured.
+                    for i, b in enumerate(buckets):
                         await self.comms.put(
-                            state_dict=bucket,
+                            state_dict=b,
                             uid=str(self.uid),
                             window=step_window,
-                            key=f"gradient-frag{frag_idx:02d}",
+                            key=f"gradient-frag{i:02d}",
                             global_step=self.global_step,
                             local=False,
                             stale_retention=100,
                         )
-                        return _estimate_bucket_bytes(bucket)
-
-                    fragment_byte_counts.extend(
-                        await asyncio.gather(
-                            *(
-                                _put_one(i, b)
-                                for i, b in enumerate(buckets)
-                            )
-                        )
-                    )
+                        fragment_byte_counts.append(_estimate_bucket_bytes(b))
                 else:
                     await self.comms.put(
                         state_dict=processed_state_dict,
