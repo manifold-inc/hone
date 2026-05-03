@@ -2692,6 +2692,17 @@ async def check_uid_index_overlap(
         if vals_all is None:
             continue
 
+        # P0b (Rollout 2 fix, 2026-05-02): when senders opt into
+        # ``pack_values_2bit``, ``vals`` is bit-packed 4× along the
+        # last dim so ``val_data.shape`` is NOT the right input to
+        # ``unpack_12bit_indices``. The original last dim lives in
+        # ``qparams[6]`` of the 7-tuple ``PACK_VERSION_2BIT`` form;
+        # fall back to ``val_data.shape`` for legacy 5-tuple qparams
+        # or when no qparams travels alongside. Mirrors
+        # ``Comms.check_compressed_indices`` exactly.
+        qparams_key = cname + "quant_params"
+        qparams_all = getattr(gather_result.state_dict, qparams_key, None)
+
         contributor_uids = uids_per_param.get(idx_key)
         if contributor_uids is None:
             # Legacy gather pre-P1 didn't populate ``uids_per_param``.
@@ -2711,15 +2722,33 @@ async def check_uid_index_overlap(
         if n_contributors < 2:
             continue
 
-        # Unpack all 12-bit packed indices using values shape
+        # Unpack all 12-bit packed indices using per-peer qparams
+        # to recover the correct (pre-2-bit-pack) values shape.
         unpacked_indices = []
         for i in range(n_contributors):
             idx_data = idxs_all[i] if isinstance(idxs_all, list) else idxs_all
             val_data = vals_all[i] if isinstance(vals_all, list) else vals_all
+            qp_data = (
+                qparams_all[i]
+                if isinstance(qparams_all, list)
+                else qparams_all
+            )
 
-            # 12-bit packed format - use values shape for unpacking
+            # P0b: prefer the 7-tuple's ``original_last_dim`` when the
+            # sender packed values as 2-bit. Legacy 5-tuple or
+            # missing qparams → trust the wire last dim (pre-rollout
+            # behaviour is preserved exactly).
+            if (
+                isinstance(qp_data, tuple)
+                and len(qp_data) >= 7
+                and int(qp_data[5]) == 1  # PACK_VERSION_2BIT
+            ):
+                values_shape = (*val_data.shape[:-1], int(qp_data[6]))
+            else:
+                values_shape = val_data.shape
+
             unpacked = unpack_12bit_indices(
-                idx_data.to(neuron.config.device), val_data.shape
+                idx_data.to(neuron.config.device), values_shape
             )
             unpacked_indices.append(unpacked)
 

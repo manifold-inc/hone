@@ -1337,10 +1337,47 @@ def _run_self_tests() -> None:  # pragma: no cover - exercised via __main__
         f"(legacy={legacy_bytes}B, packed={packed_bytes}B)"
     )
 
+    # --- (6) check_compressed_indices shape derivation under 2-bit ----
+    # Regression for Rollout 2 (2026-05-02): if a downstream caller
+    # forgets to pass ``qparams`` to ``check_compressed_indices`` the
+    # packed wire ``vals.shape[-1]`` is 4× too small and the 12-bit
+    # unpacker raises "expanded size ... must match existing size ..."
+    # with EXACTLY a 4× ratio. This catches any future regression of
+    # either the qparams plumbing or the shape-derivation math.
+    assert qp_p[5] == PACK_VERSION_2BIT and len(qp_p) == 7, (
+        "compress() did not produce a 7-tuple under pack_values_2bit=True"
+    )
+
+    # WITHOUT qparams override: indices_shape would come from packed
+    # vals last dim → 4× too small → unpack throws. Asserting the
+    # throw guards both directions of the bug (a future change that
+    # silently accepts the wrong shape would ALSO be wrong).
+    wrong_shape = val_p.shape
+    try:
+        unpack_12bit_indices(idx_p, wrong_shape)
+    except RuntimeError as e:
+        _msg = str(e)
+        assert "expanded size" in _msg or "must match" in _msg, _msg
+    else:  # pragma: no cover
+        raise AssertionError(
+            "Expected unpack_12bit_indices to fail with packed-vals shape; "
+            "got success. Either pack_2bit_values no longer shrinks the last "
+            "dim, or the 12-bit unpacker silently accepts mismatched shapes "
+            "-- both mask the Rollout 2 bug."
+        )
+
+    # WITH qparams[6] override: indices_shape is the ORIGINAL last dim,
+    # unpack succeeds, shape matches the legacy-path unpacked shape.
+    correct_shape = (*val_p.shape[:-1], int(qp_p[6]))
+    unpacked_ok = unpack_12bit_indices(idx_p, correct_shape)
+    assert unpacked_ok.shape[-1] == int(qp_p[6])
+    assert unpacked_ok.shape[:-1] == val_p.shape[:-1]
+
     print(
         "[hone.compress] self-tests passed: pack_2bit_values round-trips, "
         f"end-to-end shrinks values {legacy_bytes}B -> {packed_bytes}B "
-        f"({ratio:.1%} of legacy)"
+        f"({ratio:.1%} of legacy); check_compressed_indices qparams "
+        "plumbing regression covered."
     )
 
 

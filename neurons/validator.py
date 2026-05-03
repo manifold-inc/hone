@@ -4938,13 +4938,22 @@ class Validator(BaseNode, Trainer):
                         f"Invalid gradient data from peer {eval_uid}: Missing totalk for parameter {cname}"
                     )
 
-                # Check compressed indices are valid
+                # Check compressed indices are valid. Pass ``qparams``
+                # so ``check_compressed_indices`` can read
+                # ``original_last_dim`` from the 7-tuple under
+                # ``PACK_VERSION_2BIT`` — without it the unpacker
+                # derives ``indices_shape`` from the 4×-smaller packed
+                # wire vals and raises "expanded size ... must match
+                # existing size ..." for every ``pack_values_2bit: true``
+                # peer, causing blanket slashing and a dashboard
+                # loss=0 cascade (Rollout 2 incident, 2026-05-02).
                 self.comms.check_compressed_indices(
                     idxs_key,
                     idxs,
                     self.totalks[cname],
                     allowed_topk=self.hparams.topk_compression,
                     vals=vals,
+                    qparams=quant_params,
                 )
 
                 # Check for NaN or Inf values
