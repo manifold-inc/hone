@@ -1718,16 +1718,6 @@ class Validator(BaseNode, Trainer):
                         current_window=self.current_window,
                     )
                     skip_window = True
-                else:
-                    # P1: surface per-fragment download sizes for the
-                    # ``upload_bytes_per_fragment_p50/_max`` dashboard tile.
-                    # Legacy single-blob gather returns ``[]`` here, in
-                    # which case the percentile block downstream emits
-                    # ``None`` for both fields (preserving the pre-P1
-                    # contract).
-                    fragment_byte_counts = list(
-                        getattr(gather_result, "fragment_byte_counts", [])
-                    )
 
             # Broadcast decision to skip window from master to all ranks
             skip_tensor = torch.tensor(
@@ -2375,11 +2365,23 @@ class Validator(BaseNode, Trainer):
                 # the percentiles when calling ``report_window``.
                 uid_eval_times: list[float] = []
                 # P1: per-fragment upload byte counts surfaced by the streaming
-                # gather path. Empty when ``fragmented_uploads=false`` (legacy
-                # path returns ``[]``); the percentile block below tolerates
-                # that and emits ``None`` for both fields. Populated below from
-                # ``gather_result.fragment_byte_counts`` once gather completes.
-                fragment_byte_counts: list[int] = []
+                # gather path. Validator-side GET payload sizes are byte-exact
+                # mirrors of the miner's per-fragment PUT bytes (R2 echoes
+                # back exactly what was uploaded), so this is the canonical
+                # signal for the ``upload_bytes_per_fragment_p50/_max``
+                # dashboard tile. Empty when ``fragmented_uploads=false``
+                # (legacy single-blob gather returns ``[]``); the percentile
+                # block below tolerates that and emits ``None`` for both
+                # fields. Only master sees a real ``gather_result`` —
+                # non-master ranks always get ``[]`` here so the downstream
+                # code stays rank-agnostic. Populated AT this point (not at
+                # the earlier gather block) so the eval-loop reset for
+                # other per-window locals doesn't accidentally shadow it.
+                fragment_byte_counts: list[int] = (
+                    list(getattr(gather_result, "fragment_byte_counts", []))
+                    if self.is_master and gather_result is not None
+                    else []
+                )
                 # Use CPU offloading instead of deepcopy to save memory
                 offload_start = hone.T()
                 save_ok_local = True
@@ -3930,9 +3932,11 @@ class Validator(BaseNode, Trainer):
                 else:
                     eval_p50 = eval_p95 = eval_max = None
 
-                # Per-fragment upload sizes — empty until P1 wires
-                # ``prepare_gradient_buckets`` into the gather path. The
-                # stub stays so the reporter call site doesn't change in P1.
+                # Per-fragment upload sizes. Empty list when fragmentation
+                # is off (``fragmented_uploads=false``) or when this rank is
+                # non-master; in either case both fields are reported as
+                # ``None`` so the dashboard tile renders ``—`` instead of
+                # a misleading ``0``.
                 if fragment_byte_counts:
                     frag_p50: int | None = int(
                         np.percentile(fragment_byte_counts, 50)
@@ -4700,15 +4704,152 @@ class Validator(BaseNode, Trainer):
         time_min,
         time_max,
     ):
-        """Fetch a single peer's gradient for per-UID evaluation."""
-        return await self.comms.get(
-            uid=str(eval_uid),
-            window=window,
-            key="gradient",
-            local=False,
-            stale_retention=10,
-            time_min=time_min,
-            time_max=time_max,
+        """Fetch a single peer's gradient for per-UID evaluation.
+
+        Rollout 3 blocker fix (2026-05-02): under ``fragmented_uploads:
+        true`` the miner writes 24 per-fragment blobs instead of a
+        single ``gradient`` blob. This method branches on the hparam
+        and composes the fragments back into one CommsGetResult so the
+        eval-path downstream can keep treating the payload as a
+        monolithic state_dict.
+
+        Rollout-safety net: if ``fragmented_uploads=true`` but the peer
+        hasn't restarted on the new code yet (mixed-fleet window), ALL
+        24 fragment fetches return ``NOT_FOUND``. Before slashing, we
+        fall back ONCE to a legacy ``gradient`` fetch. Trades a single
+        extra R2 GET per legacy-straggler per window for survivability
+        against non-atomic fleet upgrades. Removed once the fleet is
+        100% on the new code.
+        """
+        if not bool(getattr(self.hparams, "fragmented_uploads", False)):
+            # Legacy single-blob path (unchanged).
+            return await self.comms.get(
+                uid=str(eval_uid),
+                window=window,
+                key="gradient",
+                local=False,
+                stale_retention=10,
+                time_min=time_min,
+                time_max=time_max,
+            )
+
+        # Fragmented path: fetch N fragments concurrently, compose them.
+        from hone.schemas import CommsGetResult
+
+        num_fragments = int(getattr(self.hparams, "num_fragments", 24))
+        tasks = [
+            self.comms.get(
+                uid=str(eval_uid),
+                window=window,
+                key=f"gradient-frag{frag_idx:02d}",
+                local=False,
+                stale_retention=10,
+                time_min=time_min,
+                time_max=time_max,
+            )
+            for frag_idx in range(num_fragments)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        ok_fragments: list[CommsGetResult] = []
+        not_found_count = 0
+        first_non_ok: CommsGetResult | None = None
+        first_exception: BaseException | None = None
+        for r in results:
+            if isinstance(r, BaseException):
+                first_exception = first_exception or r
+                continue
+            if not isinstance(r, CommsGetResult):
+                first_exception = first_exception or RuntimeError(
+                    f"unexpected fetch return type: {type(r).__name__}"
+                )
+                continue
+            if r.status == "NOT_FOUND":
+                not_found_count += 1
+            elif r.success:
+                ok_fragments.append(r)
+            else:
+                # TOO_EARLY / TOO_LATE / ERROR → propagate first non-OK
+                # so the caller treats this peer the same as legacy.
+                first_non_ok = first_non_ok or r
+
+        if first_non_ok is not None:
+            return first_non_ok
+
+        if first_exception is not None:
+            # Validator-side transient (network/deser); raise so the
+            # caller's try/except marks it invalid WITHOUT slashing.
+            raise first_exception
+
+        if not_found_count == num_fragments:
+            # All fragments missing — might be a legacy miner that
+            # hasn't upgraded yet. Try the legacy key once before
+            # slashing; if THAT is also missing, the peer is truly
+            # absent.
+            legacy = await self.comms.get(
+                uid=str(eval_uid),
+                window=window,
+                key="gradient",
+                local=False,
+                stale_retention=10,
+                time_min=time_min,
+                time_max=time_max,
+            )
+            if legacy.success:
+                hone.logger.info(
+                    f"[_fetch_peer_gradient] uid={eval_uid} served by legacy "
+                    f"'gradient' key (fleet-upgrade in progress)"
+                )
+            return legacy
+
+        if not_found_count > 0:
+            # Partial upload — raise as transient so we don't slash an
+            # honest peer whose fragment N hit a server-side error.
+            raise RuntimeError(
+                f"partial fragments for uid {eval_uid}: "
+                f"{not_found_count}/{num_fragments} missing"
+            )
+
+        # All fragments present and OK — compose into one dict.
+        import json
+
+        composed_data: dict = {}
+        metadata_votes: dict[str, tuple[int, dict]] = {}
+        first_global_step: int | None = None
+        for frag in ok_fragments:
+            if first_global_step is None:
+                first_global_step = frag.global_step
+            assert frag.data is not None
+            for k, v in frag.data.items():
+                if k == "metadata":
+                    continue
+                composed_data[k] = v
+            meta = frag.data.get("metadata")
+            if isinstance(meta, dict):
+                try:
+                    canon = json.dumps(meta, sort_keys=True, default=str)
+                except (TypeError, ValueError):
+                    continue
+                if canon in metadata_votes:
+                    cnt, ref = metadata_votes[canon]
+                    metadata_votes[canon] = (cnt + 1, ref)
+                else:
+                    metadata_votes[canon] = (1, meta)
+
+        if metadata_votes:
+            if len(metadata_votes) > 1:
+                hone.logger.warning(
+                    f"[_fetch_peer_gradient] uid={eval_uid} fragments disagree "
+                    f"on metadata: {len(metadata_votes)} distinct dicts across "
+                    f"{num_fragments} fragments; using majority value"
+                )
+            best_meta = max(metadata_votes.values(), key=lambda t: t[0])[1]
+            composed_data["metadata"] = best_meta
+
+        return CommsGetResult(
+            data=composed_data,
+            global_step=first_global_step,
+            status="OK",
         )
 
     def slash_for_missing_gradient(self, eval_uid: int) -> None:

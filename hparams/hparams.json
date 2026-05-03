@@ -66,7 +66,7 @@
     "eval_single_forward": false,
     "count_sketch_buckets": 1024,
     "count_sketch_min_weight": 0.5,
-    "fragmented_uploads": false,
+    "fragmented_uploads": true,
     "num_fragments": 24,
     "token_weighted_aggregation": false,
     "rda_merge": false,
