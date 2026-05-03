@@ -373,9 +373,11 @@ class Validator(BaseNode, Trainer):
             hone.logger = hone.setup_loki_logger(
                 service="validator", uid=str(self.uid), version=version
             )
-            hone.logger.info(f"Loki logging enabled for validator UID: {self.uid}")
+            hone.logger.info(
+                f"Process logger initialized for validator UID: {self.uid}"
+            )
         except Exception as e:
-            hone.logger.warning(f"Failed to initialize Loki logging: {e}")
+            hone.logger.warning(f"Failed to initialize process logger: {e}")
 
         self.device = torch.device(self.config.device)
         hone.logger.info(f"[Init] device set → {self.device}")
@@ -3661,7 +3663,7 @@ class Validator(BaseNode, Trainer):
                     (mean_grad_norm / mean_weight_norm) if mean_weight_norm else 0.0
                 )
 
-                # Console / Loki
+                # Console
                 hone.log_with_context(
                     level="info",
                     message=(
@@ -5117,6 +5119,49 @@ class Validator(BaseNode, Trainer):
         canon_map = hone.canonical_param_names(model)
         for n, p in model.named_parameters():
             cname = canon_map.get(n, n)
+
+            # FU1 (Rollout 7 hotfix, 2026-05-03): TurboQuant payloads
+            # ship under ``cname+{"tq_idxs","tq_codes","tq_meta"}`` with
+            # NO legacy ``idxs/vals/quant_params`` for that param.
+            # Catch obvious malformations (NaN/Inf in the codebook
+            # codes) here so a bad TQ peer is slashed via the eval
+            # loop's existing ``validate_gradient_data`` try/except
+            # instead of hitting a deeper exception inside
+            # ``batch_decompress_turboquant``. The legacy 12-bit index
+            # check does not apply — TQ indices are 1-D raw int64
+            # (``turboquant.py:529``), not 12-bit packed.
+            tq_idxs = eval_state_dict.get(cname + "tq_idxs", None)
+            if tq_idxs is not None:
+                tq_codes = eval_state_dict.get(cname + "tq_codes", None)
+                if tq_codes is None:
+                    raise ValueError(
+                        f"Invalid gradient data from peer {eval_uid}: "
+                        f"TurboQuant payload missing tq_codes for {cname}"
+                    )
+                # codes are uint8 codebook indices — cast to float for
+                # the finiteness check to cover any future codebook
+                # format change; cheap because cache locality is tiny.
+                if (
+                    torch.isnan(tq_codes.float()).any()
+                    or torch.isinf(tq_codes.float()).any()
+                ):
+                    hone.log_with_context(
+                        level="warning",
+                        message=(
+                            f"TurboQuant codes contain NaN or Inf for "
+                            f"{cname + 'tq_codes'}, skipping peer {eval_uid}"
+                        ),
+                        sync_window=self.sync_window,
+                        current_window=self.current_window,
+                        eval_uid=eval_uid,
+                    )
+                    raise ValueError(
+                        f"Invalid gradient data from peer {eval_uid}: "
+                        f"NaN or Inf values in {cname + 'tq_codes'}"
+                    )
+                # Skip the legacy-path validation below for TQ params.
+                continue
+
             idxs_key = cname + "idxs"
             vals_key = cname + "vals"
             quant_key = cname + "quant_params"
@@ -5241,6 +5286,7 @@ class Validator(BaseNode, Trainer):
 
             full_grad_src = torch.empty(1, dtype=p.dtype, device=p.device)
             has_valid_gradient = True
+            is_tq_payload = False
 
             cname = canon_map.get(n, n)
 
@@ -5255,6 +5301,91 @@ class Validator(BaseNode, Trainer):
 
             # Build the full dense grad on the source rank only (or always in single GPU)
             if on_src and not use_cached:
+                # FU1 (Rollout 7 hotfix, 2026-05-03): TurboQuant branch
+                # FIRST — mirrors outer_step's per-param dispatch at
+                # ``neurons.py:1284-1335``. A TurboQuant-encoded peer
+                # ships ``cname+{"tq_idxs","tq_codes","tq_meta"}`` and
+                # NO legacy ``idxs/vals/quant_params`` for that param.
+                # Without this branch the legacy ``if vals is None or
+                # quant_params is None: has_valid_gradient=False`` at
+                # the clip_norm guard below raises ValueError for EVERY
+                # TQ peer evaluated → blanket slashing. The interaction-
+                # audit agent surfaced this as the single catastrophic
+                # blocker for flipping ``turboquant_enabled: true``.
+                tq_idxs = eval_state_dict.get(cname + "tq_idxs", None)
+                if tq_idxs is not None:
+                    tq_codes = eval_state_dict.get(cname + "tq_codes", None)
+                    tq_meta = eval_state_dict.get(cname + "tq_meta", None)
+                    if tq_codes is not None and tq_meta is not None:
+                        is_tq_payload = True
+                        try:
+                            # ``batch_decompress_turboquant`` takes
+                            # per-peer lists; eval scores one peer at a
+                            # time so wrap singletons. ``peer_weights
+                            # =None`` → uniform (single-peer path is
+                            # literally just the peer's own gradient).
+                            full_grad_src = (
+                                hone.turboquant.batch_decompress_turboquant(
+                                    p,
+                                    [tq_idxs.to(self.device)],
+                                    [tq_codes.to(self.device)],
+                                    [tq_meta],
+                                    peer_weights=None,
+                                )
+                            )
+                            full_grad_src = full_grad_src.to(
+                                dtype=p.dtype,
+                                device=p.device,
+                                non_blocking=True,
+                            )
+                            if full_grad_src.shape != p.shape:
+                                full_grad_src = full_grad_src.view(p.shape)
+
+                            if (
+                                torch.isnan(full_grad_src).any()
+                                or torch.isinf(full_grad_src).any()
+                            ):
+                                hone.log_with_context(
+                                    level="warning",
+                                    message=(
+                                        f"TurboQuant-decoded gradient for "
+                                        f"{n} contains NaN/Inf, skipping "
+                                        f"peer {eval_uid}"
+                                    ),
+                                    sync_window=self.sync_window,
+                                    current_window=self.current_window,
+                                    eval_uid=eval_uid,
+                                )
+                                del full_grad_src
+                                full_grad_src = torch.empty(
+                                    1, dtype=p.dtype, device=p.device
+                                )
+                                has_valid_gradient = False
+                            elif on_decompressed is not None:
+                                on_decompressed(cname, full_grad_src)
+                        except Exception as e:
+                            hone.log_with_context(
+                                level="error",
+                                message=(
+                                    f"Failed to TurboQuant-decode "
+                                    f"gradient for {n}: {e}"
+                                ),
+                                sync_window=self.sync_window,
+                                current_window=self.current_window,
+                                eval_uid=eval_uid,
+                            )
+                            has_valid_gradient = False
+                    else:
+                        # tq_idxs present but tq_codes or tq_meta
+                        # missing — malformed payload; slash.
+                        is_tq_payload = True
+                        has_valid_gradient = False
+
+            # Legacy top-K path (unchanged) — skipped entirely when TQ
+            # already handled this param. The ``use_cached`` path is
+            # codec-agnostic (reads ``grad_cache[cname]``) so this
+            # guard only covers the fresh-decode branch.
+            if on_src and not use_cached and not is_tq_payload:
                 idxs_key = cname + "idxs"
                 vals_key = cname + "vals"
                 quant_key = cname + "quant_params"

@@ -1,25 +1,11 @@
 """Logging utilities for Hone."""
 
-import json
 import logging
-import logging.handlers
-import os
-import socket
 import time
-import uuid
-from datetime import datetime
-from queue import Queue
-from typing import Final
 
 import bittensor as bt
-import logging_loki
 from rich.highlighter import NullHighlighter
 from rich.logging import RichHandler
-
-LOKI_URL: Final[str] = os.environ.get(
-    "LOKI_URL", "https://logs.tplr.ai/loki/api/v1/push"
-)
-TRACE_ID: Final[str] = str(uuid.uuid4())
 
 
 def T() -> float:
@@ -101,43 +87,30 @@ def setup_loki_logger(
     service: str,
     uid: str,
     version: str,
-    environment="finney",
-    url=LOKI_URL,
+    environment: str = "finney",
+    url: str | None = None,
 ) -> logging.Logger:
-    host = socket.gethostname()
-    pid = os.getpid()
-    tags = {
-        "service": service,
-        "host": host,
-        "pid": pid,
-        "environment": environment,
-        "version": version,
-        "uid": uid,
-        "trace_id": TRACE_ID,
-    }
+    """Return the process logger with ``log_with_context`` attached.
 
-    class StructuredLogFormatter(logging.Formatter):
-        def format(self, record: logging.LogRecord) -> str:
-            log_data = {
-                "timestamp": datetime.fromtimestamp(record.created).isoformat(),
-                "level": record.levelname,
-                "logger": record.name,
-                "message": record.getMessage(),
-                "host": host,
-                "pid": pid,
-                "service": service,
-                "environment": environment,
-                "version": version,
-                "uid": uid,
-                "trace_id": TRACE_ID,
-            }
-            if hasattr(record, "extra_data") and record.extra_data:
-                log_data.update(record.extra_data)
-            return json.dumps(log_data)
+    (historical name; Loki backend removed 2026-05-03. Kept for import
+    stability. Returns the process logger with ``log_with_context``
+    attached.)
 
-    def _log_with_context(logger, level, message, **context):
+    The ``service``, ``uid``, ``version``, ``environment`` and ``url``
+    parameters are accepted for backwards compatibility with callers
+    such as ``hone/neurons/validator.py`` that pass them positionally
+    or by keyword. They are intentionally unused: shipping logs to
+    ``logs.tplr.ai`` was retired after repeated Cloudflare 5xx upstream
+    failures, and the local ``RichHandler`` console output already
+    captures the full record stream that pm2 retains on disk.
+    """
+    del service, uid, version, environment, url
+
+    log = logging.getLogger("hone")
+
+    def _log_with_context(level: str, message: str, **context) -> None:
         record = logging.LogRecord(
-            name=logger.name,
+            name=log.name,
             level=getattr(logging, level.upper()),
             pathname=__file__,
             lineno=0,
@@ -146,56 +119,13 @@ def setup_loki_logger(
             exc_info=None,
         )
         record.extra_data = context
-        for handler in logger.handlers:
+        for handler in log.handlers:
             if record.levelno >= handler.level:
                 handler.handle(record)
 
-    try:
-        log = logging.getLogger("hone")
-        log_queue = Queue(-1)
-        queue_handler = logging.handlers.QueueHandler(log_queue)
-        listener = logging.handlers.QueueListener(
-            log_queue, respect_handler_level=True
-        )
-        loki_handler = logging_loki.LokiHandler(
-            url=url, tags=tags, auth=None, version="1"
-        )
-        listener.handlers = [loki_handler]
-        console_handler = RichHandler(
-            markup=True,
-            rich_tracebacks=True,
-            highlighter=NullHighlighter(),
-            show_level=False,
-            show_time=True,
-            show_path=False,
-        )
-        loki_handler.setFormatter(StructuredLogFormatter())
-        log.setLevel(logging.INFO)
-        log.handlers.clear()
-        listener.start()
-        log.addHandler(queue_handler)
-        log.addHandler(console_handler)
-        log.log_with_context = lambda level, message, **kwargs: _log_with_context(
-            log, level, message, **kwargs
-        )
-        log.propagate = False
-        log._listener = listener
-        return log
-    except Exception as e:
-        log = logging.getLogger("hone")
-        log.error(f"Failed to add Loki logging: {e}")
-        if not log.handlers:
-            log.addHandler(
-                RichHandler(
-                    markup=True,
-                    rich_tracebacks=True,
-                    highlighter=NullHighlighter(),
-                    show_level=False,
-                    show_time=True,
-                    show_path=False,
-                )
-            )
-        return log
+    log.log_with_context = _log_with_context
+    log.propagate = False
+    return log
 
 
 def log_with_context(level, message, **context):

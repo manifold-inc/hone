@@ -531,7 +531,7 @@ hone/
     ├── distributed.py             # NCCL / FSDP helpers
     ├── checkpoint.py              # Distributed checkpointing
     ├── neurons.py                 # outer_step, prepare_gradient_dict
-    ├── logging.py                 # Rich + Loki logging
+    ├── logging.py                 # Rich console logging
     └── muon/                      # Muon optimizer (Newton-Schulz)
 ```
 
