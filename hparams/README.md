@@ -68,6 +68,7 @@ before recommending a step-down.
 |---|---|---|
 | `pack_values_2bit` | P0b | Bit-pack n_bins=4 quantized values to true 2 bits on the wire (~1.4× wire reduction at parity). |
 | `fragmented_uploads` | P1 | Switch from monolithic upload to balanced bin-packed fragments (Decoupled DiLoCo §C). |
+| `fragment_upload_concurrency` | P1 | Cap on in-flight `gradient-frag*` PUTs per window. `1` = serial (today's default); `2-4` = bounded `asyncio.gather`. Setting too high (`>~4`) re-creates the 2026-05-03 chaos-mode bandwidth-contention regression where each fragment got 5-10× slower. |
 | `rda_merge` | P2a | Radial-Directional Averaging for non-embedding params during outer-step merge. |
 | `token_weighted_aggregation` | P2b | Weight peer gradients by their reported `c_tokens × c_tokens / c_steps` (requires `c_tokens_clamp_enabled = true`, which is default-on). |
 | `gather_min_quorum` (≥ 4) | P3 | Fire outer step at quorum K instead of waiting for all 20 peers; pair with `gather_safety_cap = 8`. |
@@ -91,6 +92,13 @@ plan section.
   fingerprint signal for P5b score weighting.
 - `num_fragments` — number of streaming-upload fragments when
   `fragmented_uploads = true`.
+- `fragment_upload_concurrency` — when `1` (default) fragment PUTs
+  are issued serially. When `>1`, an `asyncio.Semaphore(N)` caps the
+  in-flight stream count. R2 per-miner upload throughput is the
+  binding constraint, not connection latency, so values above ~4
+  typically degrade total wallclock. Validate against the live
+  per-fragment p50/p95 from the dashboard's "Per-fragment upload"
+  hint row before raising past 2.
 
 ## Out of scope here
 

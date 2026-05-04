@@ -931,29 +931,102 @@ class Miner(BaseNode, Trainer):
                         processed_state_dict, num_buckets=num_fragments
                     )
 
-                    # Revert (2026-05-03): the asyncio.gather variant
-                    # opened 24 concurrent TCP streams to R2 expecting
-                    # max-of-tails wins, but the actual bottleneck is
-                    # per-miner upload bandwidth, not connection
-                    # parallelism. Bandwidth-shared across 24 streams
-                    # made each fragment 5-10x slower (30-80s -> 250-500s)
-                    # and total upload 50-100% slower (~20min -> ~30+min),
-                    # blowing through the validator's 70s gather window
-                    # on every peer. Restoring serial PUTs here. A
-                    # bounded-concurrency variant (Semaphore(N) for small
-                    # N) can be re-attempted once R2 per-connection
-                    # throughput is properly measured.
-                    for i, b in enumerate(buckets):
-                        await self.comms.put(
-                            state_dict=b,
-                            uid=str(self.uid),
-                            window=step_window,
-                            key=f"gradient-frag{i:02d}",
-                            global_step=self.global_step,
-                            local=False,
-                            stale_retention=100,
+                    # Pre-compute per-bucket byte sizes BEFORE upload so
+                    # the accounting is independent of completion order
+                    # under the bounded-concurrency path below
+                    # (sem-gated ``asyncio.gather`` can finish PUTs out
+                    # of submission order; the serial fast-path
+                    # trivially preserves order, but we share one
+                    # accounting site for both).
+                    fragment_byte_counts = [
+                        _estimate_bucket_bytes(b) for b in buckets
+                    ]
+
+                    # Bounded concurrency for fragment PUTs.
+                    # ``fragment_upload_concurrency`` defaults to 1 —
+                    # bytewise identical to the legacy serial loop —
+                    # so flipping this hparam is the only thing that
+                    # changes behaviour. The safe default is the same
+                    # code path the validator's 70s gather budget has
+                    # been tuned against; bumping to 2-4 is the
+                    # recommended next step once R2 per-connection
+                    # throughput has been measured for the current
+                    # fleet.
+                    #
+                    # History (2026-05-03): an earlier chaos-mode
+                    # rollout (Patch 1A) replaced this loop with an
+                    # unbounded ``asyncio.gather`` over all 24
+                    # fragments, expecting max-of-tails wins from
+                    # parallel TCP streams. That regressed per-fragment
+                    # PUT time 5-10x (30-80s -> 250-500s) and total
+                    # upload wallclock ~20min -> ~30+min because
+                    # per-miner upload bandwidth — not connection
+                    # latency — is the binding constraint, and 24
+                    # streams each got a 1/24 starvation share.
+                    # Patch 1A was reverted. The Semaphore-gated path
+                    # below is the right shape: open enough streams to
+                    # keep the pipe full but not so many that each
+                    # gets a starvation share. Do NOT raise the
+                    # default past 1 without an A/B; do NOT remove
+                    # the bound and revive the gather-everything
+                    # variant.
+                    concurrency = max(
+                        1,
+                        int(
+                            getattr(
+                                self.hparams,
+                                "fragment_upload_concurrency",
+                                1,
+                            )
+                        ),
+                    )
+
+                    if concurrency == 1:
+                        # Fast path: serial — the legacy behaviour.
+                        # Avoids the Semaphore + gather overhead and
+                        # keeps a one-bucket-at-a-time stack trace for
+                        # debugging.
+                        for i, b in enumerate(buckets):
+                            await self.comms.put(
+                                state_dict=b,
+                                uid=str(self.uid),
+                                window=step_window,
+                                key=f"gradient-frag{i:02d}",
+                                global_step=self.global_step,
+                                local=False,
+                                stale_retention=100,
+                            )
+                    else:
+                        # Bounded-concurrency path. The Semaphore caps
+                        # in-flight S3 PUTs per miner; the rest queue
+                        # behind it. ``return_exceptions`` is the
+                        # default (False) so a failed fragment raises
+                        # exactly like the serial loop did. Per-key
+                        # temp files in /tmp/{uid} (see ``Comms.put``)
+                        # are unique per fragment so concurrent calls
+                        # do not collide. The Semaphore is created
+                        # here — inside the running async function —
+                        # so it binds to the current event loop.
+                        sem = asyncio.Semaphore(concurrency)
+
+                        async def _put_one(i: int, b: dict) -> None:
+                            async with sem:
+                                await self.comms.put(
+                                    state_dict=b,
+                                    uid=str(self.uid),
+                                    window=step_window,
+                                    key=f"gradient-frag{i:02d}",
+                                    global_step=self.global_step,
+                                    local=False,
+                                    stale_retention=100,
+                                )
+
+                        await asyncio.gather(
+                            *[
+                                _put_one(i, b)
+                                for i, b in enumerate(buckets)
+                            ]
                         )
-                        fragment_byte_counts.append(_estimate_bucket_bytes(b))
                 else:
                     await self.comms.put(
                         state_dict=processed_state_dict,
