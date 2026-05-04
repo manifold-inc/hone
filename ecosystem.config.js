@@ -95,7 +95,7 @@ console.error(
 // four share ``--wallet.name miner`` — single wallet, four hotkeys.
 const MINERS = [
   { hotkey: "default", cudaDevices: "0,1,2,3", masterPort: 29501 },
-  { hotkey: "1",       cudaDevices: "4,5,6,7", masterPort: 29502 },
+  { hotkey: "1",       cudaDevices: "4,5,6,7", masterPort: 29503 },
   // { hotkey: "2",       cudaDevices: "4,5", masterPort: 29503 },
   // { hotkey: "3",       cudaDevices: "6,7", masterPort: 29504 },
 ];
