@@ -36,14 +36,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from wandb.sdk.wandb_run import Run
 
 import hone
-from hone.compress import (
-    pack_1bit_values,
-    pack_2bit_values,
-    pack_3bit_values,
-    pack_4bit_values,
-    pack_12bit_indices,
-    unpack_12bit_indices,
-)
+from hone.compress import unpack_12bit_indices
 from hone.distributed import dist_helper
 
 if TYPE_CHECKING:
@@ -289,21 +282,22 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         )
 
         if use_turboquant:
-            # P6b dark-code path, v2 wire format
-            # (``hone/docs/turboquant.md`` "wire-format inflation
-            # incident", 2026-05-03). Hadamard-rotate the full d-dim
-            # flat EF, scalar-quantise every coord via the Beta-Lloyd-Max
-            # codebook, then chunk-then-pack: split the codes into
-            # ``target_chunk``-wide rows, take top-K-on-|code| per
-            # chunk, and pack indices as 12-bit (chunk-local in
-            # ``[0, target_chunk)``) plus codes at ``main_bits``. The
-            # chunk-then-pack rewrite drops the per-param wire budget
-            # from ~5.5d (raw int64 idxs + uint8 codes + uint8
-            # sign_bits) to ~1.06d (12-bit chunk-local idxs + N-bit
-            # packed codes + 1-bit packed sign_bits), restoring parity
-            # with the legacy 0.875d top-K path. ``turboquant_enabled``
-            # MUST stay false until the operator gating workflow in
-            # ``hone/docs/turboquant.md`` clears the audit + A/B gates.
+            # P6b dark-code path. Replaces the encode → compress →
+            # decompress → decode chain with:
+            #   1. Hadamard rotation on the FULL d-dim flat EF.
+            #   2. Beta-Lloyd-Max scalar quantisation of every coord.
+            #   3. Top-K **on the codebook indices** (NOT the float
+            #      values) — the load-bearing fix to the original P6
+            #      plan. Selecting on float values after rotation
+            #      breaks the Beta distribution the codebook assumes.
+            # The TurboQuant payload is written under ``cname + 'tq_*'``
+            # keys; the legacy ``cname + {'idxs','vals','quant_params'}``
+            # keys are deliberately NOT populated so a TurboQuant-
+            # unaware validator skips this param outright instead of
+            # mis-decoding it. Per the operator gating workflow in
+            # ``hone/docs/turboquant.md``, ``turboquant_enabled`` MUST
+            # remain false until both the matching validator-side
+            # decoder lands and the P6a + A/B gates pass.
             ef_flat = ef_for_codec.flatten()
             d_flat = int(ef_flat.numel())
             rotated = _turboquant.hadamard_rotate(ef_flat.unsqueeze(0)).squeeze(0)
@@ -314,119 +308,37 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                 mode=tq_mode,
                 outlier_top_k=tq_outlier_k,
             )
-            main_bits = int(tq_meta["main_bits"])
-
+            # Match the legacy budget so swapping codecs does not change
+            # wire size: the legacy path keeps roughly
+            # ``ef.numel() * topk / target_chunk`` coords (≈ 50% under
+            # the default 32/64 ratio).
             target_chunk = int(getattr(miner.hparams, "target_chunk", 64))
-            pad = (-d_flat) % target_chunk
-            if pad:
-                codes_padded = torch.cat(
-                    [
-                        tq_codes,
-                        torch.zeros(
-                            pad, dtype=torch.uint8, device=tq_codes.device
-                        ),
-                    ]
-                )
-            else:
-                codes_padded = tq_codes
-            num_chunks = codes_padded.numel() // target_chunk
-            chunked_codes = codes_padded.view(num_chunks, target_chunk)
+            tq_keep_count = max(1, (d_flat * topk) // max(target_chunk, 1))
+            tq_keep_count = min(tq_keep_count, d_flat)
+            # Top-K on |codes| — rotated coords whose code magnitude is
+            # largest carry the most reconstructed signal.
+            topk_idx = tq_codes.long().abs().topk(tq_keep_count).indices
 
-            # Per-chunk top-K on |code|. The legacy compressor budgets
-            # ``topk`` survivors per ``target_chunk`` chunk (32 of 64
-            # in production); we keep the same density semantics so
-            # the codec swap does not change wire size beyond the
-            # compaction the v2 packing layout provides.
-            k_per_chunk = min(int(topk), int(target_chunk))
-            if k_per_chunk % 2 != 0:
-                # 12-bit packing requires the FLATTENED count of indices
-                # to be even (``pack_12bit_indices`` rejects odd input).
-                # Bump up by 1 while staying inside [0, target_chunk];
-                # the cap protects against pathological hparam combos.
-                k_per_chunk = min(k_per_chunk + 1, int(target_chunk))
-            topk_idx_per_chunk = (
-                chunked_codes.long().abs().topk(k_per_chunk, dim=-1).indices
-            )
-
-            # Pack chunk-local indices as 12-bit (each is < target_chunk
-            # so trivially fits, regardless of d_flat).
-            tq_idxs_packed = pack_12bit_indices(topk_idx_per_chunk)
-
-            # Gather codes at the kept top-K and pack at main_bits.
-            # Production runs with b=4, prod mode → main_bits == 3.
-            # The other widths (1/2/4/8) are kept as a defensive
-            # dispatch for future hparam tweaks; the validator-side
-            # decoder does the matching unpack via the same dispatch
-            # in ``batch_decompress_turboquant``.
-            codes_at_topk = torch.gather(chunked_codes, -1, topk_idx_per_chunk)
-            if main_bits == 1:
-                tq_codes_packed = pack_1bit_values(codes_at_topk)
-            elif main_bits == 2:
-                tq_codes_packed = pack_2bit_values(codes_at_topk)
-            elif main_bits == 3:
-                tq_codes_packed = pack_3bit_values(codes_at_topk)
-            elif main_bits == 4:
-                tq_codes_packed = pack_4bit_values(codes_at_topk)
-            elif main_bits == 8:
-                tq_codes_packed = codes_at_topk.contiguous()
-            else:
-                raise ValueError(
-                    f"prepare_gradient_dict: unsupported turboquant "
-                    f"main_bits={main_bits}; expected one of {{1,2,3,4,8}}"
-                )
-
-            # Stamp chunk geometry onto the meta dict. The codec
-            # already populated version / d / b / main_bits / mode /
-            # centroids / sign_bits; these chunk fields are the
-            # encoder's responsibility because the codec works on
-            # full-d flat tensors and doesn't know about the chunk
-            # layout. ``batch_decompress_turboquant`` raises if any
-            # of the four are missing.
-            tq_meta["target_chunk"] = int(target_chunk)
-            tq_meta["num_chunks"] = int(num_chunks)
-            tq_meta["topk_per_chunk"] = int(k_per_chunk)
-            tq_meta["d_padded"] = int(num_chunks * target_chunk)
-
-            # Reconstruct global indices into the FULL d_flat-length
-            # rotated vector for the local EF residual update. Validator
-            # decoder reconstructs these the same way (chunk_id *
-            # target_chunk + local_idx); duplicating the math here keeps
-            # the encode-side EF accumulate consistent with the receiver
-            # side without forcing a round-trip through the codec.
-            chunk_offsets = (
-                torch.arange(
-                    num_chunks,
-                    device=topk_idx_per_chunk.device,
-                    dtype=torch.long,
-                )
-                * target_chunk
-            )
-            global_indices_flat = (
-                topk_idx_per_chunk + chunk_offsets.unsqueeze(-1)
-            ).flatten()
-            if pad:
-                # Trailing-padding indices (>= d_flat) must NOT touch
-                # the EF tensor: those bytes are zeros from the pad in
-                # ``codes_padded`` and writing them would corrupt the
-                # residual once we reshape back to ef_for_codec.shape.
-                # Mirrors the validator decoder's ``d_padded > d``
-                # filter in ``batch_decompress_turboquant``.
-                global_indices_flat = global_indices_flat[
-                    global_indices_flat < d_flat
-                ]
-
-            # Local reconstruction for EF accumulation. ``full_dequant``
-            # is over the FULL d_flat-length codes (not the padded
-            # view) so indexing with ``global_indices_flat`` (already
-            # filtered to < d_flat) is safe. We dequantise the full-d
-            # codes tensor before sparsifying because ``tq_meta``
-            # carries outlier indices in the full-d coordinate system;
-            # passing a subset would index outliers out-of-bounds.
+            # Reconstruct what the receiver would see (sparse rotated
+            # vector + inverse rotation) so the local EF accumulates
+            # the same residual the validator does. The WHT is its own
+            # inverse on power-of-two padded length, so the second
+            # ``hadamard_rotate`` call is the inverse rotation.
+            #
+            # We dequantize the FULL ``d_flat``-length codes tensor
+            # before sparsifying because ``tq_meta`` carries outlier
+            # indices in the full-d-space coordinate system; passing a
+            # subset of codes would index outliers out-of-bounds. This
+            # costs an O(d) lookup but keeps the codec API simple — the
+            # alternative (re-indexing tq_meta at the kept positions)
+            # would split the meta semantics into two flavours and
+            # complicate the validator-side decoder we owe in the
+            # follow-up PR.
             full_dequant = _turboquant.dequantize_turboquant(tq_codes, tq_meta)
             sparse_rotated = torch.zeros_like(rotated)
-            sparse_rotated[global_indices_flat] = full_dequant[
-                global_indices_flat
-            ].to(sparse_rotated.dtype)
+            sparse_rotated[topk_idx] = full_dequant[topk_idx].to(
+                sparse_rotated.dtype
+            )
             del full_dequant
             transmit_grad_flat = _turboquant.hadamard_rotate(
                 sparse_rotated.unsqueeze(0)
@@ -441,23 +353,13 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             miner.error_feedback[n] = error_feedback
             del transmit_grad, transmit_grad_flat, sparse_rotated, error_feedback
 
-            # Ship the v2 payload under TQ-prefixed keys:
-            #   * ``tq_idxs``  — uint8 12-bit packed chunk-local
-            #     indices (dense ``(num_chunks, topk_per_chunk)``
-            #     int64 in ``[0, target_chunk)``).
-            #   * ``tq_codes`` — uint8 ``main_bits``-packed codes at
-            #     the kept top-K positions (same dense shape).
-            #   * ``tq_meta``  — codec dict carrying centroids /
-            #     scales / outlier override / 1-bit-packed sign_bits
-            #     plus the chunk reconstruction parameters
-            #     (``target_chunk``, ``num_chunks``, ``topk_per_chunk``,
-            #     ``d_padded``) that the validator decoder uses to
-            #     unpack everything back into the d_padded rotated
-            #     vector. A TurboQuant-unaware validator sees no
-            #     legacy ``idxs/vals/quant_params`` keys for this
-            #     param and skips it outright instead of mis-decoding.
-            gradient[cname + "tq_idxs"] = tq_idxs_packed.to("cpu")
-            gradient[cname + "tq_codes"] = tq_codes_packed.to("cpu")
+            # Stash the TurboQuant payload under TQ-prefixed keys. We
+            # only ship the kept top-K subset to keep wire size in
+            # parity with the legacy path; full-tensor codes would
+            # roughly double payload at b=4. Validator-side TQ decode
+            # (TBD) reads these keys; legacy decode skips them.
+            gradient[cname + "tq_idxs"] = topk_idx.to("cpu")
+            gradient[cname + "tq_codes"] = tq_codes[topk_idx].to("cpu")
             gradient[cname + "tq_meta"] = tq_meta
 
             p.grad = None
@@ -1357,138 +1259,89 @@ def outer_step(
         # delta is one full-model gradient slice per rank (1/world_size
         # under FSDP2); the win is 5-15s of Python-loop overhead removed
         # per outer step.
-
-        # P3A (2026-05-03): batched per-param ``has_update`` broadcast.
-        # Pre-P3A the inline ``_bcast_flag(has_update)`` issued one
-        # ``dist.broadcast(int32)`` per param for the ~7100 trainable
-        # tensors of MoE 8B-A1B every outer step -- ~7100 NCCL launches
-        # per step at ~100us launch + serialization stalls = 1-1.5s of
-        # pure dispatch overhead. We hoist the master lookup into a
-        # pre-pass that populates per-param ``has_update`` + payload
-        # references, then ship every flag in a single int32 tensor
-        # broadcast. The main loop below then dispatches on the
-        # pre-computed flag (no inline NCCL) and uses the cached
-        # payload tuple instead of re-reading from ``src_sd``.
-        #
-        # Memory cost is essentially zero: ``per_param_payload`` stores
-        # tuples of references into ``src_sd`` (already allocated) plus
-        # the dequantised ``vals_f32`` list (which previously also
-        # lived in ``vals_f32_cache`` for the clipping pre-pass --
-        # we're just holding it slightly longer). The full dense
-        # ``full_grad_src`` is still built one-at-a-time and freed
-        # after distribute_tensor / dist.broadcast, just like pre-P3A.
-        named_params = list(model.named_parameters())
-        n_params = len(named_params)
-
-        per_param_has_update: list[int] = [0] * n_params
-        per_param_payload: list[tuple | None] = [None] * n_params
-        per_param_is_tq: list[bool] = [False] * n_params
-
-        # Pass 1 (master only): per-param payload lookup. Non-master
-        # ranks idle here -- they get the flags via the single
-        # broadcast below. Folded into ``decode_seconds`` because pre-
-        # P3A the equivalent lookup also lived inside the
-        # decode-timed span of each per-param iteration.
-        _p3a_lookup_t0 = time.perf_counter()
-        if on_src and src_sd is not None:
-            for _i, (_name, _p_unused) in enumerate(named_params):
-                _cname = canon_map.get(_name, _name)
-                if _cname is None:
-                    continue
-
-                # FU1 TurboQuant check FIRST -- mirrors pre-P3A inline
-                # logic at the same call site. A TurboQuant-encoded
-                # param has no idxs/vals/quant_params entries so the
-                # legacy branch would silently drop the param
-                # regardless; explicit dispatch is clearer and keeps
-                # the ``has_update`` flag correct.
-                _tq_idxs = src_sd.get(_cname + "tq_idxs")
-                if _tq_idxs is not None:
-                    _tq_codes = src_sd.get(_cname + "tq_codes")
-                    _tq_metas = src_sd.get(_cname + "tq_meta")
-                    if _tq_codes is not None and _tq_metas is not None:
-                        if not isinstance(_tq_idxs, (list, tuple)):
-                            _tq_idxs = [_tq_idxs]
-                        if not isinstance(_tq_codes, (list, tuple)):
-                            _tq_codes = [_tq_codes]
-                        if not isinstance(_tq_metas, (list, tuple)):
-                            _tq_metas = [_tq_metas]
-                        if (
-                            len(_tq_idxs) == len(_tq_codes) == len(_tq_metas)
-                            and len(_tq_idxs) > 0
-                        ):
-                            per_param_payload[_i] = (
-                                _tq_idxs,
-                                _tq_codes,
-                                _tq_metas,
-                            )
-                            per_param_is_tq[_i] = True
-                            per_param_has_update[_i] = 1
-                            continue
-
-                # Legacy top-K branch
-                _idxs = src_sd.get(_cname + "idxs")
-                _vals = src_sd.get(_cname + "vals")
-                _qps = src_sd.get(_cname + "quant_params")
-                if _idxs is not None and _vals is not None:
-                    if not isinstance(_idxs, (list, tuple)):
-                        _idxs = [_idxs]
-                    if not isinstance(_vals, (list, tuple)):
-                        _vals = [_vals]
-                    # Reuse the dequantised list from the clipping
-                    # pre-pass if it ran; otherwise dequantise here.
-                    # Saves one dequant per param when clipping is on.
-                    _vals_f32 = vals_f32_cache.pop(_cname, None)
-                    if _vals_f32 is None:
-                        _vals_f32 = compressor.maybe_dequantize_values(
-                            _vals, _qps, device
-                        )
-                    if _vals_f32:
-                        _idxs_dev = _idx_to_device(_idxs, device)
-                        per_param_payload[_i] = (_idxs_dev, _vals_f32)
-                        per_param_has_update[_i] = 1
-        outer_step_timings["decode_seconds"] += (
-            time.perf_counter() - _p3a_lookup_t0
-        )
-
-        # Single batched broadcast of every per-param ``has_update``
-        # flag in one int32 tensor. Mirrors the pre-P3A
-        # ``_bcast_flag(has_update)`` semantics (no-op on single GPU,
-        # one ``dist.broadcast`` in DDP mode) but pays the launch cost
-        # exactly once instead of n_params times.
-        _p3a_bcast_t0 = time.perf_counter()
-        if ddp:
-            _flags_tensor = torch.tensor(
-                per_param_has_update, device=device, dtype=torch.int32
-            )
-            dist.broadcast(_flags_tensor, src_rank)
-            per_param_has_update = _flags_tensor.cpu().tolist()
-        outer_step_timings["decode_seconds"] += (
-            time.perf_counter() - _p3a_bcast_t0
-        )
-
-        for _i, (name, p) in enumerate(named_params):
+        for name, p in model.named_parameters():
             cname = canon_map.get(name, name)
 
-            # ---- has_update + payload come from the P3A pre-pass above ----
-            # The inline ``_bcast_flag(has_update)`` cross-rank sync
-            # was hoisted out of this loop; we just read the
-            # pre-computed flag here. ``payload`` and ``is_tq_payload``
-            # are populated only on master (the rank that ran the
-            # pre-pass lookup); non-master ranks receive the flag and
-            # then participate in the per-param ``distribute_tensor``
-            # / ``dist.broadcast`` collective in the merge phase.
+            # ---- master decides if this param has an update; others receive a flag ----
+            # Decode phase: master idxs/vals lookup + dequant + sparse->dense
+            # decompress + IDCT + clip_scale + per-param fingerprint stats.
+            # The ``_bcast_flag`` cross-rank sync is folded in here because
+            # it's a tiny int broadcast and lives between lookup and decode.
             _decode_t0 = time.perf_counter()
 
-            has_update = per_param_has_update[_i]
-            if has_update == 0:
-                # Nothing to apply for this param; nothing more to
-                # accumulate into decode_seconds either (the lookup +
-                # broadcast time was already folded in pre-loop).
-                continue
+            has_update = 0
+            payload = None
+            # FU1 (P6b): flag set when the payload originated from the
+            # TurboQuant miner branch. Selects the
+            # ``batch_decompress_turboquant`` decode below instead of the
+            # legacy ``transformer.decode ∘ compressor.batch_decompress``
+            # chain. Mutually exclusive with the legacy idxs/vals path
+            # per ``prepare_gradient_dict``'s TurboQuant branch (the
+            # miner either populates tq_* OR idxs/vals/quant_params for
+            # a given cname, never both).
+            is_tq_payload = False
 
-            payload = per_param_payload[_i] if on_src else None
-            is_tq_payload = per_param_is_tq[_i] if on_src else False
+            if on_src and src_sd is not None and cname is not None:
+                # FU1 TurboQuant check FIRST — when the hparam is flipped
+                # on and a miner ships tq_* keys, skip the legacy lookup
+                # entirely. A TurboQuant-encoded param has no
+                # idxs/vals/quant_params entries so the legacy branch
+                # would silently drop the param regardless; explicit
+                # dispatch is clearer and keeps the has_update flag
+                # correct for the cross-rank broadcast sync.
+                tq_idxs = src_sd.get(cname + "tq_idxs")
+                if tq_idxs is not None:
+                    tq_codes = src_sd.get(cname + "tq_codes")
+                    tq_metas = src_sd.get(cname + "tq_meta")
+                    if tq_codes is not None and tq_metas is not None:
+                        if not isinstance(tq_idxs, (list, tuple)):
+                            tq_idxs = [tq_idxs]
+                        if not isinstance(tq_codes, (list, tuple)):
+                            tq_codes = [tq_codes]
+                        if not isinstance(tq_metas, (list, tuple)):
+                            tq_metas = [tq_metas]
+                        if (
+                            len(tq_idxs) == len(tq_codes) == len(tq_metas)
+                            and len(tq_idxs) > 0
+                        ):
+                            payload = (tq_idxs, tq_codes, tq_metas)
+                            is_tq_payload = True
+                            has_update = 1
+
+                if not is_tq_payload:
+                    idxs = src_sd.get(cname + "idxs")
+                    vals = src_sd.get(cname + "vals")
+                    qps = src_sd.get(cname + "quant_params")
+
+                    if idxs is not None and vals is not None:
+                        if not isinstance(idxs, (list, tuple)):
+                            idxs = [idxs]
+                        if not isinstance(vals, (list, tuple)):
+                            vals = [vals]
+                        # Reuse the dequantised list from the clipping pre-pass
+                        # if it ran; otherwise dequantise here. This keeps the
+                        # work identical when ``max_grad_norm`` is None (the
+                        # cache is empty) and saves one dequant per param when
+                        # clipping is on.
+                        vals_f32 = vals_f32_cache.pop(cname, None)
+                        if vals_f32 is None:
+                            vals_f32 = compressor.maybe_dequantize_values(
+                                vals, qps, device
+                            )
+                        if vals_f32:
+                            # Ensure indices (or packed tuples) live on the same device as 'ref'
+                            idxs_dev = _idx_to_device(idxs, device)
+                            payload = (idxs_dev, vals_f32)
+                            has_update = 1
+
+            flag_result = _bcast_flag(has_update)
+            if flag_result == 0:
+                # Nothing to apply for this param; the bcast_flag is the
+                # only work this iter contributed to decode.
+                outer_step_timings["decode_seconds"] += (
+                    time.perf_counter() - _decode_t0
+                )
+                continue
 
             full_grad_src = torch.empty(1)
             decompressed = None
