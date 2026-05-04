@@ -289,6 +289,56 @@ def unpack_2bit_values(packed: torch.Tensor, original_last_dim: int) -> torch.Te
     return unpacked.contiguous()
 
 
+# TurboQuant codec (``hone.turboquant``) imports multi-bit-width pack /
+# unpack helpers at module level. Only ``pack_2bit_values`` /
+# ``unpack_2bit_values`` ship implemented today because
+# ``turboquant_enabled: false`` by default and the P6a audit is the hard
+# gate before a real b=1/3/4 codec lands. The stubs below keep the
+# ``hone.turboquant`` module-level import healthy (otherwise every
+# validator / miner boot raises ``ImportError`` from
+# ``hone/src/hone/__init__.py:24 from . import turboquant``) without
+# letting any default-on code path silently lose bits. If an operator
+# flips ``turboquant_enabled: true`` AND picks a bit width that hasn't
+# been implemented, they get a clear ``NotImplementedError`` at the
+# first compress call rather than a silent NaN.
+
+
+def _unsupported_pack_stub(bits: int, *, role: str):
+    def _impl(values: torch.Tensor) -> torch.Tensor:  # noqa: ARG001
+        raise NotImplementedError(
+            f"{role} for b={bits} is not implemented in this build. "
+            f"TurboQuant b={bits} requires the P6a coordinate-distribution "
+            f"audit to pass before the codec ships. Until then, keep "
+            f"``turboquant_enabled: false`` or use ``turboquant_bits=2`` "
+            f"(the only width with shipped pack/unpack helpers)."
+        )
+
+    _impl.__name__ = role
+    return _impl
+
+
+def _unsupported_unpack_stub(bits: int, *, role: str):
+    def _impl(
+        packed: torch.Tensor,  # noqa: ARG001
+        original_last_dim: int,  # noqa: ARG001
+    ) -> torch.Tensor:
+        raise NotImplementedError(
+            f"{role} for b={bits} is not implemented in this build. "
+            f"See ``pack_{bits}bit_values`` for the full explanation."
+        )
+
+    _impl.__name__ = role
+    return _impl
+
+
+pack_1bit_values = _unsupported_pack_stub(1, role="pack_1bit_values")
+unpack_1bit_values = _unsupported_unpack_stub(1, role="unpack_1bit_values")
+pack_3bit_values = _unsupported_pack_stub(3, role="pack_3bit_values")
+unpack_3bit_values = _unsupported_unpack_stub(3, role="unpack_3bit_values")
+pack_4bit_values = _unsupported_pack_stub(4, role="pack_4bit_values")
+unpack_4bit_values = _unsupported_unpack_stub(4, role="unpack_4bit_values")
+
+
 class ChunkingTransformer:
     """
     A transformer for chunking tensors to enable more efficient gradient processing.
