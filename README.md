@@ -1,6 +1,6 @@
-# Hone Subnet — ARC-AGI-2 Benchmarking on Bittensor
+# Hone — LoopLM Distributed Training on Bittensor
 
-A Bittensor subnet where **validators** evaluate **miners** on their ability to solve novel ARC-AGI-2 reasoning problems. Miners don't run solvers directly—they point to a git repository containing their solution, which is executed in a secure GPU sandbox.
+Incentivised distributed training of **Looped Language Models** (LoopLM) on Bittensor. Miners train a shared LoopLM model locally and upload compressed gradients; validators aggregate, score, and apply them. The architecture reproduces [Ouro](https://arxiv.org/abs/2510.25741) — a recurrent transformer where a shared stack of layers is applied multiple times, with a learned exit gate for adaptive computation depth.
 
 ---
 
@@ -8,14 +8,15 @@ A Bittensor subnet where **validators** evaluate **miners** on their ability to 
 
 - [Overview](#overview)
 - [Architecture](#architecture)
-- [Quick Start](#quick-start)
-- [Validator Setup](#validator-setup)
-- [Miner Setup](#miner-setup)
-- [Building Your Solver](#building-your-solver)
-- [Local Testing with Sandbox Runner](#local-testing-with-sandbox-runner)
-- [Configuration Reference](#configuration-reference)
+- [Installation](#installation)
+- [Running a Miner](#running-a-miner)
+- [Running a Validator](#running-a-validator)
+- [Multi-GPU Training (FSDP)](#multi-gpu-training-fsdp)
+- [Hyperparameters](#hyperparameters)
+- [LoopLM Model](#looplm-model)
+- [Training Stages](#training-stages)
+- [Environment Variables](#environment-variables)
 - [Troubleshooting](#troubleshooting)
-- [Security Notes](#security-notes)
 
 ---
 
@@ -23,714 +24,519 @@ A Bittensor subnet where **validators** evaluate **miners** on their ability to 
 
 ### How It Works
 
-1. **Miners** expose an HTTP endpoint (`/info`) that returns a pointer to their solution repository
-2. **Validators** fetch miner info, submit jobs to a **Sandbox Runner** (secure GPU execution service)
-3. The Sandbox Runner clones the miner's repo, builds a Docker image, runs prep (with internet) and inference (isolated), then calculates metrics
-4. Validators aggregate `exact_match_rate` scores and set on-chain weights using exponential distribution
+1. **Miners** train the LoopLM model on sharded data for a fixed number of inner steps each window
+2. Gradients are compressed via top-k sparsification and uploaded to object storage (R2)
+3. **Validators** gather compressed gradients from miners, aggregate them, and apply an outer SGD step
+4. Validators score miners based on gradient quality (loss improvement, index overlap detection) and set on-chain weights
+5. All nodes stay in sync via chain-window pacing and checkpoint loading
 
-### Scoring Mechanism
+### What is LoopLM?
 
-- **Metric**: `exact_match_rate` — percentage of ARC problems solved correctly
-- **Minimum floor**: 20% accuracy required to qualify
-- **Top 5** miners above floor receive rewards
-- **Miner rewards**: Rewards distributed via exponential decay (factor 0.8 per rank)
-- **No qualifiers**: If no miners meet the floor, 100% is burned
+A standard decoder-only transformer whose layer stack is applied **T_max times** recurrently (weight-tied). At each recurrent step:
 
-### Key Features
+- An **LM head** produces next-token logits
+- An **exit gate** predicts a halting probability
 
-- **Submission caching**: Identical repo+branch+commit combinations use cached scores (no redundant evaluation)
-- **Daily limits**: Configurable submissions per miner per day (default: 1)
-- **GPU isolation**: Inference runs without network access
-- **vLLM support**: Optional LLM sidecar for transformer-based solvers
+This yields 2-3x parameter efficiency: a 1.4B LoopLM matches 4B dense models on reasoning benchmarks.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              BITTENSOR CHAIN                                │
-│                    (miner registration, weights, stake)                     │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                      │
-                 ┌────────────────────┼────────────────────┐
-                 │                    │                    │
-                 ▼                    ▼                    ▼
-          ┌─────────────┐      ┌─────────────┐      ┌─────────────┐
-          │  VALIDATOR  │      │  VALIDATOR  │      │  VALIDATOR  │
-          │             │      │             │      │             │
-          │ • Discover  │      │             │      │             │
-          │ • Query     │      │             │      │             │
-          │ • Score     │      │             │      │             │
-          │ • Set wts   │      │             │      │             │
-          └──────┬──────┘      └─────────────┘      └─────────────┘
-                 │
-        ┌────────┴────────┐
-        │                 │
-        │ Fetch /info     │ Submit jobs via API
-        ▼                 ▼
-  ┌───────────┐    ┌─────────────────────────────────────────────────────┐
-  │  MINERS   │    │                  SANDBOX RUNNER                      │
-  │           │    │                                                      │
-  │ ┌───────┐ │    │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
-  │ │ M1    │ │    │  │ H200 #0 │  │ H200 #1 │  │ H200 #2 │  │ H200 #3 │ │
-  │ │/info  │ │    │  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │
-  │ └───────┘ │    │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐ │
-  │ ┌───────┐ │    │  │ H200 #4 │  │ H200 #5 │  │ H200 #6 │  │ H200 #7 │ │
-  │ │ M2    │ │    │  └─────────┘  └─────────┘  └─────────┘  └─────────┘ │
-  │ │/info  │ │    │                                                      │
-  │ └───────┘ │    │  • Clone repo → Build image → Run prep → Run infer  │
-  │ ┌───────┐ │    │  • Calculate exact_match_rate against held-out data │
-  │ │ M_N   │ │    └─────────────────────────────────────────────────────┘
-  │ │/info  │ │
-  │ └───────┘ │
-  └───────────┘
+                         Bittensor Chain
+                    (registration, weights, stake)
+                              |
+              +---------------+---------------+
+              |                               |
+         +---------+                    +-----------+
+         |  MINER  |  x N               | VALIDATOR |
+         |         |                    |           |
+         | 1. Load data shard          | 1. Gather compressed
+         | 2. inner_steps() x30        |    gradients from miners
+         | 3. Compress gradients       | 2. Aggregate + outer_step
+         | 4. Upload to R2             | 3. Score miners
+         | 5. Gather peers' grads      | 4. Set on-chain weights
+         | 6. outer_step (SGD)         | 5. Upload checkpoint
+         +---------+                    +-----------+
+              |                               |
+              +---------- R2 Storage ---------+
+                   (gradients, checkpoints,
+                    peer lists, datasets)
 ```
+
+### Inner / Outer Loop
+
+- **Inner loop** (local, per-miner): Standard LM training with the LoopLM loss (entropy-regularized, adaptive gate, or SFT depending on training stage). AdamW or Muon optimizer.
+- **Outer loop** (network-wide): Compressed gradients from all miners are aggregated and applied via SGD. This is the decentralised training step.
 
 ---
 
-## Quick Start
+## Installation
 
 ### Prerequisites
 
-- **Python 3.10+**
-- **Docker & Docker Compose**
-- **Bittensor CLI** (`btcli`)
-- **NVIDIA GPU + drivers** (for sandbox runner / local testing)
-- TAO for registration and staking
+- Python 3.11+
+- CUDA-capable GPU (8GB+ VRAM for 1.4B, 16GB+ for 2.6B)
+- [uv](https://docs.astral.sh/uv/) (recommended) or pip
+
+### Install
+
+```bash
+git clone <repo-url>
+cd hone
+
+# with uv (recommended)
+uv sync
+
+# or with pip
+pip install -e .
+```
 
 ### Create Wallets
 
 ```bash
-# create coldkey
 btcli wallet new_coldkey --wallet.name default
-
-# create hotkeys
-btcli wallet new_hotkey --wallet.name default --wallet.hotkey validator
 btcli wallet new_hotkey --wallet.name default --wallet.hotkey miner
+btcli wallet new_hotkey --wallet.name default --wallet.hotkey validator
+```
+
+### Register on Subnet
+
+```bash
+btcli subnet register --netuid <NETUID> --wallet.name default --wallet.hotkey <miner|validator>
 ```
 
 ---
 
-## Validator Setup
+## Running a Miner
 
-### Requirements
+The miner trains the LoopLM model locally each chain window, compresses and uploads gradients, then gathers and applies peer gradients.
 
-- 4+ CPU cores
-- 8GB+ RAM
-- 20GB disk
-- Reliable network connection
-
-### 1. Clone Repository
+### Single-GPU
 
 ```bash
-git clone https://github.com/manifold-inc/hone.git
-cd hone/validator
+python neurons/miner.py \
+    --netuid <NETUID> \
+    --wallet.name default \
+    --wallet.hotkey miner \
+    --device cuda \
+    --amp-dtype bf16
 ```
 
-### 2. Configure Environment
-
-Create `validator/.env`:
-
-```ini
-# chain
-NETUID=5
-CHAIN_ENDPOINT=wss://entrypoint-finney.opentensor.ai:443
-
-# wallet
-WALLET_NAME=default
-WALLET_HOTKEY=validator
-WALLET_PATH=/root/.bittensor/wallets
-
-# database
-DB_URL=postgresql://postgres:postgres@db:5432/hone
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=postgres
-POSTGRES_DB=hone
-
-# sandbox runner connection
-SANDBOX_RUNNER_ENDPOINT=http://your-sandbox-runner:8000
-SANDBOX_RUNNER_API_KEY=your_api_key_here
-SANDBOX_RUNNER_TIMEOUT_HOURS=3
-
-# scoring parameters
-MAX_SUBMISSIONS_PER_DAY=1
-MIN_ACCURACY_FLOOR=0.20
-TOP_MINERS_COUNT=5
-BURN_UID=251
-BURN_PERCENTAGE=0.95
-
-# cycle timing
-CYCLE_DURATION=30
-```
-
-### 3. Register and Stake
+### Multi-GPU (torchrun)
 
 ```bash
-# register validator on subnet
-btcli subnet register --netuid 5 --wallet.name default --wallet.hotkey validator
-
-# stake TAO
-btcli stake add --wallet.name default --wallet.hotkey validator --amount 100
+torchrun --nproc_per_node=8 neurons/miner.py \
+    --netuid <NETUID> \
+    --wallet.name default \
+    --wallet.hotkey miner \
+    --device cuda \
+    --amp-dtype bf16
 ```
 
-### 4. Start Validator
+### All Miner Options
 
-```bash
-cd validator
-make up
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--netuid` | `268` | Bittensor subnet UID |
+| `--device` | `cuda` | Training device |
+| `--amp-dtype` | `bf16` | Mixed precision: `bf16` or `fp16` |
+| `--actual-batch-size` | (from hparams) | Override batch size |
+| `--project` | `hone` | WandB project name |
+| `--debug` | off | Enable debug logging |
+| `--trace` | off | Enable trace-level logging |
+| `--test` | off | Test mode: use all peers without filtering |
+| `--local` | off | Local mode: use local-run hparams override |
+| `--store-gathers` | off | Upload gathered gradients to R2 |
+| `--profile-iters` | `0` | Torch profiler active iterations (0 = disabled) |
+| `--profile-dir` | `./log/profiler` | Profiler trace output directory |
 
-This starts:
-- PostgreSQL database
-- Adminer (DB UI on port 8080)
-- Validator service
-
-### 5. Monitor
-
-```bash
-# view logs
-make logs
-
-# check status
-make status
-
-# auto-updater logs
-make logs-update
-```
-
-The validator includes auto-update functionality that pulls and restarts on new commits.
+Plus all standard `bt.subtensor`, `bt.wallet`, and `bt.logging` arguments.
 
 ---
 
-## Miner Setup
+## Running a Validator
 
-### Requirements
+The validator gathers compressed gradients from miners, evaluates gradient quality, applies outer optimisation steps, scores miners, and sets on-chain weights.
 
-- Public IP address
-- Open port (default: 8091)
-- Minimal compute (the heavy lifting happens in sandbox)
-
-### 1. Clone Repository
+### Single-GPU
 
 ```bash
-git clone https://github.com/manifold-inc/hone.git
-cd hone
+python neurons/validator.py \
+    --netuid <NETUID> \
+    --wallet.name default \
+    --wallet.hotkey validator \
+    --device cuda
 ```
 
-### 2. Configure Environment
-
-Create `miner/.env`:
-
-```ini
-WALLET_NAME=default
-WALLET_HOTKEY=miner
-MINER_PORT=8091
-
-# your solution repository
-MINER_REPO_URL=https://github.com/your-username/your-arc-solver
-MINER_REPO_BRANCH=main
-MINER_REPO_PATH=              # subdirectory if needed
-MINER_WEIGHT_CLASS=1xH200     # 1xH200, 2xH200, 4xH200, or 8xH200
-
-# vLLM settings (optional)
-MINER_USE_VLLM=true
-VLLM_MODEL=unsloth/Meta-Llama-3.1-8B-Instruct
-VLLM_DTYPE=half
-VLLM_GPU_MEMORY_UTIL=0.8
-VLLM_MAX_MODEL_LEN=12000
-```
-
-### 3. Register Miner
+### Multi-GPU (torchrun)
 
 ```bash
-# register on subnet
-btcli subnet register --netuid 5 --wallet.name default --wallet.hotkey miner
-
-# set your public IP on-chain so validators can discover you
-python tools/post_ip_chain.py \
-  --wallet-name default \
-  --hotkey miner \
-  --ip YOUR_PUBLIC_IP \
-  --port 8091
+torchrun --nproc_per_node=4 neurons/validator.py \
+    --netuid <NETUID> \
+    --wallet.name default \
+    --wallet.hotkey validator \
+    --device cuda
 ```
 
-### 4. Start Miner
+### All Validator Options
 
-```bash
-# build and run
-docker build -t hone-miner -f miner/Dockerfile .
-docker run -d --name miner \
-  -p 8091:8091 \
-  -v ~/.bittensor/wallets:/root/.bittensor/wallets:ro \
-  --env-file miner/.env \
-  hone-miner
-```
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--netuid` | `5` | Bittensor subnet UID |
+| `--device` | `cuda` | Device for model and gradient ops |
+| `--project` | `hone` | WandB project name |
+| `--debug` | off | Enable debug logging |
+| `--trace` | off | Enable trace-level logging |
+| `--test` | off | Test mode: use all peers without filtering |
+| `--local` | off | Local mode: use local-run hparams override |
+| `--store-gathers` | off | Upload gathered gradients to R2 |
+| `--profile-iters` | `0` | Torch profiler active iterations (0 = disabled) |
+| `--profile-dir` | `./log/profiler` | Profiler trace output directory |
 
-### 5. Verify
-
-```bash
-# check health
-curl http://localhost:8091/health
-
-# check info endpoint (what validators see)
-curl http://localhost:8091/info
-```
-
-Expected `/info` response:
-```json
-{
-  "repo_url": "https://github.com/your-username/your-arc-solver",
-  "repo_branch": "main",
-  "weight_class": "1xH200",
-  "use_vllm": true,
-  "vllm_config": {
-    "model": "unsloth/Meta-Llama-3.1-8B-Instruct",
-    "dtype": "half",
-    "gpu_memory_utilization": 0.8,
-    "max_model_len": 12000
-  },
-  "version": "1.0.0",
-  "hotkey": "5Abc...xyz"
-}
-```
+Plus all standard `bt.subtensor`, `bt.wallet`, and `bt.logging` arguments.
 
 ---
 
-## Building Your Solver
+## Multi-GPU Training (FSDP)
 
-Your solution lives in a git repository. The sandbox runner clones it, builds a Docker image, and runs two phases:
+Hone uses PyTorch FSDP2 for multi-GPU training. FSDP shards model parameters across GPUs at the `DecoderLayer` boundary.
 
-### Required Files
+### Launch with torchrun
 
-```
-your-solver-repo/
-├── Dockerfile           # builds your execution environment
-├── requirements.txt     # python dependencies
-├── arc_main.py          # entry point (CLI wrapper)
-├── arc_prep_phase.py    # downloads models, data (internet ON)
-├── arc_inference_phase.py  # solves problems (internet OFF)
-├── arc_solver_llm.py    # your solver implementation (or any name)
-└── arc_utils.py         # I/O utilities
-```
+```bash
+# 8-GPU miner
+torchrun --nproc_per_node=8 neurons/miner.py \
+    --netuid <NETUID> \
+    --wallet.name default \
+    --wallet.hotkey miner
 
-### Execution Flow
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                      PREP PHASE                                │
-│                   (internet enabled)                           │
-│                                                                │
-│  • Download model weights from HuggingFace                     │
-│  • Download any auxiliary data                                 │
-│  • Models saved to /app/models                                 │
-│                                                                │
-│  Command: python arc_main.py --phase prep --input /input       │
-│                              --output /output                  │
-└────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌────────────────────────────────────────────────────────────────┐
-│                    INFERENCE PHASE                             │
-│                   (internet disabled)                          │
-│                                                                │
-│  • Load models from /app/models                                │
-│  • Read problems from /input/miner_current_dataset.json        │
-│  • Solve each problem                                          │
-│  • Write predictions to /output/results.json                   │
-│                                                                │
-│  Command: python arc_main.py --phase inference --input /input  │
-│                              --output /output                  │
-└────────────────────────────────────────────────────────────────┘
+# 4-GPU validator
+torchrun --nproc_per_node=4 neurons/validator.py \
+    --netuid <NETUID> \
+    --wallet.name default \
+    --wallet.hotkey validator
 ```
 
-### Input Format
-
-`/input/miner_current_dataset.json`:
-```json
-{
-  "tasks": [
-    {
-      "task_hash": "abc123...",
-      "train_examples": [
-        {"input": [[0,1,2],[3,4,5]], "output": [[5,4,3],[2,1,0]]}
-      ],
-      "test_input": [[1,2,3],[4,5,6]],
-      "metadata": {}
-    }
-  ]
-}
-```
-
-### Output Format
-
-`/output/results.json`:
-```json
-{
-  "phase": "inference",
-  "status": "success",
-  "predictions": [
-    {
-      "problem_index": 0,
-      "task_hash": "abc123...",
-      "predicted_output": [[6,5,4],[3,2,1]]
-    }
-  ]
-}
-```
-
-### Solver Interface
-
-Your solver must implement:
-
-```python
-class ARCSolver:
-    def __init__(self, use_vllm: bool = True):
-        # initialize your model/algorithm
-        pass
-    
-    def solve(
-        self,
-        train_examples: List[Dict],  # [{"input": grid, "output": grid}, ...]
-        test_input: List[List[int]]  # 2D grid of ints 0-9
-    ) -> List[List[int]]:            # 2D grid prediction
-        # your solving logic here
-        pass
-```
-
-### Using vLLM
-
-If `use_vllm=true` in your miner config, a vLLM server runs alongside your container on a shared network. Connect via:
-
-```python
-from openai import OpenAI
-
-vllm_api_base = os.environ.get("VLLM_API_BASE", "http://vllm-container:8000")
-client = OpenAI(base_url=f"{vllm_api_base}/v1", api_key="dummy")
-
-response = client.chat.completions.create(
-    model="your-model-name",  # discovered via client.models.list()
-    messages=[...],
-    temperature=0.1,
-    max_tokens=2000
-)
-```
-
-### Example Solver
-
-See `miner-solution-example/` for a complete reference implementation with:
-- HuggingFace model download in prep phase
-- vLLM-based inference with fallback heuristics
-- Proper error handling and logging
+The `fsdp.dp_shard` value in `hparams.json` controls the FSDP shard degree. It must divide your GPU count evenly.
 
 ---
 
-## Local Testing with Sandbox Runner
+## Hyperparameters
 
-Test your solver locally before submitting to mainnet.
+All hyperparameters are loaded from `hparams/` with a layered merge:
 
-### 1. Set Up Sandbox Runner
+1. `DEFAULT_HPARAMS` (built-in defaults)
+2. `hparams/hparams.json` (base config, must define `model_size`)
+3. `hparams/{model_size}.json` (model architecture: `1.4B.json` or `2.6B.json`)
+4. `hparams/hparams-local-run.json` (optional, for `--local` flag)
 
-```bash
-cd sandbox_runner
+### Key Parameters
 
-# configure
-cp config.yaml.example config.yaml
-# edit config.yaml with your settings
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `model_size` | `1.4B` | Architecture config to load (`1.4B` or `2.6B`) |
+| `sequence_length` | `4096` | Token sequence length |
+| `batch_size` | `192` | Micro-batches per gradient accumulation |
+| `inner_steps` | `30` | Local training steps per chain window |
+| `outer_learning_rate` | `0.4` | SGD learning rate for outer (aggregate) step |
+| `t_max` | `4` | Recurrent steps per forward pass |
+| `kl_beta` | `0.05` | KL divergence coefficient (Stage I) |
+| `training_stage` | `pretrain` | Active training stage: `pretrain`, `gate`, or `sft` |
+| `gate_k` | `50.0` | Sigmoid slope for gate training (Stage II) |
+| `gate_gamma` | `0.005` | Improvement threshold for gate training (Stage II) |
+| `topk_compression` | `64` | Top-k sparsity for gradient compression |
+| `momentum_decay` | `0.95` | Error-feedback momentum decay |
 
-# create .env
-cat > .env << EOF
-API_KEYS=test-key-123
-GPU_COUNT=1
-LOG_LEVEL=INFO
-EOF
+### Model Configurations
 
-# start
-make up
-```
+**1.4B** (`hparams/1.4B.json`):
 
-### 2. Generate Test Dataset
+| Parameter | Value |
+|-----------|-------|
+| Layers | 24 |
+| Hidden size | 2048 |
+| Attention heads | 16 |
+| KV heads | 16 (MHA) |
+| FFN intermediate | 5504 |
+| Vocab size | 49152 |
+| RoPE theta | 10000 |
 
-The sandbox runner generates daily datasets automatically, but you can trigger manually:
+**2.6B** (`hparams/2.6B.json`):
 
-```bash
-# inside sandbox_runner container or locally
-python -c "
-from synthetics.dataset_manager import DatasetManager
-from pathlib import Path
-import asyncio
+| Parameter | Value |
+|-----------|-------|
+| Layers | 48 |
+| Hidden size | 2048 |
+| Attention heads | 16 |
+| KV heads | 16 (MHA) |
+| FFN intermediate | 5504 |
+| Vocab size | 49152 |
+| RoPE theta | 10000 |
 
-dm = DatasetManager(Path('/app/data/datasets'))
-asyncio.run(dm.generate_daily_dataset())
-"
-```
-
-### 3. Submit Test Job
-
-```bash
-curl -X POST http://localhost:8000/v1/jobs/submit \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: test-key-123" \
-  -d '{
-    "repo_url": "https://github.com/your-username/your-arc-solver",
-    "repo_branch": "main",
-    "repo_path": "",
-    "weight_class": "1xH200",
-    "miner_hotkey": "test-miner",
-    "validator_hotkey": "test-validator",
-    "priority": 5,
-    "use_vllm": true,
-    "vllm_config": {
-      "model": "unsloth/Meta-Llama-3.1-8B-Instruct",
-      "dtype": "half",
-      "gpu_memory_utilization": 0.8,
-      "max_model_len": 12000
-    }
-  }'
-```
-
-Response:
-```json
-{
-  "job_id": "job_abc123def456",
-  "status": "pending",
-  "queue_position": 0
-}
-```
-
-### 4. Monitor Job
-
-```bash
-# check status
-curl http://localhost:8000/v1/jobs/job_abc123def456 \
-  -H "X-API-Key: test-key-123"
-
-# get metrics (after completion)
-curl http://localhost:8000/v1/jobs/job_abc123def456/metrics \
-  -H "X-API-Key: test-key-123"
-
-# stream logs
-curl http://localhost:8000/v1/logs/job_abc123def456/tail?lines=100 \
-  -H "X-API-Key: test-key-123"
-```
-
-### 5. Check Results
-
-```json
-{
-  "job_id": "job_abc123def456",
-  "status": "completed",
-  "metrics": {
-    "aggregate": {
-      "total_problems": 100,
-      "num_solved": 85,
-      "num_exact_matches": 23,
-      "exact_match_rate": 0.2706,
-      "avg_partial_correctness": 0.4521,
-      "avg_grid_similarity": 0.6234
-    }
-  }
-}
-```
-
-### Local Development Workflow
-
-```bash
-# 1. make changes to your solver
-vim your-solver/arc_solver_llm.py
-
-# 2. commit and push
-git add -A && git commit -m "improve pattern matching" && git push
-
-# 3. submit new job to local sandbox
-curl -X POST http://localhost:8000/v1/jobs/submit ...
-
-# 4. check results
-curl http://localhost:8000/v1/jobs/{job_id}/metrics ...
-
-# 5. iterate until satisfied with exact_match_rate
-```
+Both use the SmolLM2 49,152-token vocabulary (`HuggingFaceTB/SmolLM2-135M` tokenizer).
 
 ---
 
-## Configuration Reference
+## LoopLM Model
 
-### Validator Environment Variables
+The model (`src/hone/model.py`) is a self-contained implementation matching the [official Ouro checkpoint](https://huggingface.co/ByteDance/Ouro-1.4B) for weight-loading compatibility.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NETUID` | `5` | Subnet UID |
-| `CHAIN_ENDPOINT` | mainnet | Bittensor chain endpoint |
-| `WALLET_NAME` | `default` | Wallet name |
-| `WALLET_HOTKEY` | `validator` | Hotkey name |
-| `DB_URL` | - | PostgreSQL connection string |
-| `SANDBOX_RUNNER_ENDPOINT` | - | Sandbox runner API URL |
-| `SANDBOX_RUNNER_API_KEY` | - | API key for sandbox |
-| `SANDBOX_RUNNER_TIMEOUT_HOURS` | `3` | Max job execution time |
-| `SANDBOX_POLL_INTERVAL` | `30` | Seconds between status polls |
-| `SANDBOX_MAX_POLL_ATTEMPTS` | `360` | Max polling attempts (360 × 30s = 3h) |
-| `MAX_SUBMISSIONS_PER_DAY` | `1` | Submissions per miner per day |
-| `MIN_ACCURACY_FLOOR` | `0.20` | Minimum exact_match_rate to qualify |
-| `TOP_MINERS_COUNT` | `5` | Number of miners to reward |
-| `BURN_UID` | `251` | UID to receive burn weight |
-| `BURN_PERCENTAGE` | `0.95` | Percentage of emissions to burn |
-| `CYCLE_DURATION` | `30` | Blocks per query cycle |
-| `MINER_INFO_TIMEOUT` | `5` | Timeout for /info endpoint (seconds) |
-| `RETENTION_DAYS` | `30` | Days to keep query results in DB |
-| `CLEANUP_INTERVAL_HOURS` | `24` | Hours between DB cleanup runs |
+### Architecture
 
-### Miner Environment Variables
+```
+Input tokens
+    |
+    v
+[Embedding]  (49152 -> 2048)
+    |
+    v
++-- Recurrent Loop (T_max iterations) -----------+
+|                                                  |
+|   for each layer in [DecoderLayer x N]:         |
+|       Sandwich Norm:                             |
+|         input_layernorm -> Attention -> input_layernorm_2 + residual
+|         post_attention_layernorm -> MLP -> post_attention_layernorm_2 + residual
+|                                                  |
+|   RMSNorm                                        |
+|   LM Head  -> step_logits[t]                     |
+|   Exit Gate -> step_gate_logits[t]               |
+|                                                  |
++--------------------------------------------------+
+    |
+    v
+LoopLMOutput(step_logits, step_gate_logits, final_hidden)
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WALLET_NAME` | `default` | Wallet name |
-| `WALLET_HOTKEY` | `miner` | Hotkey name |
-| `MINER_PORT` | `8091` | HTTP server port |
-| `MINER_REPO_URL` | - | Your solver repository URL |
-| `MINER_REPO_BRANCH` | `main` | Git branch |
-| `MINER_REPO_COMMIT` | - | Specific commit (optional) |
-| `MINER_REPO_PATH` | - | Subdirectory in repo |
-| `MINER_WEIGHT_CLASS` | `1xH200` | GPU requirement |
-| `MINER_USE_VLLM` | `false` | Enable vLLM sidecar |
+### Key Design Decisions
 
-### Weight Classes
+- **Sandwich normalization**: Pre-norm AND post-norm on both attention and FFN, critical for recurrent-depth training stability (Geiping et al.)
+- **Exit gate outputs raw logits**: Sigmoid is applied downstream in loss functions, matching the official Ouro convention
+- **Weight naming**: Parameter names match `ByteDance/Ouro-1.4B` (`q_proj`, `k_proj`, `gate_proj`, `up_proj`, `down_proj`, `input_layernorm`, etc.) for direct weight loading
 
-| Class | GPUs | Use Case |
-|-------|------|----------|
-| `1xH200` | 1 | Small models, heuristics |
-| `2xH200` | 2 | Medium models |
-| `4xH200` | 4 | Large models with tensor parallelism |
-| `8xH200` | 8 | Very large models |
+---
+
+## Training Stages
+
+The LoopLM paper defines three training stages, controlled by `hparams.training_stage`:
+
+### Stage I: Pre-training (`"pretrain"`)
+
+Entropy-regularized objective where the loss is the expected task loss weighted by the exit distribution, minus an entropy bonus:
+
+```
+L = sum_t p(t|x) * CE(t) - beta * H(p)
+```
+
+- `p(t|x)` is derived from the exit gate via a survival function (Eq. 3 in the paper)
+- `beta` (`kl_beta`) prevents collapse to always using T_max
+- This is the primary pre-training objective
+
+### Stage II: Adaptive Gate Training (`"gate"`)
+
+The LM parameters are frozen; only the exit gate is trained:
+
+- Per-step loss improvement `I_t = max(0, L_{t-1} - L_t)` is computed
+- An ideal continuation label `w_t = sigmoid(k * (I_t - gamma))` is derived
+- The gate is trained via BCE to predict when to stop looping
+- `gate_k` (50.0) and `gate_gamma` (0.005) control the sharpness and threshold
+
+### Stage III: Supervised Fine-Tuning (`"sft"`)
+
+Standard cross-entropy on the final recurrent step's logits. Used after pre-training for instruction tuning or domain adaptation.
+
+---
+
+## Environment Variables
+
+### Required (R2 Object Storage)
+
+These must be set for gradient exchange and dataset access:
+
+```bash
+# Gradient bucket
+R2_GRADIENTS_ACCOUNT_ID=...
+R2_GRADIENTS_BUCKET_NAME=...
+R2_GRADIENTS_READ_ACCESS_KEY_ID=...
+R2_GRADIENTS_READ_SECRET_ACCESS_KEY=...
+R2_GRADIENTS_WRITE_ACCESS_KEY_ID=...
+R2_GRADIENTS_WRITE_SECRET_ACCESS_KEY=...
+
+# Aggregator bucket
+R2_AGGREGATOR_ACCOUNT_ID=...
+R2_AGGREGATOR_BUCKET_NAME=...
+R2_AGGREGATOR_READ_ACCESS_KEY_ID=...
+R2_AGGREGATOR_READ_SECRET_ACCESS_KEY=...
+
+# Dataset
+DATASET_BINS_PATH=...
+```
+
+### Optional
+
+```bash
+# WandB logging
+WANDB_API_KEY=your_key_here
+
+# HuggingFace token (for gated tokenizers)
+HF_TOKEN=your_token_here
+
+# Dataset bucket list override (JSON array)
+R2_DATASET_BUCKET_LIST='[{"account_id": "...", ...}]'
+```
+
+### .env File
+
+Create a `.env` file in the project root. All variables are loaded automatically via `python-dotenv`:
+
+```bash
+cp .env.example .env
+# edit .env with your credentials
+```
 
 ---
 
 ## Troubleshooting
 
-### Validator Issues
+### NCCL Errors on Multi-GPU
 
-**Cannot connect to database**
 ```bash
-# check postgres is running
-docker ps | grep db
+# Ensure NCCL can find all GPUs
+export NCCL_DEBUG=INFO
+export NCCL_IB_DISABLE=1  # if no InfiniBand
 
-# check logs
-docker logs validator-db-1
-
-# verify connection string
-echo $DB_URL
+# Verify GPU visibility
+python -c "import torch; print(torch.cuda.device_count())"
 ```
 
-**Sandbox runner unreachable**
-```bash
-# test connectivity
-curl $SANDBOX_RUNNER_ENDPOINT/health
+### Out of Memory
 
-# check API key
-curl -H "X-API-Key: $SANDBOX_RUNNER_API_KEY" $SANDBOX_RUNNER_ENDPOINT/v1/status
+- Reduce `batch_size` or `micro_batch_size` in `hparams.json`
+- Enable optimizer state offloading: `"offload_optimizer_states": true`
+- Use `--amp-dtype bf16` (default) for mixed precision
+- For the 2.6B model, 8 GPUs with FSDP is recommended
+
+### Checkpoint Loading Failures
+
+- Ensure the model size in `hparams.json` matches the checkpoint
+- Check R2 credentials are correct
+- Verify network connectivity to the aggregator bucket
+
+### Validator Not Setting Weights
+
+- Ensure sufficient stake on the validator hotkey
+- Check that the validator UID is registered on the subnet
+- Wait for the rate-limiting window between weight updates
+
+### Miner Gradients Not Being Accepted
+
+- Verify R2 write credentials are configured
+- Check that `topk_compression` matches the network standard
+- Ensure the miner's model is in sync (checkpoint loaded correctly)
+
+### SIGTERM troubleshooting
+
+**Symptom** (in `pm2 logs vali` or `logs/vali-error.log`):
+
+```
+File "/root/hone/src/hone/__init__.py", line 10, in <module>
+    from .neurons import *
+  ...
+  File "<frozen importlib._bootstrap_external>", line 753, in _compile_bytecode
+EOFError: marshal data too short
+...
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError: neurons/validator.py FAILED
 ```
 
-**Weights not setting**
-- Ensure sufficient stake
-- Check rate limiting (must wait between weight updates)
-- Verify validator UID is registered
+followed by sibling ranks exiting with `exitcode: -15 (SIGTERM)` and pm2/systemd restarting in a tight loop.
 
-### Miner Issues
+**Root cause.** `torchrun` spawns N Python ranks simultaneously. Each rank runs `import hone`, which compiles `src/hone/*.py` to `.pyc` files under `src/hone/__pycache__/` on first load. CPython writes atomically via a per-PID tempfile + `os.replace(2)`, but on shared / overlay filesystems (NFS, some cloud block volumes, overlay2) `rename(2)` is **not** fully POSIX-atomic. A sibling rank can read a partially-written `.pyc` and die with `EOFError: marshal data too short`. That aborts the distributed run; pm2 restarts; the corrupt `.pyc` is still on disk; the cycle continues.
 
-**Not discovered by validators**
+**Fix** (shipped in [`ecosystem.config.js`](ecosystem.config.js) and [`ecosystem.validator.config.js`](ecosystem.validator.config.js)):
+
+1. Every pm2 app sets `PYTHONDONTWRITEBYTECODE=1` in its `env:` block. Every Python process in the `pm2 → uv → torchrun → N ranks` tree inherits it and never writes a `.pyc` — there is no file to race on. Cold-start cost is a one-time sub-second import hit, invisible against the minutes-long model load that follows.
+2. Each ecosystem config runs `cleanStalePyCache(CWD)` at config-load time (i.e. every `pm2 start` / `pm2 reload`). That walks `src/hone/` and `neurons/`, removes any `__pycache__` directories it finds, and leaves the venv's `site-packages` alone. This clears already-corrupt `.pyc` files from a previous crash loop.
+
+**Deploy the fix:**
+
 ```bash
-# verify on-chain registration
-btcli subnet list --netuid 5
-
-# check IP is set correctly
-btcli subnet metagraph --netuid 5 | grep YOUR_HOTKEY
-
-# re-post IP if needed
-python tools/post_ip_chain.py --wallet-name default --hotkey miner --ip YOUR_IP --port 8091
+cd <hone-checkout>
+git pull
+pm2 delete all                           # stop the crash loop cleanly
+pm2 start ecosystem.validator.config.js  # (or ecosystem.config.js on the miner box)
+pm2 logs vali --lines 100                # confirm healthy startup
 ```
 
-**/info endpoint not working**
-```bash
-# test locally
-curl http://localhost:8091/info
+The first log line from the ecosystem config will confirm the wipe happened, e.g. `[ecosystem.validator] resolved UV=... (dotenv loaded N keys, purged 2 __pycache__ dir(s); PYTHONDONTWRITEBYTECODE=1 will be set on all ranks)`.
 
-# check logs
-docker logs miner
+**Verify manually:**
+
+Single-process sanity check first — should print the version, exit 0, and leave no `.pyc` behind:
+
+```bash
+cd <hone-checkout>
+find src/hone neurons -type d -name __pycache__ -exec rm -rf {} +
+PYTHONDONTWRITEBYTECODE=1 uv run python -c "import hone; print(hone.__version__)"
+test -z "$(find src/hone neurons -name '*.pyc' 2>/dev/null)" && echo "OK: no .pyc written"
 ```
 
-**Jobs failing in sandbox**
-- Check Dockerfile builds successfully locally
-- Verify all required files exist
-- Check prep phase has internet access
-- Ensure inference phase doesn't require network
+Then a multi-rank `torchrun` smoke test (4 ranks hitting the import path simultaneously — this is the exact race condition that was looping):
 
-### Sandbox Runner Issues
-
-**GPU allocation failures**
 ```bash
-# check GPU status
-curl http://localhost:8000/v1/status -H "X-API-Key: ..."
-
-# verify nvidia-smi works
-nvidia-smi
+PYTHONDONTWRITEBYTECODE=1 uv run torchrun --nproc_per_node=4 --master_port=29599 \
+  -m pytest -q -x -k "test_nothing"  # any no-op entry; goal is to load hone on 4 ranks
 ```
 
-**Docker network conflicts**
-```bash
-# cleanup stale networks
-docker network prune -f
+If either command triggers `EOFError: marshal data too short`, `PYTHONDONTWRITEBYTECODE=1` isn't propagating — check the shell invocation and that the venv's Python honours env vars (it should; this is stdlib behaviour).
 
-# remove specific network
-docker network rm sandbox-job-xyz
-```
+**pm2 supervision guards** (also in both ecosystem configs):
 
-**vLLM not starting**
-- Check GPU memory is sufficient
-- Verify model exists in /app/models after prep phase
-- Check vLLM logs: `curl .../v1/logs/{job_id}/tail?lines=100`
+| Field | Value | Guards against |
+|-------|-------|----------------|
+| `autorestart` | `true` | Normal crashes should still bring the process back up. |
+| `min_uptime` | `60s` | Process is "stable" only after 60s of uptime. Faster exits count against `max_restarts`. |
+| `max_restarts` | `5` | After 5 consecutive unstable exits, pm2 stops auto-restarting. Forces operator attention instead of masking a persistent fault. |
+| `restart_delay` | `5000` (ms) | 5s between restarts. Prevents tight crash loops from pinning a CPU. |
+| `exp_backoff_restart_delay` | `100` (ms) | Base for exponential backoff on repeated failures; doubles each consecutive crash. |
+| `kill_timeout` | `30000` (ms) | On stop/restart, gives workers 30s to drain in-flight gather (up to 600s timeout), R2 PUTs, and NCCL handles before pm2 sends `SIGKILL`. Cutting this short strands peer uploads. |
+
+If you see `stopped (max_restarts reached)` in `pm2 list`, the supervision guards did their job — check `pm2 logs vali --lines 500` for the underlying error before running `pm2 start ecosystem.validator.config.js` again.
 
 ---
 
-## Security Notes
-
-- **Wallet files** are mounted read-only
-- **Inference phase** runs with network disabled (`network_mode: none`)
-- **Capabilities dropped**: `CAP_SYS_ADMIN`, `CAP_NET_ADMIN`, `CAP_SYS_MODULE`, `CAP_SYS_PTRACE`, `CAP_SYS_RAWIO`
-- **No new privileges** flag enabled on containers
-- **Validation dataset** (with expected outputs) never exposed to miners
-- Never expose Adminer or sandbox runner APIs publicly without authentication
-
----
-
-## Repository Structure
+## Project Structure
 
 ```
 hone/
-├── common/                 # shared utilities (chain, epistula, etc.)
-├── miner/                  # miner HTTP server
-├── miner-solution-example/ # reference solver implementation
-├── sandbox_runner/         # GPU execution service
-│   ├── api/                # REST API routes
-│   ├── core/               # job queue, GPU pool, scheduler, executor
-│   ├── execution/          # Docker execution logic
-│   ├── synthetics/         # ARC problem generation
-│   └── utils/              # metrics, validation, S3
-├── validator/              # validator service
-│   ├── autoupdate/         # auto-update scripts
-│   └── sql/                # database schema
-├── telemetry/              # optional telemetry service
-└── tools/                  # CLI utilities
+├── pyproject.toml                 # Package config (no torchtitan dependency)
+├── hparams/
+│   ├── hparams.json               # Base training config
+│   ├── 1.4B.json                  # 1.4B model architecture
+│   └── 2.6B.json                  # 2.6B model architecture
+├── neurons/
+│   ├── base_node.py               # Async lifecycle, chain block listener
+│   ├── trainer.py                 # LoopLM training loop + optimizers
+│   ├── miner.py                   # Miner node (train + compress + upload)
+│   └── validator.py               # Validator node (gather + score + weights)
+└── src/hone/
+    ├── model.py                   # LoopLM model (matches Ouro checkpoint)
+    ├── loss.py                    # Stage I/II/SFT loss functions
+    ├── hparams.py                 # Hyperparameter loading
+    ├── chain.py                   # Bittensor chain interaction
+    ├── comms.py                   # R2 object storage + gradient exchange
+    ├── compress.py                # Top-k gradient compression + 12-bit packing
+    ├── config.py                  # Environment / bucket configuration
+    ├── dataset.py                 # Dataset management
+    ├── distributed.py             # NCCL / FSDP helpers
+    ├── checkpoint.py              # Distributed checkpointing
+    ├── neurons.py                 # outer_step, prepare_gradient_dict
+    ├── logging.py                 # Rich console logging
+    └── muon/                      # Muon optimizer (Newton-Schulz)
 ```
 
 ---
 
 ## License
 
-See [LICENSE](LICENSE) file.
-
----
-
-## Links
-
-- [ARC-AGI-2 Dataset](https://arcprize.org/)
-- [Bittensor Documentation](https://docs.bittensor.com/)
-- [Subnet Registration Guide](https://docs.bittensor.com/subnets/)
+MIT. See [LICENSE](LICENSE).
