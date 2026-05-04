@@ -94,6 +94,25 @@ import torch
 # (``turboquant`` depends on ``turboquant_audit``, never the reverse).
 from hone.turboquant_audit import hadamard_rotate as hadamard_rotate
 
+# Bit-packing helpers shared with the legacy compressor. The codec
+# uses these for the v2 wire format: ``sign_bits`` is 1-bit-packed
+# inside ``quantize_turboquant`` / unpacked inside ``dequantize_turboquant``,
+# and ``batch_decompress_turboquant`` consumes 12-bit-packed
+# chunk-local indices plus ``main_bits``-packed codes from the encoder
+# in ``hone.neurons.prepare_gradient_dict``.
+from hone.compress import (
+    pack_1bit_values,
+    pack_2bit_values,
+    pack_3bit_values,
+    pack_4bit_values,
+    pack_12bit_indices,
+    unpack_1bit_values,
+    unpack_2bit_values,
+    unpack_3bit_values,
+    unpack_4bit_values,
+    unpack_12bit_indices,
+)
+
 __all__ = [
     "hadamard_rotate",
     "beta_lloyd_max_centroids",
@@ -350,9 +369,18 @@ def quantize_turboquant(
           a graceful (lossier) reconstruction; the high-res override
           lives in ``meta['outlier_codes']``.
         * ``meta`` carries everything the decoder needs:
-          ``bulk_centroids``, ``bulk_max``, ``outlier_indices``,
-          ``outlier_codes``, ``outlier_centroids``, ``outlier_max``,
-          ``sign_bits`` (prod mode only), ``mode``, ``b``, ``d``.
+          ``bulk_centroids``, ``bulk_scale``, ``outlier_indices``,
+          ``outlier_codes``, ``outlier_centroids``, ``outlier_scale``,
+          ``sign_bits`` (prod mode only — 1-bit-packed via
+          :func:`hone.compress.pack_1bit_values`, dense length carried
+          in ``sign_bits_original_d``), ``mode``, ``b``, ``d``,
+          ``main_bits``. Marked ``version='turboquant_v2'`` to lock in
+          the packed wire format (see ``docs/turboquant.md``
+          "wire-format inflation incident" for the v1 → v2 rationale).
+          The chunk-related keys (``target_chunk``, ``num_chunks``,
+          ``topk_per_chunk``, ``d_padded``) are stamped onto the meta
+          by the encoder in :func:`hone.neurons.prepare_gradient_dict`
+          — the codec itself doesn't chunk and leaves them absent.
     """
     if g.dim() != 1:
         raise ValueError(
@@ -424,7 +452,7 @@ def quantize_turboquant(
         outlier_centroids = beta_lloyd_max_centroids(max(k, 2), outlier_bits)
         outlier_codes = _quantize_codes_for_centroids(outlier_scaled, outlier_centroids)
 
-    sign_bits: torch.Tensor | None = None
+    sign_bits_dense: torch.Tensor | None = None
     if mode == "prod":
         # 1-bit Q_prod residual: sign of (g - dequant(g)). The decoder
         # nudges each reconstructed coord by half the inter-centroid
@@ -434,10 +462,22 @@ def quantize_turboquant(
         bulk_recon_unit = bulk_centroids.to(g32.device)[bulk_codes.long()] * 2.0 - 1.0
         bulk_recon = bulk_recon_unit * bulk_norm
         residual = g32 - bulk_recon
-        sign_bits = (residual > 0).to(torch.uint8)
+        sign_bits_dense = (residual > 0).to(torch.uint8)
+
+    # v2 wire format: ``sign_bits`` is 1-bit-packed before it lands in
+    # the meta dict (drops 8x off the on-the-wire size of the largest
+    # single meta field — see ``docs/turboquant.md`` "wire-format
+    # inflation incident"). The dense form lives only inside this
+    # function; the receiver unpacks via ``unpack_1bit_values`` using
+    # ``sign_bits_original_d`` to recover the trailing-zero padding.
+    sign_bits_packed: torch.Tensor | None = None
+    if sign_bits_dense is not None:
+        sign_bits_packed = (
+            pack_1bit_values(sign_bits_dense.unsqueeze(0)).squeeze(0).detach().cpu()
+        )
 
     meta: dict = {
-        "version": "turboquant_v1",
+        "version": "turboquant_v2",
         "d": int(d),
         "b": int(b),
         "main_bits": int(main_bits),
@@ -453,7 +493,8 @@ def quantize_turboquant(
         ),
         "outlier_scale": outlier_norm,
         "outlier_bits": int(outlier_bits),
-        "sign_bits": sign_bits.detach().cpu() if sign_bits is not None else None,
+        "sign_bits": sign_bits_packed,
+        "sign_bits_original_d": int(d) if sign_bits_dense is not None else 0,
     }
     return bulk_codes, meta
 
@@ -474,10 +515,10 @@ def dequantize_turboquant(codes: torch.Tensor, meta: dict) -> torch.Tensor:
        average centroid spacing in the direction encoded by
        ``meta['sign_bits']``.
     """
-    if "version" not in meta or meta["version"] != "turboquant_v1":
+    if "version" not in meta or meta["version"] != "turboquant_v2":
         raise ValueError(
             f"dequantize_turboquant: unknown meta version "
-            f"{meta.get('version')!r}; expected 'turboquant_v1'"
+            f"{meta.get('version')!r}; expected 'turboquant_v2'"
         )
 
     bulk_centroids = meta["bulk_centroids"].to(codes.device, dtype=torch.float32)
@@ -497,15 +538,28 @@ def dequantize_turboquant(codes: torch.Tensor, meta: dict) -> torch.Tensor:
         ) * outlier_scale
         out[outlier_indices.to(codes.device, dtype=torch.long)] = outlier_recon
 
-    sign_bits = meta.get("sign_bits")
-    if sign_bits is not None and bulk_centroids.numel() >= 2:
-        # Inter-centroid spacing is the average gap between adjacent
-        # sorted centroids on the [0, 1] codebook scale; rescale to
-        # the bulk_scale range and apply half-spacing as the nudge
+    sign_bits_packed = meta.get("sign_bits")
+    sign_bits_original_d = int(meta.get("sign_bits_original_d", 0))
+    if (
+        sign_bits_packed is not None
+        and bulk_centroids.numel() >= 2
+        and sign_bits_original_d > 0
+    ):
+        # v2 wire format: sign_bits arrives 1-bit-packed (one byte
+        # per 8 coords). Unpack along the last dim using the
+        # original-d sentinel from meta to drop the trailing zero
+        # padding the packer added on stride boundaries. Inter-
+        # centroid spacing is the average gap between adjacent sorted
+        # centroids on the [0, 1] codebook scale; rescale to the
+        # bulk_scale range and apply half-spacing as the nudge
         # magnitude. Direction comes from sign_bits.
         spacing = (bulk_centroids[1:] - bulk_centroids[:-1]).mean().item()
         correction = spacing * bulk_scale
-        signs = sign_bits.to(codes.device, dtype=out.dtype) * 2.0 - 1.0
+        sign_bits_dense = unpack_1bit_values(
+            sign_bits_packed.unsqueeze(0).to(codes.device),
+            sign_bits_original_d,
+        ).squeeze(0)
+        signs = sign_bits_dense.to(codes.device, dtype=out.dtype) * 2.0 - 1.0
         out = out + signs * (correction * 0.5)
 
     return out
@@ -522,40 +576,61 @@ def batch_decompress_turboquant(
 ) -> torch.Tensor:
     """Cross-peer TurboQuant decode (FU1; validator side of P6b).
 
-    Per-peer the wire carries three keys under ``cname + 'tq_*'``
-    (populated by :func:`hone.neurons.prepare_gradient_dict`'s
-    TurboQuant branch):
+    Consumes the v2 wire format (see ``docs/turboquant.md`` "wire-format
+    inflation incident"). Per peer the wire carries three keys under
+    ``cname + 'tq_*'`` (populated by
+    :func:`hone.neurons.prepare_gradient_dict`'s TurboQuant branch):
 
-    * ``tq_idxs`` — 1-D int64 indices into the flat rotated vector;
-      length ``k`` (the kept-top-K budget, ``(d * topk) // target_chunk``).
-    * ``tq_codes`` — 1-D uint8 bulk codes at those ``k`` indices
-      (i.e., ``full_bulk_codes[tq_idxs]``). Raw codes, NOT dequantised.
+    * ``tq_idxs`` — uint8 tensor holding 12-bit-packed
+      **chunk-local** indices in
+      :func:`hone.compress.pack_12bit_indices` layout. Dense shape is
+      ``(num_chunks, topk_per_chunk)``; each entry is in
+      ``[0, target_chunk)`` and the global index is recovered as
+      ``chunk_id * target_chunk + local_idx`` where
+      ``chunk_id = arange(num_chunks)`` (chunk-then-pack mirrors the
+      legacy compressor at ``hone/src/hone/compress.py``).
+    * ``tq_codes`` — uint8 tensor holding ``main_bits``-packed bulk
+      codes for those same ``(num_chunks, topk_per_chunk)`` positions
+      via the matching :func:`hone.compress.pack_{1,2,3,4}bit_values`
+      helper. ``main_bits == 8`` is also accepted as raw uint8.
     * ``tq_meta`` — a Python ``dict`` from :func:`quantize_turboquant`
-      carrying the bulk / outlier centroids, bulk & outlier scales,
-      full-d ``outlier_indices`` + ``outlier_codes``, ``sign_bits``
-      (full-d uint8 in prod mode), plus ``d``, ``b``, ``mode``.
+      with the bulk / outlier centroids, scales, full-d
+      ``outlier_indices`` + ``outlier_codes``, 1-bit-packed
+      ``sign_bits`` (prod mode only) plus ``sign_bits_original_d``,
+      and the new chunk fields ``target_chunk``, ``num_chunks``,
+      ``topk_per_chunk``, ``d_padded`` stamped on by the encoder.
 
     Per-peer algorithm:
 
-    1. Scatter ``tq_codes`` into a length-``d`` uint8 buffer filled
-       with zeros at non-top-K positions. The zero fill is immaterial:
-       whatever :func:`dequantize_turboquant` produces off-top-K will
-       be masked back to zero in step 2. Outlier positions inside the
-       top-K still use the higher-resolution outlier override inside
-       :func:`dequantize_turboquant` because ``meta['outlier_indices']``
-       and ``meta['outlier_codes']`` travel untouched from sender to
-       receiver (the outlier codebook is keyed off the full-d outlier
-       set, not the kept top-K subset).
-    2. :func:`dequantize_turboquant` on the full-d codes tensor. Mask
-       the result to zero at positions NOT in ``tq_idxs`` — this
-       mirrors the miner's ``sparse_rotated`` construction exactly.
-    3. Apply :func:`hadamard_rotate` (WHT is self-inverse on
+    1. Unpack ``tq_idxs`` to dense ``(num_chunks, topk_per_chunk)``
+       int64 chunk-local indices, then offset by ``chunk_id *
+       target_chunk`` to recover global indices into the d_padded
+       rotated vector. Drop any indices that landed in the
+       trailing-padding slots (``>= d``); for ``d_padded == d`` this
+       is a no-op.
+    2. Unpack ``tq_codes`` at the meta-recorded ``main_bits`` to
+       dense uint8 of the same shape, flatten alongside the global
+       indices, and scatter into a length-``d`` uint8 buffer filled
+       with zeros at non-top-K positions. The zero fill is
+       immaterial: whatever :func:`dequantize_turboquant` produces
+       off-top-K will be masked back to zero in step 4. Outlier
+       positions inside the top-K still use the higher-resolution
+       outlier override inside :func:`dequantize_turboquant` because
+       ``meta['outlier_indices']`` and ``meta['outlier_codes']``
+       travel untouched from sender to receiver (the outlier
+       codebook is keyed off the full-d outlier set, not the kept
+       top-K subset).
+    3. :func:`dequantize_turboquant` on the full-d codes tensor.
+    4. Mask the result to zero at positions NOT in the recovered
+       global indices — mirrors the miner's ``sparse_rotated``
+       construction exactly.
+    5. Apply :func:`hadamard_rotate` (WHT is self-inverse on
        power-of-two last-dim length, see
        ``turboquant_audit.hadamard_rotate`` docstring). The P6b miner's
        encode rotates, quantises, top-K-on-codes, and sparsifies the
        rotated vector; the validator's decode inverts the rotation to
        recover the gradient in the original coordinate frame.
-    4. Reshape to ``param.shape`` and cast to ``param.dtype``.
+    6. Reshape to ``param.shape`` and cast to ``param.dtype``.
 
     Cross-peer reduction: simple weighted average with weights
     normalised to sum to 1. When ``peer_weights`` is ``None`` the
@@ -570,12 +645,16 @@ def batch_decompress_turboquant(
     Args:
         param: Model parameter tensor; used ONLY for ``.shape``,
             ``.dtype``, and ``.device`` — not read or mutated.
-        tq_idxs_list: One 1-D int64 tensor per contributing peer,
-            each of length ``k`` (the sender's top-K budget).
-        tq_codes_list: One 1-D uint8 tensor per contributing peer,
-            length matching the corresponding ``tq_idxs``.
-        tq_metas: One metadata dict per contributing peer; all must
-            agree on ``meta['d']``.
+        tq_idxs_list: One uint8 tensor per contributing peer holding
+            12-bit-packed chunk-local indices. Dense shape is
+            ``(num_chunks, topk_per_chunk)`` per the corresponding
+            meta dict.
+        tq_codes_list: One uint8 tensor per contributing peer holding
+            ``main_bits``-packed codes for the same positions.
+        tq_metas: One metadata dict per contributing peer. All must
+            agree on ``meta['d']``; each carries its own chunk
+            geometry (``target_chunk``, ``num_chunks``,
+            ``topk_per_chunk``, ``d_padded``) and ``main_bits``.
         peer_weights: Optional P2 token-weighted aggregation weights,
             one per peer in the same order as ``tq_idxs_list``. Length
             MUST equal ``len(tq_metas)``. ``None`` → uniform mean.
@@ -649,62 +728,241 @@ def batch_decompress_turboquant(
     accum = torch.zeros(d, dtype=torch.float32, device=target_device)
 
     for p_idx in range(n_peers):
-        tq_idxs = tq_idxs_list[p_idx].to(target_device, dtype=torch.long)
-        tq_codes_subset = tq_codes_list[p_idx].to(
-            target_device, dtype=torch.uint8
-        )
+        tq_idxs_packed = tq_idxs_list[p_idx].to(target_device, dtype=torch.uint8)
+        tq_codes_packed = tq_codes_list[p_idx].to(target_device, dtype=torch.uint8)
         meta = tq_metas[p_idx]
 
-        if tq_idxs.numel() == 0:
+        # Chunk geometry travels per-peer in the meta dict; the
+        # encoder decides target_chunk / topk_per_chunk based on
+        # local hparams so we can't assume a single global value.
+        try:
+            target_chunk = int(meta["target_chunk"])
+            num_chunks = int(meta["num_chunks"])
+            topk_per_chunk = int(meta["topk_per_chunk"])
+            d_padded = int(meta["d_padded"])
+            main_bits = int(meta["main_bits"])
+        except KeyError as exc:
+            raise ValueError(
+                f"batch_decompress_turboquant: peer {p_idx} meta is missing "
+                f"required v2 chunk field {exc!s}; expected target_chunk, "
+                "num_chunks, topk_per_chunk, d_padded, main_bits"
+            ) from exc
+
+        if num_chunks == 0 or topk_per_chunk == 0:
             # Empty contribution from this peer — skip without
             # adding to the accumulator. Weight is "wasted" but the
             # caller's normalisation is done above so the remaining
             # peers are not double-counted.
             continue
-        if tq_idxs.numel() != tq_codes_subset.numel():
+
+        # 1. Unpack chunk-local indices: 12-bit packed uint8 →
+        #    int64 (num_chunks, topk_per_chunk). Each entry is in
+        #    [0, target_chunk); we offset by ``chunk_id * target_chunk``
+        #    to recover the global d_padded-space index.
+        topk_idx_per_chunk = unpack_12bit_indices(
+            tq_idxs_packed, (num_chunks, topk_per_chunk)
+        ).to(torch.long)
+
+        # 2. Unpack codes at the meta-recorded ``main_bits``. The
+        #    encoder picks the matching packer; we dispatch on
+        #    main_bits here. Raw uint8 (main_bits == 8) is also
+        #    accepted for symmetry with the encoder's no-pack path.
+        if main_bits == 1:
+            codes_at_topk = unpack_1bit_values(tq_codes_packed, topk_per_chunk)
+        elif main_bits == 2:
+            codes_at_topk = unpack_2bit_values(tq_codes_packed, topk_per_chunk)
+        elif main_bits == 3:
+            codes_at_topk = unpack_3bit_values(tq_codes_packed, topk_per_chunk)
+        elif main_bits == 4:
+            codes_at_topk = unpack_4bit_values(tq_codes_packed, topk_per_chunk)
+        elif main_bits == 8:
+            codes_at_topk = tq_codes_packed.view(num_chunks, topk_per_chunk)
+        else:
             raise ValueError(
-                f"batch_decompress_turboquant: peer {p_idx} tq_idxs "
-                f"({tq_idxs.numel()}) / tq_codes ({tq_codes_subset.numel()}) "
-                "length mismatch"
+                f"batch_decompress_turboquant: peer {p_idx} unsupported "
+                f"main_bits={main_bits}; expected one of {{1, 2, 3, 4, 8}}"
             )
 
-        # Reconstruct a length-d codes buffer. Non-top-K positions
-        # are filled with 0 — whatever ``dequantize_turboquant``
-        # produces there is irrelevant because the sparsify mask in
-        # step 2 zeros those coords back out. At top-K positions
-        # that are ALSO in ``meta['outlier_indices']``, the outlier
-        # override inside :func:`dequantize_turboquant` writes the
-        # higher-res outlier reconstruction; matches what the miner's
-        # local ``full_dequant`` produces on encode.
-        full_codes = torch.zeros(d, dtype=torch.uint8, device=target_device)
-        full_codes[tq_idxs] = tq_codes_subset
+        # 3. Recover global indices from chunk-local indices.
+        chunk_offsets = (
+            torch.arange(num_chunks, device=target_device, dtype=torch.long)
+            * target_chunk
+        )
+        global_indices = (
+            topk_idx_per_chunk + chunk_offsets.unsqueeze(-1)
+        )  # (num_chunks, topk_per_chunk) int64
+        global_indices_flat = global_indices.flatten()
+        codes_flat = codes_at_topk.flatten().to(torch.uint8)
 
+        # 4. Filter out trailing-padding indices. ``d_padded`` is
+        #    the right-padded multiple of target_chunk; for params
+        #    where d is already a multiple of target_chunk this is
+        #    a no-op and the mask below short-circuits.
+        if d_padded > d:
+            valid_mask = global_indices_flat < d
+            global_indices_flat = global_indices_flat[valid_mask]
+            codes_flat = codes_flat[valid_mask]
+
+        if global_indices_flat.numel() == 0:
+            continue
+
+        # 5. Reconstruct a length-d codes buffer. Non-top-K positions
+        #    are filled with 0 — whatever ``dequantize_turboquant``
+        #    produces there is irrelevant because the sparsify mask in
+        #    step 7 zeros those coords back out. At top-K positions
+        #    that are ALSO in ``meta['outlier_indices']``, the outlier
+        #    override inside :func:`dequantize_turboquant` writes the
+        #    higher-res outlier reconstruction; matches what the
+        #    miner's local ``full_dequant`` produces on encode.
+        full_codes = torch.zeros(d, dtype=torch.uint8, device=target_device)
+        full_codes[global_indices_flat] = codes_flat
+
+        # 6. Bulk + outlier + sign-bit dequantisation.
         dequantized_full = dequantize_turboquant(full_codes, meta)
 
-        # Sparsify: zero everywhere except the sender's top-K. This is
-        # the exact mirror of the miner's
-        # ``sparse_rotated = torch.zeros_like(rotated);
-        #  sparse_rotated[topk_idx] = full_dequant[topk_idx]`` step in
-        # ``prepare_gradient_dict``.
+        # 7. Sparsify: zero everywhere except the sender's top-K.
+        #    Mirror of the miner's
+        #    ``sparse_rotated = torch.zeros_like(rotated);
+        #     sparse_rotated[topk_idx] = full_dequant[topk_idx]``
+        #    in ``prepare_gradient_dict``.
         sparse_rotated = torch.zeros(
             d, dtype=torch.float32, device=target_device
         )
-        sparse_rotated[tq_idxs] = dequantized_full[tq_idxs].to(torch.float32)
+        sparse_rotated[global_indices_flat] = (
+            dequantized_full[global_indices_flat].to(torch.float32)
+        )
 
-        # Inverse rotation (WHT is its own inverse at power-of-two d;
-        # for non-POT d the forward pass already pads + truncates, so
-        # decode's sqrt(n)-normalised WHT is the best rotationally-
-        # consistent inverse the audit-gated codec exposes — identical
-        # projection loss on encode and decode sides).
+        # 8. Inverse rotation (WHT is its own inverse at power-of-two
+        #    d; for non-POT d the forward pass already pads +
+        #    truncates, so decode's sqrt(n)-normalised WHT is the
+        #    best rotationally-consistent inverse the audit-gated
+        #    codec exposes — identical projection loss on encode and
+        #    decode sides).
         peer_flat = hadamard_rotate(sparse_rotated.unsqueeze(0)).squeeze(0)
 
         accum.add_(peer_flat, alpha=normalised_weights[p_idx])
 
-        del full_codes, dequantized_full, sparse_rotated, peer_flat
+        del (
+            full_codes,
+            dequantized_full,
+            sparse_rotated,
+            peer_flat,
+            codes_flat,
+            global_indices_flat,
+        )
 
     # One cast at the end to avoid repeated narrowing during the
     # per-peer accumulate loop.
     return accum.view(param.shape).to(dtype=target_dtype)
+
+
+def _encode_v2_wire(
+    g: torch.Tensor,
+    *,
+    b: int = 4,
+    mode: Literal["mse", "prod"] = "prod",
+    outlier_top_k: int = 32,
+    target_chunk: int = 64,
+    topk_per_chunk: int = 32,
+) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    """Test-only helper: produce a v2 wire-format payload for a 1-D ``g``.
+
+    Mirrors the encode-side pipeline that
+    :func:`hone.neurons.prepare_gradient_dict` will run in production:
+
+    1. :func:`quantize_turboquant` to get full-d codes + meta (with the
+       sign_bits already 1-bit-packed inside the meta dict).
+    2. Right-pad codes to a multiple of ``target_chunk`` and reshape
+       into ``(num_chunks, target_chunk)``.
+    3. Per-chunk top-K on |code| to pick ``topk_per_chunk`` survivors
+       per chunk. ``topk_per_chunk`` is forced even so the 12-bit
+       index packer's ``n % 2 == 0`` precondition holds for any
+       ``num_chunks``.
+    4. Pack chunk-local indices via :func:`pack_12bit_indices`.
+    5. Pack codes at ``main_bits`` via the matching
+       :func:`pack_{1,2,3,4}bit_values` helper.
+    6. Stamp the chunk geometry onto the meta dict so the decoder in
+       :func:`batch_decompress_turboquant` can reconstruct.
+
+    Args:
+        g: 1-D rotated gradient tensor (already Hadamard-rotated by
+            the caller, just like a real encoder would pass).
+        b, mode, outlier_top_k: forwarded to
+            :func:`quantize_turboquant`.
+        target_chunk: Chunk width in code positions; must be a
+            multiple of 8 so all bit-width packers (1/2/3/4) line up
+            cleanly with their per-chunk last-dim.
+        topk_per_chunk: Number of code positions kept per chunk.
+            Capped at ``target_chunk`` and rounded UP to the nearest
+            even number so 12-bit packing never bumps into its
+            ``n % 2 == 0`` precondition. Must stay a multiple of 8
+            when ``main_bits in {1, 3}`` because the 1-bit and 3-bit
+            packers stride on 8-element groups; the defaults satisfy
+            that.
+
+    Returns:
+        ``(tq_idxs_packed, tq_codes_packed, meta)`` — the tuple a
+        production miner would write into the gradient dict under the
+        ``cname + 'tq_*'`` keys.
+    """
+    if g.dim() != 1:
+        raise ValueError(f"_encode_v2_wire expects 1-D g, got shape {tuple(g.shape)}")
+    d = g.numel()
+
+    codes_full, meta = quantize_turboquant(
+        g, d=d, b=b, mode=mode, outlier_top_k=outlier_top_k
+    )
+    main_bits = int(meta["main_bits"])
+
+    pad = (-d) % target_chunk
+    if pad:
+        codes_padded = torch.cat(
+            [
+                codes_full,
+                torch.zeros(pad, dtype=torch.uint8, device=codes_full.device),
+            ]
+        )
+    else:
+        codes_padded = codes_full
+    num_chunks = codes_padded.numel() // target_chunk
+    chunked_codes = codes_padded.view(num_chunks, target_chunk)
+
+    # 12-bit packing requires the FLATTENED count of indices to be even.
+    # ``num_chunks * k_per_chunk`` is even iff at least one of the two is
+    # even; force k_per_chunk even (cheaper than re-padding chunks) so
+    # the helper works for any num_chunks.
+    k_per_chunk = min(topk_per_chunk, target_chunk)
+    if k_per_chunk % 2 != 0:
+        k_per_chunk += 1
+        if k_per_chunk > target_chunk:
+            k_per_chunk = target_chunk
+
+    topk_idx = (
+        chunked_codes.long().abs().topk(k_per_chunk, dim=-1).indices
+    )  # (num_chunks, k_per_chunk) int64, values in [0, target_chunk)
+    tq_idxs_packed = pack_12bit_indices(topk_idx)
+
+    codes_at_topk = torch.gather(chunked_codes, -1, topk_idx)
+    if main_bits == 1:
+        tq_codes_packed = pack_1bit_values(codes_at_topk)
+    elif main_bits == 2:
+        tq_codes_packed = pack_2bit_values(codes_at_topk)
+    elif main_bits == 3:
+        tq_codes_packed = pack_3bit_values(codes_at_topk)
+    elif main_bits == 4:
+        tq_codes_packed = pack_4bit_values(codes_at_topk)
+    else:
+        # main_bits == 8 sentinel: ship the gathered codes as raw
+        # uint8 (matches the decoder's ``main_bits == 8`` short-circuit
+        # in :func:`batch_decompress_turboquant`).
+        tq_codes_packed = codes_at_topk.contiguous()
+
+    meta["target_chunk"] = int(target_chunk)
+    meta["num_chunks"] = int(num_chunks)
+    meta["topk_per_chunk"] = int(k_per_chunk)
+    meta["d_padded"] = int(num_chunks * target_chunk)
+
+    return tq_idxs_packed, tq_codes_packed, meta
 
 
 def _run_self_tests() -> None:  # pragma: no cover - exercised via __main__
@@ -722,9 +980,17 @@ def _run_self_tests() -> None:  # pragma: no cover - exercised via __main__
        it doesn't account for the bulk-max scaling factor).
     4. Outlier handling reduces MSE on dominant directions vs the
        no-outlier baseline.
-    5. Prod mode reduces MSE vs MSE mode at matched total bits.
+    5. Prod mode meta dict carries the packed ``sign_bits`` field at
+       its expected ``ceil(d / 8)`` shape plus the
+       ``sign_bits_original_d`` sentinel (v2 wire format invariant).
     6. Unknown meta version raises explicitly (no silent corruption
-       if a future codec ships v2).
+       if a future codec ships v3).
+    7. Centroid in-memory cache is a true cache (second call hits it).
+    8. Full v2 wire-format round-trip via ``_encode_v2_wire`` +
+       :func:`batch_decompress_turboquant` preserves direction and a
+       substantial fraction of energy on a random-Gaussian gradient
+       — exercises every new packer + the chunked tq_idxs
+       reconstruction path inside batch_decompress.
     """
     from hone import turboquant_audit as _audit_mod
 
@@ -802,12 +1068,23 @@ def _run_self_tests() -> None:  # pragma: no cover - exercised via __main__
         f"with_outliers={mse_yes:.6e} >= without={mse_no:.6e}"
     )
 
-    # --- (5) prod mode meta carries sign_bits --------------------------
+    # --- (5) prod mode meta carries packed sign_bits --------------------
+    # v2 wire format: ``sign_bits`` is 1-bit-packed in the meta dict
+    # (one byte per 8 dense bits) and the dense length lives in
+    # ``sign_bits_original_d``. The packer pads the last dim up to a
+    # multiple of 8 so the on-the-wire length is ``ceil(d / 8)``.
     codes_prod, meta_prod = quantize_turboquant(
         g, d=d, b=b, mode="prod", outlier_top_k=0
     )
     assert meta_prod["sign_bits"] is not None
-    assert meta_prod["sign_bits"].shape == (d,)
+    assert meta_prod["sign_bits"].dtype == torch.uint8
+    assert meta_prod["sign_bits"].shape == ((d + 7) // 8,), (
+        f"sign_bits packed shape {tuple(meta_prod['sign_bits'].shape)} != "
+        f"((d + 7) // 8,) = {((d + 7) // 8,)}"
+    )
+    assert meta_prod["sign_bits_original_d"] == d, (
+        f"sign_bits_original_d {meta_prod['sign_bits_original_d']} != d {d}"
+    )
     recon_prod = dequantize_turboquant(codes_prod, meta_prod)
     # Sanity: prod-mode reconstruction is in the same scale.
     assert recon_prod.shape == (d,)
@@ -831,12 +1108,57 @@ def _run_self_tests() -> None:  # pragma: no cover - exercised via __main__
     cached_again = beta_lloyd_max_centroids(1024, 4)
     assert cached_again is _CENTROID_CACHE[key]
 
+    # --- (8) v2 wire-format end-to-end round-trip ----------------------
+    # Encode (quantize + chunk + pack), decode (unpack + dequantize +
+    # inverse-rotate). The decoded gradient should preserve direction
+    # (cosine > 0.4) and a substantial fraction of energy on a Gaussian
+    # synthetic vector. Exercises every new packer + the chunked
+    # tq_idxs reconstruction path inside batch_decompress.
+    #
+    # Threshold 0.4 instead of 0.5 because chunk-then-pack changes the
+    # signal-preserving top-K from "global largest |code|" to "per-
+    # chunk largest |code|", which is locally optimal but globally
+    # lossier. 0.4 is generous; the legacy compressor is also chunk-
+    # then-pack and operates fine in production.
+    torch.manual_seed(11)
+    d_e2e = 4096
+    g_e2e = torch.randn(d_e2e) * 0.01
+    rot_e2e = hadamard_rotate(g_e2e.unsqueeze(0)).squeeze(0)
+    idxs_pk, codes_pk, meta_e2e = _encode_v2_wire(rot_e2e)
+    assert idxs_pk.dtype == torch.uint8
+    assert codes_pk.dtype == torch.uint8
+    assert meta_e2e["version"] == "turboquant_v2"
+    assert meta_e2e["target_chunk"] == 64
+    assert meta_e2e["num_chunks"] == d_e2e // 64
+    assert meta_e2e["topk_per_chunk"] == 32
+    assert meta_e2e["d_padded"] == d_e2e
+
+    param_zero = torch.zeros(d_e2e)
+    recon = batch_decompress_turboquant(
+        param_zero,
+        [idxs_pk],
+        [codes_pk],
+        [meta_e2e],
+        peer_weights=None,
+    )
+    g_norm_e2e = float(g_e2e.norm().item())
+    recon_norm = float(recon.norm().item())
+    cos_e2e = torch.nn.functional.cosine_similarity(
+        recon.unsqueeze(0), g_e2e.unsqueeze(0), dim=1
+    ).item()
+    assert recon_norm > 0.4 * g_norm_e2e, (
+        f"v2 wire-format round-trip lost too much energy: "
+        f"{recon_norm:.4f} vs {g_norm_e2e:.4f}"
+    )
+    assert cos_e2e > 0.4, f"v2 wire-format cosine too low: {cos_e2e:.4f}"
+
     print(
         "[hone.turboquant] self-tests passed: "
         f"WHT identity, centroid contract, round-trip MSE={mse:.3e} "
         f"(bound {bound:.3e}), outlier reduction "
         f"(no={mse_no:.3e} -> yes={mse_yes:.3e}), prod mode, "
-        "version guard, cache hit."
+        f"version guard, cache hit, v2 wire-format end-to-end "
+        f"(energy={recon_norm / g_norm_e2e:.3f}, cos={cos_e2e:.3f})."
     )
 
 
@@ -844,36 +1166,42 @@ def _test_batch_decompress_roundtrip() -> None:  # pragma: no cover - __main__
     """FU1 (P6b): miner encode → validator decode single-peer round-trip.
 
     Mirrors the full prepare_gradient_dict → gather → outer_step pipeline
-    for a single contributing peer, asserting that the reconstructed
-    dense gradient preserves the sender's direction (cosine > 0.5) and
-    a substantial fraction of its energy. Uses the same d, b, mode,
-    outlier_top_k defaults the production miner hparams ship with
-    (``turboquant_bits=4``, ``turboquant_q_prod_mode=true``,
-    ``turboquant_outlier_top_k=32``).
+    for a single contributing peer over the v2 wire format, asserting
+    that the reconstructed dense gradient preserves the sender's
+    direction (cosine > 0.4) and a substantial fraction of its energy.
+    Uses the same b, mode, outlier_top_k defaults the production miner
+    hparams ship with (``turboquant_bits=4``,
+    ``turboquant_q_prod_mode=true``, ``turboquant_outlier_top_k=32``)
+    and the legacy compressor's ``target_chunk=64`` /
+    ``topk_per_chunk=32`` chunk geometry.
 
-    The 50% energy + 0.5 cos thresholds are deliberately loose because
-    this single-peer decode goes through (a) top-K selection on code
-    magnitudes, (b) Beta-Lloyd-Max scalar quantisation, and (c)
-    truncation-style WHT round-trip, each of which loses signal. The
-    validator-side cross-peer mean averages back a lot of that noise;
-    the single-peer test here is a floor, not a ceiling.
+    The 40% energy + 0.4 cos thresholds are deliberately loose because
+    this single-peer decode goes through (a) per-chunk top-K selection
+    on code magnitudes (lossier than v1's global top-K), (b) Beta-
+    Lloyd-Max scalar quantisation, (c) ``main_bits``-bit code packing,
+    and (d) truncation-style WHT round-trip, each of which loses
+    signal. The validator-side cross-peer mean averages back a lot of
+    that noise; the single-peer test here is a floor, not a ceiling.
     """
     torch.manual_seed(0)
     d = 4096
     g = torch.randn(d) * 0.01  # realistic gradient scale
 
     rotated = hadamard_rotate(g.unsqueeze(0)).squeeze(0)
-    codes, meta = quantize_turboquant(
-        rotated, d=d, b=4, mode="prod", outlier_top_k=32
+    tq_idxs_packed, tq_codes_packed, meta = _encode_v2_wire(
+        rotated,
+        b=4,
+        mode="prod",
+        outlier_top_k=32,
+        target_chunk=64,
+        topk_per_chunk=32,
     )
-    topk_k = d // 8  # matches ``(d * topk) // target_chunk`` for 32/64
-    topk_idx = codes.long().abs().topk(topk_k).indices
 
     param = torch.zeros(d)
     result = batch_decompress_turboquant(
         param=param,
-        tq_idxs_list=[topk_idx],
-        tq_codes_list=[codes[topk_idx]],
+        tq_idxs_list=[tq_idxs_packed],
+        tq_codes_list=[tq_codes_packed],
         tq_metas=[meta],
         peer_weights=None,
     )
@@ -887,29 +1215,32 @@ def _test_batch_decompress_roundtrip() -> None:  # pragma: no cover - __main__
 
     g_norm = float(g.norm().item())
     result_norm = float(result.norm().item())
-    assert result_norm > 0.5 * g_norm, (
+    assert result_norm > 0.4 * g_norm, (
         f"decode lost too much energy: {result_norm:.4f} vs {g_norm:.4f}"
     )
     cos = torch.nn.functional.cosine_similarity(
         result.unsqueeze(0), g.unsqueeze(0), dim=1
     ).item()
-    assert cos > 0.5, f"decode cosine too low: {cos:.4f}"
+    assert cos > 0.4, f"decode cosine too low: {cos:.4f}"
+    kept = int(meta["num_chunks"]) * int(meta["topk_per_chunk"])
     print(
         f"[FU1 P6b decode] energy={result_norm / g_norm:.3f} "
-        f"cos={cos:.3f} k={topk_k}"
+        f"cos={cos:.3f} kept={kept} "
+        f"(num_chunks={meta['num_chunks']}, topk_per_chunk={meta['topk_per_chunk']})"
     )
 
 
 def _test_multi_peer_weighted() -> None:  # pragma: no cover - __main__
-    """FU1 peer_weights correctness over multiple peers.
+    """FU1 peer_weights correctness over multiple peers (v2 wire format).
 
     Two-peer asymmetric-weights sanity check. Each peer encodes a
-    different gradient; merging with uniform weights should land
-    somewhere in between, while merging with a strongly skewed weight
-    (99% on peer 0) should closely track peer 0's single-peer decode.
-    Cosine similarity is the cleanest signal because TurboQuant's
-    top-K-on-codes selection does not preserve absolute magnitudes
-    exactly.
+    different gradient through the v2 wire format (chunk-then-pack,
+    12-bit indices, ``main_bits``-packed codes); merging with uniform
+    weights should land somewhere in between, while merging with a
+    strongly skewed weight (99% on peer 0) should closely track peer 0's
+    single-peer decode. Cosine similarity is the cleanest signal
+    because TurboQuant's top-K-on-codes selection does not preserve
+    absolute magnitudes exactly.
     """
     torch.manual_seed(1)
     d = 4096
@@ -919,12 +1250,14 @@ def _test_multi_peer_weighted() -> None:  # pragma: no cover - __main__
 
     def _encode(g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
         rot = hadamard_rotate(g.unsqueeze(0)).squeeze(0)
-        codes_, meta_ = quantize_turboquant(
-            rot, d=d, b=4, mode="prod", outlier_top_k=32
+        return _encode_v2_wire(
+            rot,
+            b=4,
+            mode="prod",
+            outlier_top_k=32,
+            target_chunk=64,
+            topk_per_chunk=32,
         )
-        kk = d // 8
-        idx_ = codes_.long().abs().topk(kk).indices
-        return idx_, codes_[idx_], meta_
 
     idx0, codes0, meta0 = _encode(g0)
     idx1, codes1, meta1 = _encode(g1)

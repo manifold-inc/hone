@@ -207,13 +207,25 @@ ONLY after BOTH gates above have passed:
 }
 ```
 
-This MUST land alongside the validator-side TurboQuant decoder PR.
-The legacy `cname + {'idxs','vals','quant_params'}` keys are NOT
-populated in the TurboQuant branch (the payload moves to
-`cname + 'tq_*'` keys); a TurboQuant-unaware validator that gets a
-TurboQuant-encoded gradient will simply skip the param, breaking
-upload / outer-step convergence for the affected miners. Coordinate
-the rollout.
+The validator-side TurboQuant decoder is in place (FU1 dispatch at
+`hone/neurons/validator.py:5380+`, outer_step branches in
+`hone/src/hone/neurons.py`). The dispatch keys themselves
+(`cname + {'tq_idxs','tq_codes','tq_meta'}`) are unchanged across
+v1 → v2 — only the wire shapes inside those keys shifted (see "v2
+wire format" under the wire-format inflation incident below). The
+legacy `cname + {'idxs','vals','quant_params'}` keys are NOT
+populated in the TurboQuant branch, so a TurboQuant-unaware
+validator that gets a TurboQuant-encoded gradient will simply skip
+the param, breaking upload / outer-step convergence for the
+affected miners.
+
+The rollout is hard-coordinated, not gracefully backward-compatible:
+the v2 decoder rejects `meta['version'] == 'turboquant_v1'` outright
+(version guard in `dequantize_turboquant` at
+`hone/src/hone/turboquant.py:518`), so any v1-encoded peer would be
+IGNORED by every validator running this codec. That is fine — v1
+was never enabled in production beyond the 2026-05-03 incident
+window, which was reverted same-day. Coordinate the rollout.
 
 ## Hparams reference
 
@@ -238,7 +250,7 @@ The P6a audit verifies that empirical claim BEFORE the operator
 commits engineering effort to the validator-side decoder + the A/B
 soak. If the audit fails, P6 is deferred at zero blast radius.
 
-## Wire-format inflation incident (2026-05-03) and follow-up fix
+## Wire-format inflation incident (2026-05-03) and v2 codec fix
 
 **Incident.** With `turboquant_enabled: true` on the 8B-A1B production
 hparams, miner upload payloads inflated to ~38.7 GB per window
@@ -257,8 +269,22 @@ when miners stop emitting that key they fall through to the legacy
 top-K decode that the rest of the system has been running on
 forever).
 
+**Codec rework (deployed same-day).** The v2 wire format described
+in "v2 codec wire format" below has shipped. The encoder now
+chunk-then-packs (`hone/src/hone/neurons.py:291-464` —
+`prepare_gradient_dict` TurboQuant branch); `quantize_turboquant`
+1-bit-packs `sign_bits` and stamps `meta['version'] =
+"turboquant_v2"` (`hone/src/hone/turboquant.py:338-499`);
+`dequantize_turboquant` (`:502-566`) and
+`batch_decompress_turboquant` (`:569-856`) consume the v2 chunked
++ bit-packed payload end-to-end. The `turboquant_enabled: false`
+flag remains the deployed safety gate pending P6b A/B re-validation
+against the new codec — chunk-then-pack is functionally a different
+selection strategy from v1's global top-K, so perplexity neutrality
+must be re-confirmed before the flag flips back on.
+
 **Per-suspect byte accounting** for the audit (full report in chat
-transcript [Hone gradient payload audit](TODO-uuid)):
+transcript [Hone gradient payload audit](95d0b611-ca0f-4608-b186-e3d39f49b23a)):
 
 The TurboQuant payload writes three keys per encoded param of
 size `d`:
@@ -288,74 +314,121 @@ quantization_bins=4` ships:
 Total: **`0.875d`**. Across 8.6B params this is ~7.5 GB — matches
 the observed legacy baseline before the TurboQuant flip.
 
-**Follow-up (re-enable TurboQuant later).** Three wire-format
-changes are required before flipping `turboquant_enabled` back on.
-Each MUST land alongside its matching decoder update or it
-silently corrupts every TurboQuant peer's gradient.
+**v2 codec wire format (deployed 2026-05-03 same-day).** All three
+wire-format changes that were required before re-enabling
+TurboQuant landed in the same calendar day as the incident, paired
+with their matching decoder updates so the codec is internally
+consistent end-to-end. The `turboquant_enabled: false` safety gate
+is the only thing keeping the new code from running on the gather
+path; the codec itself is on `meta['version'] = "turboquant_v2"`
+and the v1 layout is no longer accepted by any decoder.
 
-1. **Pack `tq_idxs` as 12-bit.** Change in
-   `hone/src/hone/neurons.py:361`:
+1. **`tq_idxs` packed 12-bit (chunk-then-pack).** The encoder now
+   pads the rotated codes to a multiple of `target_chunk`
+   (production: 64), takes per-chunk top-K on `|code|`, and packs
+   chunk-local indices via `pack_12bit_indices`
+   (`hone/src/hone/compress.py:73`). Each index lives in
+   `[0, target_chunk)` so trivially fits in 12 bits regardless of
+   the underlying `d_flat`. The 28-bit global packer alternative
+   was rejected in favour of chunk-then-pack: the chunked layout
+   matches the `0.75d` legacy budget (versus ~1.5d for the 28-bit
+   variant) and reuses the existing 12-bit packing helper
+   unchanged. Note that this also makes the per-chunk top-K
+   selection functionally distinct from v1's global top-K — see
+   the re-validation note at the end of this section.
 
-   ```python
-   gradient[cname + "tq_idxs"] = topk_idx.to("cpu")
-   ```
+   Encoder: `hone/src/hone/neurons.py:291-464`
+   (`prepare_gradient_dict`'s TurboQuant branch). Decoder:
+   `hone/src/hone/turboquant.py:569-856`
+   (`batch_decompress_turboquant`) recovers global indices via
+   `chunk_id * target_chunk + local_idx` and filters trailing
+   padding at `>= d`.
 
-   to use `pack_12bit_indices` exactly like the legacy path
-   does at `hone/src/hone/compress.py:612`. Note that
-   `topk_idx` indexes into the FULL flat `d_flat`-dim rotated
-   vector, so the packer must accept indices up to
-   `max(d_flat) - 1` ≈ 100M (the largest single 8B-A1B param).
-   The current `pack_12bit_indices` caps at 4096 (12-bit max);
-   we'll need either a 28-bit packing variant (`(d_flat * topk)
-   // target_chunk`-size index space, 4 B per index instead of
-   8 B → 2× saving, contributes ~13 GB → ~6.5 GB) OR
-   chunk-then-pack like the legacy path so each chunk's
-   indices fit in 12 bits (matches the `0.75d` legacy budget,
-   contributes 0.75d ≈ 6.5 GB → ~1.6 GB).
+   None of the existing call sites needed code changes — they all
+   delegate to `batch_decompress_turboquant` and so picked up the
+   v2 wire shape transparently:
+   - `hone/neurons/validator.py:5380+` (FU1 eval decode).
+   - `hone/src/hone/neurons.py:1146-1196` (outer_step pre-clip
+     decode), `:1399-1427` (P3A per-param pre-pass), `:1505-1535`
+     (main outer_step body).
+   - `hone/src/hone/neurons.py:2727+` (`check_uid_index_overlap`)
+     still SKIPS TQ params; per-chunk set-overlap is not a
+     meaningful signal on rotated-flat-top-K indices and the
+     count-sketch alternative remains a separate workstream.
 
-   Saves ~19 GB at the larger packing, ~25 GB at chunk-then-pack.
+2. **`tq_meta['sign_bits']` 1-bit-packed.** Previously uint8 (one
+   byte per coordinate of the full `d`-dim rotated vector); now
+   1-bit-packed inside `quantize_turboquant`
+   (`hone/src/hone/turboquant.py:338-499`) via `pack_1bit_values`
+   from `hone/src/hone/compress.py:292`. `dequantize_turboquant`
+   (`:502-566`) unpacks via `unpack_1bit_values` using the new
+   `meta['sign_bits_original_d']` field to drop the trailing-zero
+   padding the packer added on the stride boundary. The codec
+   stamps `meta['version'] = "turboquant_v2"` at the same time;
+   `dequantize_turboquant` rejects any other version outright at
+   line 518. Drops the sign-bits contribution from `d` to `d/8`.
 
-   Decoder updates required:
-   - `hone/neurons/validator.py:5380+` (FU1 decode) — unpack
-     before the `batch_decompress_turboquant` call.
-   - `hone/src/hone/neurons.py:1284-1335` and
-     `hone/src/hone/neurons.py:1055-1080` (outer_step TQ
-     decode branch) — same.
-   - `hone/src/hone/neurons.py:2671-2687`
-     (`check_uid_index_overlap`) — currently SKIPS TQ params;
-     no change needed unless we want overlap detection on
-     the new wire format.
+3. **`tq_codes` packed at `main_bits`.** Previously uint8 (one
+   byte per kept top-K position). The encoder
+   (`hone/src/hone/neurons.py:291-464`, same TurboQuant branch as
+   fix 1) now packs `main_bits`-wide (production prod-mode:
+   `b - 1 = 3` bits) via the matching `pack_{1,2,3,4}bit_values`
+   helper in `hone/src/hone/compress.py` (`pack_2bit_values:167`,
+   `pack_1bit_values:292`, `pack_3bit_values:414`,
+   `pack_4bit_values:563`); raw uint8 is preserved as the
+   `main_bits == 8` no-pack path. The validator decoder dispatches
+   on `meta['main_bits']` inside `batch_decompress_turboquant`
+   (`hone/src/hone/turboquant.py:569-856`) and runs the matching
+   `unpack_{1,2,3,4}bit_values` per peer. Drops `tq_codes` from
+   `0.5d` (uint8 over the 50%-density top-K) to `0.1875d`
+   (3-bit-packed at the same density) in the production b=4
+   prod-mode configuration.
 
-2. **1-bit-pack `tq_meta['sign_bits']`.** It's currently uint8
-   (1 byte per coordinate of the full `d`-dim rotated vector).
-   At b=1 it would be 0.125d. The pack/unpack helpers can mirror
-   `pack_2bit_values` / `unpack_2bit_values` in
-   `hone/src/hone/compress.py:167+`. Saves ~7 GB more (drops
-   d → d/8 on the sign-bits contribution).
+After all three fixes, the per-param wire payload has been verified
+end-to-end at:
 
-   Decoder update: `hone/src/hone/turboquant.py:500-510`
-   (`dequantize_turboquant` consumes `sign_bits` directly).
+| Key | Bytes per param (deployed) |
+|-----|----------------------------|
+| `tq_idxs` (12-bit packed chunk-local) | `0.7500d` |
+| `tq_codes` (3-bit packed at `main_bits=3`) | `0.1875d` |
+| `tq_meta.sign_bits` (1-bit packed) | `0.1250d` |
+| `tq_meta` other (centroids, outliers, chunk dims) | ~500 B |
 
-3. **Pack `tq_codes` to `main_bits`.** Currently uint8 (1 byte
-   per coord) but `main_bits` is `b - 1 = 3` in prod mode. Could
-   pack 3-bit (every 8 coords → 3 bytes). Saves ~1.6 GB more.
+Total: **`1.0625d` + ~500 B per param**. Across the 8B-A1B model
+this lands at ~9 GB per window per miner, within parity of the
+legacy `0.875d` ≈ 7 GB path.
 
-   Decoder update: same call site as (1).
+### v2 wire format (deployed 2026-05-03)
 
-After all three fixes, payload would be approximately:
-- `tq_idxs` (12-bit chunked): 0.75d
-- `tq_codes` (3-bit packed): 0.1875d
-- `tq_meta.sign_bits` (1-bit packed): 0.125d
-- meta overhead: ~500 B per param
+- `cname + "tq_idxs"` — uint8 packed 12-bit chunk-local indices.
+  Length = `(num_chunks * topk_per_chunk * 12) / 8` bytes.
+- `cname + "tq_codes"` — uint8 packed at `main_bits` bits (= `b - 1`
+  in prod mode, `b` in mse mode). Each kept top-K position
+  contributes one packed code.
+- `cname + "tq_meta"` — Python dict, version `"turboquant_v2"`.
+  Carries `target_chunk`, `num_chunks`, `topk_per_chunk`,
+  `d_padded`, `bulk_centroids`, `bulk_scale`, `outlier_*`,
+  `sign_bits` (1-bit packed when `mode='prod'`),
+  `sign_bits_original_d`, `mode`, `b`, `main_bits`, `d`.
+- v1 (pre-2026-05-03) sent: int64 `tq_idxs`, uint8 `tq_codes`,
+  uint8 `sign_bits` — all three keys at full byte-per-coord
+  density. Cumulative inflation `5.5d` per coord vs the v2
+  `1.0625d` per coord. The v2 decoder rejects v1 metadata
+  outright; the two formats are NOT interchangeable on the wire.
 
-Total: **~1.06d ≈ 9 GB** for 8B-A1B — within parity of the legacy
-path's ~7 GB and worth re-enabling once tested.
-
-The mitigation is reversible: flipping the hparam back to `true`
-restores the bloated wire format. Do not flip `true` again until
-**all three** wire-format fixes above have shipped (and ideally
-been A/B-tested via `turboquant_ab_compare.py` for cross-peer
-quality regression).
+The mitigation flag (`turboquant_enabled: false`) remains the
+deployed state. The underlying codec is now safe to re-enable, but
+chunk-then-pack is functionally a different selection strategy from
+v1's global top-K and the codec's rate-distortion profile may have
+shifted enough to need re-validating perplexity neutrality. Before
+flipping `turboquant_enabled` to `true` again, operators MUST run
+§P6b's A/B compare against the v2 codec
+(`hone/validator/turboquant_ab_compare.py`) and confirm both gates
+clear (perplexity regression ≤ 0.5%, Spearman per-UID-score
+correlation ≥ 0.85). The §P6a coordinate-distribution audit only
+needs to be re-run if the EF distribution has drifted since the
+last passing audit; the rotation + Beta assumption is unchanged
+between v1 and v2.
 
 ## Troubleshooting
 

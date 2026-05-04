@@ -36,7 +36,14 @@ from torch.optim.lr_scheduler import LRScheduler
 from wandb.sdk.wandb_run import Run
 
 import hone
-from hone.compress import unpack_12bit_indices
+from hone.compress import (
+    pack_1bit_values,
+    pack_2bit_values,
+    pack_3bit_values,
+    pack_4bit_values,
+    pack_12bit_indices,
+    unpack_12bit_indices,
+)
 from hone.distributed import dist_helper
 
 if TYPE_CHECKING:
@@ -282,22 +289,21 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
         )
 
         if use_turboquant:
-            # P6b dark-code path. Replaces the encode → compress →
-            # decompress → decode chain with:
-            #   1. Hadamard rotation on the FULL d-dim flat EF.
-            #   2. Beta-Lloyd-Max scalar quantisation of every coord.
-            #   3. Top-K **on the codebook indices** (NOT the float
-            #      values) — the load-bearing fix to the original P6
-            #      plan. Selecting on float values after rotation
-            #      breaks the Beta distribution the codebook assumes.
-            # The TurboQuant payload is written under ``cname + 'tq_*'``
-            # keys; the legacy ``cname + {'idxs','vals','quant_params'}``
-            # keys are deliberately NOT populated so a TurboQuant-
-            # unaware validator skips this param outright instead of
-            # mis-decoding it. Per the operator gating workflow in
-            # ``hone/docs/turboquant.md``, ``turboquant_enabled`` MUST
-            # remain false until both the matching validator-side
-            # decoder lands and the P6a + A/B gates pass.
+            # P6b dark-code path, v2 wire format
+            # (``hone/docs/turboquant.md`` "wire-format inflation
+            # incident", 2026-05-03). Hadamard-rotate the full d-dim
+            # flat EF, scalar-quantise every coord via the Beta-Lloyd-Max
+            # codebook, then chunk-then-pack: split the codes into
+            # ``target_chunk``-wide rows, take top-K-on-|code| per
+            # chunk, and pack indices as 12-bit (chunk-local in
+            # ``[0, target_chunk)``) plus codes at ``main_bits``. The
+            # chunk-then-pack rewrite drops the per-param wire budget
+            # from ~5.5d (raw int64 idxs + uint8 codes + uint8
+            # sign_bits) to ~1.06d (12-bit chunk-local idxs + N-bit
+            # packed codes + 1-bit packed sign_bits), restoring parity
+            # with the legacy 0.875d top-K path. ``turboquant_enabled``
+            # MUST stay false until the operator gating workflow in
+            # ``hone/docs/turboquant.md`` clears the audit + A/B gates.
             ef_flat = ef_for_codec.flatten()
             d_flat = int(ef_flat.numel())
             rotated = _turboquant.hadamard_rotate(ef_flat.unsqueeze(0)).squeeze(0)
@@ -308,37 +314,119 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
                 mode=tq_mode,
                 outlier_top_k=tq_outlier_k,
             )
-            # Match the legacy budget so swapping codecs does not change
-            # wire size: the legacy path keeps roughly
-            # ``ef.numel() * topk / target_chunk`` coords (≈ 50% under
-            # the default 32/64 ratio).
-            target_chunk = int(getattr(miner.hparams, "target_chunk", 64))
-            tq_keep_count = max(1, (d_flat * topk) // max(target_chunk, 1))
-            tq_keep_count = min(tq_keep_count, d_flat)
-            # Top-K on |codes| — rotated coords whose code magnitude is
-            # largest carry the most reconstructed signal.
-            topk_idx = tq_codes.long().abs().topk(tq_keep_count).indices
+            main_bits = int(tq_meta["main_bits"])
 
-            # Reconstruct what the receiver would see (sparse rotated
-            # vector + inverse rotation) so the local EF accumulates
-            # the same residual the validator does. The WHT is its own
-            # inverse on power-of-two padded length, so the second
-            # ``hadamard_rotate`` call is the inverse rotation.
-            #
-            # We dequantize the FULL ``d_flat``-length codes tensor
-            # before sparsifying because ``tq_meta`` carries outlier
-            # indices in the full-d-space coordinate system; passing a
-            # subset of codes would index outliers out-of-bounds. This
-            # costs an O(d) lookup but keeps the codec API simple — the
-            # alternative (re-indexing tq_meta at the kept positions)
-            # would split the meta semantics into two flavours and
-            # complicate the validator-side decoder we owe in the
-            # follow-up PR.
+            target_chunk = int(getattr(miner.hparams, "target_chunk", 64))
+            pad = (-d_flat) % target_chunk
+            if pad:
+                codes_padded = torch.cat(
+                    [
+                        tq_codes,
+                        torch.zeros(
+                            pad, dtype=torch.uint8, device=tq_codes.device
+                        ),
+                    ]
+                )
+            else:
+                codes_padded = tq_codes
+            num_chunks = codes_padded.numel() // target_chunk
+            chunked_codes = codes_padded.view(num_chunks, target_chunk)
+
+            # Per-chunk top-K on |code|. The legacy compressor budgets
+            # ``topk`` survivors per ``target_chunk`` chunk (32 of 64
+            # in production); we keep the same density semantics so
+            # the codec swap does not change wire size beyond the
+            # compaction the v2 packing layout provides.
+            k_per_chunk = min(int(topk), int(target_chunk))
+            if k_per_chunk % 2 != 0:
+                # 12-bit packing requires the FLATTENED count of indices
+                # to be even (``pack_12bit_indices`` rejects odd input).
+                # Bump up by 1 while staying inside [0, target_chunk];
+                # the cap protects against pathological hparam combos.
+                k_per_chunk = min(k_per_chunk + 1, int(target_chunk))
+            topk_idx_per_chunk = (
+                chunked_codes.long().abs().topk(k_per_chunk, dim=-1).indices
+            )
+
+            # Pack chunk-local indices as 12-bit (each is < target_chunk
+            # so trivially fits, regardless of d_flat).
+            tq_idxs_packed = pack_12bit_indices(topk_idx_per_chunk)
+
+            # Gather codes at the kept top-K and pack at main_bits.
+            # Production runs with b=4, prod mode → main_bits == 3.
+            # The other widths (1/2/4/8) are kept as a defensive
+            # dispatch for future hparam tweaks; the validator-side
+            # decoder does the matching unpack via the same dispatch
+            # in ``batch_decompress_turboquant``.
+            codes_at_topk = torch.gather(chunked_codes, -1, topk_idx_per_chunk)
+            if main_bits == 1:
+                tq_codes_packed = pack_1bit_values(codes_at_topk)
+            elif main_bits == 2:
+                tq_codes_packed = pack_2bit_values(codes_at_topk)
+            elif main_bits == 3:
+                tq_codes_packed = pack_3bit_values(codes_at_topk)
+            elif main_bits == 4:
+                tq_codes_packed = pack_4bit_values(codes_at_topk)
+            elif main_bits == 8:
+                tq_codes_packed = codes_at_topk.contiguous()
+            else:
+                raise ValueError(
+                    f"prepare_gradient_dict: unsupported turboquant "
+                    f"main_bits={main_bits}; expected one of {{1,2,3,4,8}}"
+                )
+
+            # Stamp chunk geometry onto the meta dict. The codec
+            # already populated version / d / b / main_bits / mode /
+            # centroids / sign_bits; these chunk fields are the
+            # encoder's responsibility because the codec works on
+            # full-d flat tensors and doesn't know about the chunk
+            # layout. ``batch_decompress_turboquant`` raises if any
+            # of the four are missing.
+            tq_meta["target_chunk"] = int(target_chunk)
+            tq_meta["num_chunks"] = int(num_chunks)
+            tq_meta["topk_per_chunk"] = int(k_per_chunk)
+            tq_meta["d_padded"] = int(num_chunks * target_chunk)
+
+            # Reconstruct global indices into the FULL d_flat-length
+            # rotated vector for the local EF residual update. Validator
+            # decoder reconstructs these the same way (chunk_id *
+            # target_chunk + local_idx); duplicating the math here keeps
+            # the encode-side EF accumulate consistent with the receiver
+            # side without forcing a round-trip through the codec.
+            chunk_offsets = (
+                torch.arange(
+                    num_chunks,
+                    device=topk_idx_per_chunk.device,
+                    dtype=torch.long,
+                )
+                * target_chunk
+            )
+            global_indices_flat = (
+                topk_idx_per_chunk + chunk_offsets.unsqueeze(-1)
+            ).flatten()
+            if pad:
+                # Trailing-padding indices (>= d_flat) must NOT touch
+                # the EF tensor: those bytes are zeros from the pad in
+                # ``codes_padded`` and writing them would corrupt the
+                # residual once we reshape back to ef_for_codec.shape.
+                # Mirrors the validator decoder's ``d_padded > d``
+                # filter in ``batch_decompress_turboquant``.
+                global_indices_flat = global_indices_flat[
+                    global_indices_flat < d_flat
+                ]
+
+            # Local reconstruction for EF accumulation. ``full_dequant``
+            # is over the FULL d_flat-length codes (not the padded
+            # view) so indexing with ``global_indices_flat`` (already
+            # filtered to < d_flat) is safe. We dequantise the full-d
+            # codes tensor before sparsifying because ``tq_meta``
+            # carries outlier indices in the full-d coordinate system;
+            # passing a subset would index outliers out-of-bounds.
             full_dequant = _turboquant.dequantize_turboquant(tq_codes, tq_meta)
             sparse_rotated = torch.zeros_like(rotated)
-            sparse_rotated[topk_idx] = full_dequant[topk_idx].to(
-                sparse_rotated.dtype
-            )
+            sparse_rotated[global_indices_flat] = full_dequant[
+                global_indices_flat
+            ].to(sparse_rotated.dtype)
             del full_dequant
             transmit_grad_flat = _turboquant.hadamard_rotate(
                 sparse_rotated.unsqueeze(0)
@@ -353,13 +441,23 @@ def prepare_gradient_dict(miner: "Miner", step_window: int, null_round: bool = F
             miner.error_feedback[n] = error_feedback
             del transmit_grad, transmit_grad_flat, sparse_rotated, error_feedback
 
-            # Stash the TurboQuant payload under TQ-prefixed keys. We
-            # only ship the kept top-K subset to keep wire size in
-            # parity with the legacy path; full-tensor codes would
-            # roughly double payload at b=4. Validator-side TQ decode
-            # (TBD) reads these keys; legacy decode skips them.
-            gradient[cname + "tq_idxs"] = topk_idx.to("cpu")
-            gradient[cname + "tq_codes"] = tq_codes[topk_idx].to("cpu")
+            # Ship the v2 payload under TQ-prefixed keys:
+            #   * ``tq_idxs``  — uint8 12-bit packed chunk-local
+            #     indices (dense ``(num_chunks, topk_per_chunk)``
+            #     int64 in ``[0, target_chunk)``).
+            #   * ``tq_codes`` — uint8 ``main_bits``-packed codes at
+            #     the kept top-K positions (same dense shape).
+            #   * ``tq_meta``  — codec dict carrying centroids /
+            #     scales / outlier override / 1-bit-packed sign_bits
+            #     plus the chunk reconstruction parameters
+            #     (``target_chunk``, ``num_chunks``, ``topk_per_chunk``,
+            #     ``d_padded``) that the validator decoder uses to
+            #     unpack everything back into the d_padded rotated
+            #     vector. A TurboQuant-unaware validator sees no
+            #     legacy ``idxs/vals/quant_params`` keys for this
+            #     param and skips it outright instead of mis-decoding.
+            gradient[cname + "tq_idxs"] = tq_idxs_packed.to("cpu")
+            gradient[cname + "tq_codes"] = tq_codes_packed.to("cpu")
             gradient[cname + "tq_meta"] = tq_meta
 
             p.grad = None
