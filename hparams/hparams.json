@@ -79,7 +79,7 @@
     "gather_grace_ema_alpha": 0.2,
     "parallel_outer_step": true,
     "parallel_outer_snapshot_full": true,
-    "turboquant_enabled": true,
+    "turboquant_enabled": false,
     "turboquant_bits": 4,
     "turboquant_outlier_top_k": 32,
     "turboquant_q_prod_mode": true,

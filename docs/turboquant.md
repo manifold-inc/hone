@@ -238,6 +238,125 @@ The P6a audit verifies that empirical claim BEFORE the operator
 commits engineering effort to the validator-side decoder + the A/B
 soak. If the audit fails, P6 is deferred at zero blast radius.
 
+## Wire-format inflation incident (2026-05-03) and follow-up fix
+
+**Incident.** With `turboquant_enabled: true` on the 8B-A1B production
+hparams, miner upload payloads inflated to ~38.7 GB per window
+(p50 = 1.45 GB × 24 fragments per `logs/miner-*-out.log` "Uploaded …
+24 fragments" lines). The expected legacy P0b payload is ~7 GB.
+The 5.5× inflation is the actual root cause of why miner upload
+windows exceed the validator's 70 s gather budget — not a parallelism
+issue.
+
+**Mitigation (deployed).** Reverted `turboquant_enabled` to `false`
+in `hparams/hparams.json`. Drops wire payload from ~38.7 GB → ~7 GB
+per window per miner (5.5×). Validator-side decode is unaffected
+because the existing `outer_step` and eval paths are codec-agnostic
+(they dispatch on the presence of `cname + "tq_idxs"` per-param;
+when miners stop emitting that key they fall through to the legacy
+top-K decode that the rest of the system has been running on
+forever).
+
+**Per-suspect byte accounting** for the audit (full report in chat
+transcript [Hone gradient payload audit](TODO-uuid)):
+
+The TurboQuant payload writes three keys per encoded param of
+size `d`:
+
+| Key | Type | Length | Bytes per param |
+|-----|------|--------|-----------------|
+| `tq_idxs` | int64 | `(d * topk) // target_chunk` ≈ `d/2` | **`4d`** |
+| `tq_codes` | uint8 | same as `tq_idxs` | **`0.5d`** |
+| `tq_meta.sign_bits` | uint8 | full `d` (prod mode only) | **`d`** |
+| `tq_meta` other | mixed | small (centroids, outliers) | ~500 B |
+
+Total: **`5.5d` + ~500 B per param**. Across the 8B-A1B model
+(~8.6B trainable params, MoE-dominated) this lands at ~47 GB on
+paper, ~38.7 GB observed (the ~9 GB shortfall comes from
+`torch.save` framing on uint8 arrays plus a handful of tiny
+layer-norm params where the meta dict overhead dominates).
+
+The legacy P0b path with `pack_values_2bit=true,
+quantization_bins=4` ships:
+
+| Key | Bytes per param |
+|-----|-----------------|
+| `idxs` (12-bit packed) | `0.75d` (50% density × 1.5 B per kept idx) |
+| `vals` (2-bit packed) | `0.125d` (50% density × 0.25 B per kept val) |
+| `quant_params` | ~50 B per param (5- or 7-tuple with a 16-byte lookup tensor) |
+
+Total: **`0.875d`**. Across 8.6B params this is ~7.5 GB — matches
+the observed legacy baseline before the TurboQuant flip.
+
+**Follow-up (re-enable TurboQuant later).** Three wire-format
+changes are required before flipping `turboquant_enabled` back on.
+Each MUST land alongside its matching decoder update or it
+silently corrupts every TurboQuant peer's gradient.
+
+1. **Pack `tq_idxs` as 12-bit.** Change in
+   `hone/src/hone/neurons.py:361`:
+
+   ```python
+   gradient[cname + "tq_idxs"] = topk_idx.to("cpu")
+   ```
+
+   to use `pack_12bit_indices` exactly like the legacy path
+   does at `hone/src/hone/compress.py:612`. Note that
+   `topk_idx` indexes into the FULL flat `d_flat`-dim rotated
+   vector, so the packer must accept indices up to
+   `max(d_flat) - 1` ≈ 100M (the largest single 8B-A1B param).
+   The current `pack_12bit_indices` caps at 4096 (12-bit max);
+   we'll need either a 28-bit packing variant (`(d_flat * topk)
+   // target_chunk`-size index space, 4 B per index instead of
+   8 B → 2× saving, contributes ~13 GB → ~6.5 GB) OR
+   chunk-then-pack like the legacy path so each chunk's
+   indices fit in 12 bits (matches the `0.75d` legacy budget,
+   contributes 0.75d ≈ 6.5 GB → ~1.6 GB).
+
+   Saves ~19 GB at the larger packing, ~25 GB at chunk-then-pack.
+
+   Decoder updates required:
+   - `hone/neurons/validator.py:5380+` (FU1 decode) — unpack
+     before the `batch_decompress_turboquant` call.
+   - `hone/src/hone/neurons.py:1284-1335` and
+     `hone/src/hone/neurons.py:1055-1080` (outer_step TQ
+     decode branch) — same.
+   - `hone/src/hone/neurons.py:2671-2687`
+     (`check_uid_index_overlap`) — currently SKIPS TQ params;
+     no change needed unless we want overlap detection on
+     the new wire format.
+
+2. **1-bit-pack `tq_meta['sign_bits']`.** It's currently uint8
+   (1 byte per coordinate of the full `d`-dim rotated vector).
+   At b=1 it would be 0.125d. The pack/unpack helpers can mirror
+   `pack_2bit_values` / `unpack_2bit_values` in
+   `hone/src/hone/compress.py:167+`. Saves ~7 GB more (drops
+   d → d/8 on the sign-bits contribution).
+
+   Decoder update: `hone/src/hone/turboquant.py:500-510`
+   (`dequantize_turboquant` consumes `sign_bits` directly).
+
+3. **Pack `tq_codes` to `main_bits`.** Currently uint8 (1 byte
+   per coord) but `main_bits` is `b - 1 = 3` in prod mode. Could
+   pack 3-bit (every 8 coords → 3 bytes). Saves ~1.6 GB more.
+
+   Decoder update: same call site as (1).
+
+After all three fixes, payload would be approximately:
+- `tq_idxs` (12-bit chunked): 0.75d
+- `tq_codes` (3-bit packed): 0.1875d
+- `tq_meta.sign_bits` (1-bit packed): 0.125d
+- meta overhead: ~500 B per param
+
+Total: **~1.06d ≈ 9 GB** for 8B-A1B — within parity of the legacy
+path's ~7 GB and worth re-enabling once tested.
+
+The mitigation is reversible: flipping the hparam back to `true`
+restores the bloated wire format. Do not flip `true` again until
+**all three** wire-format fixes above have shipped (and ideally
+been A/B-tested via `turboquant_ab_compare.py` for cross-peer
+quality regression).
+
 ## Troubleshooting
 
 **`PASS_RATE_THRESHOLD` is too aggressive for my snapshot.**
