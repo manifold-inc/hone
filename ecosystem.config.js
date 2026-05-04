@@ -107,7 +107,7 @@ module.exports = {
     script: UV,
     args: [
       "run", "torchrun",
-      "--nproc_per_node=2",
+      "--nproc_per_node=4",
       `--master_port=${masterPort}`,
       "neurons/miner.py",
       "--wallet.name", "miner",
